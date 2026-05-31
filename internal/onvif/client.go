@@ -7,6 +7,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ type Client struct {
 	config       Config
 	http         *http.Client
 	mediaXAddr   string
+	ptzXAddr     string
 	discovered   bool
 }
 
@@ -68,6 +70,10 @@ func (c *Client) GetCapabilities(ctx context.Context) (*Capabilities, error) {
 }
 
 func (c *Client) discoverMediaURL(ctx context.Context) error {
+	return c.discoverServices(ctx)
+}
+
+func (c *Client) discoverServices(ctx context.Context) error {
 	if c.discovered {
 		return nil
 	}
@@ -80,6 +86,7 @@ func (c *Client) discoverMediaURL(ctx context.Context) error {
 	}
 
 	var result struct {
+		XMLName  xml.Name `xml:"GetServicesResponse"`
 		Services []struct {
 			Namespace string `xml:"Namespace"`
 			XAddr     string `xml:"XAddr"`
@@ -92,7 +99,9 @@ func (c *Client) discoverMediaURL(ctx context.Context) error {
 	for _, svc := range result.Services {
 		if strings.Contains(svc.Namespace, "media") || strings.Contains(svc.Namespace, "Media") {
 			c.mediaXAddr = svc.XAddr
-			break
+		}
+		if strings.Contains(svc.Namespace, "ptz") || strings.Contains(svc.Namespace, "PTZ") {
+			c.ptzXAddr = svc.XAddr
 		}
 	}
 
@@ -111,6 +120,13 @@ func (c *Client) mediaURL() string {
 	return c.serviceURL("/onvif/media_service")
 }
 
+func (c *Client) ptzURL() string {
+	if c.ptzXAddr != "" {
+		return c.ptzXAddr
+	}
+	return c.serviceURL("/onvif/ptz_service")
+}
+
 func (c *Client) GetProfiles(ctx context.Context) ([]Profile, error) {
 	c.discoverMediaURL(ctx)
 
@@ -122,6 +138,7 @@ func (c *Client) GetProfiles(ctx context.Context) ([]Profile, error) {
 	}
 
 	var result struct {
+		XMLName  xml.Name `xml:"GetProfilesResponse"`
 		Profiles []struct {
 			Token string `xml:"token,attr"`
 			Name  string `xml:"Name"`
@@ -157,6 +174,7 @@ func (c *Client) GetStreamURI(ctx context.Context, profileToken string) (*Stream
 	}
 
 	var result struct {
+		XMLName xml.Name `xml:"GetStreamUriResponse"`
 		MediaURI struct {
 			URI                 string `xml:"Uri"`
 			Timeout             string `xml:"Timeout"`
@@ -191,6 +209,7 @@ func (c *Client) GetSnapshotURI(ctx context.Context, profileToken string) (strin
 	}
 
 	var result struct {
+		XMLName  xml.Name `xml:"GetSnapshotUriResponse"`
 		MediaURI struct {
 			URI string `xml:"Uri"`
 		} `xml:"MediaUri"`
@@ -272,31 +291,16 @@ func (c *Client) setWSSecurity(req *http.Request) {
 
 func (c *Client) parseSOAPResponse(body []byte, responseTag string, result interface{}) error {
 	var envelope struct {
-		Body struct {
+		XMLName xml.Name `xml:"http://www.w3.org/2003/05/soap-envelope Envelope"`
+		Body    struct {
 			InnerXML string `xml:",innerxml"`
-		} `xml:"Body"`
+		} `xml:"http://www.w3.org/2003/05/soap-envelope Body"`
 	}
 	if err := xml.Unmarshal(body, &envelope); err != nil {
 		return fmt.Errorf("unmarshal SOAP envelope: %w", err)
 	}
 	cleaned := stripNSPrefix(envelope.Body.InnerXML)
-	cleaned = stripResponseWrapper(cleaned, responseTag)
 	return xml.Unmarshal([]byte("<root>"+cleaned+"</root>"), result)
-}
-
-func stripResponseWrapper(xmlStr, tag string) string {
-	if idx := strings.Index(xmlStr, "<"+tag); idx >= 0 {
-		end := strings.Index(xmlStr[idx:], ">")
-		if end > 0 {
-			xmlStr = xmlStr[idx+end+1:]
-		}
-	}
-	xmlStr = strings.TrimSpace(xmlStr)
-	suffix := "</" + tag + ">"
-	if strings.HasSuffix(xmlStr, suffix) {
-		xmlStr = xmlStr[:len(xmlStr)-len(suffix)]
-	}
-	return xmlStr
 }
 
 func stripNSPrefix(xmlStr string) string {
@@ -309,9 +313,12 @@ func stripNSPrefix(xmlStr string) string {
 }
 
 func (c *Client) PTZContinuousMove(ctx context.Context, profileToken string, pan, tilt, zoom float64, duration time.Duration) error {
-	c.discoverMediaURL(ctx)
+	if err := c.discoverServices(ctx); err != nil {
+		return err
+	}
 
-	ptzURL := c.serviceURL("/onvif/ptz_service")
+	ptzURL := c.ptzURL()
+	log.Printf("[PTZ] Sending ContinuousMove to %s (pan=%.1f, tilt=%.1f, dur=%v)", ptzURL, pan, tilt, duration)
 	if c.mediaXAddr != "" {
 		base := c.deviceURL()
 		if idx := strings.Index(base, "/onvif/"); idx > 0 {
@@ -328,7 +335,7 @@ func (c *Client) PTZContinuousMove(ctx context.Context, profileToken string, pan
 			</tptz:Velocity>
 			<tptz:Timeout>%s</tptz:Timeout>
 		</tptz:ContinuousMove>
-	`, xmlEscape(profileToken), pan, tilt, zoom, duration))
+	`, xmlEscape(profileToken), pan, tilt, zoom, formatISO8601(duration)))
 
 	resp, err := c.soapCall(ctx, c.deviceURL(), ptzURL, "ContinuousMove", body)
 	if err != nil {
@@ -339,7 +346,11 @@ func (c *Client) PTZContinuousMove(ctx context.Context, profileToken string, pan
 }
 
 func (c *Client) PTZStop(ctx context.Context, profileToken string) error {
-	ptzURL := c.serviceURL("/onvif/ptz_service")
+	if err := c.discoverServices(ctx); err != nil {
+		return err
+	}
+
+	ptzURL := c.ptzURL()
 	if c.mediaXAddr != "" {
 		base := c.deviceURL()
 		if idx := strings.Index(base, "/onvif/"); idx > 0 {
@@ -361,6 +372,11 @@ func (c *Client) PTZStop(ctx context.Context, profileToken string) error {
 	}
 	_ = resp
 	return nil
+}
+
+func formatISO8601(d time.Duration) string {
+	sec := d.Seconds()
+	return fmt.Sprintf("PT%.1fS", sec)
 }
 
 func xmlEscape(s string) string {
