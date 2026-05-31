@@ -9,26 +9,29 @@ const connectionStatus = ref<'disconnected' | 'connecting' | 'connected'>('conne
 const hasStream = ref(false)
 const isSnapshotMode = ref(false)
 const videoError = ref('')
+const showPTZ = ref(false)
 let frameCount = 0
 let lastFrameTime = 0
 
 let jmuxer: JMuxer | null = null
 
-const { messages, isConnected, isConnecting, popNewMessages } = useWebSocket('/ws')
-
 function initJMuxer() {
   if (!videoRef.value) return
-
   jmuxer = new JMuxer({
     node: videoRef.value,
     mode: 'video',
     videoCodec: 'H264',
     flushingTime: 100,
     debug: false,
-    onError: () => {
-      // JMuxer error — stream will auto-recover on next keyframe
-    },
+    onError: () => {},
   })
+}
+
+const { messages, isConnected, isConnecting, popNewMessages, send } = useWebSocket('/ws')
+
+function ptzMove(direction: string) {
+  console.log('[VideoPlayer] PTZ move:', direction)
+  send({ type: 'ptz_move', payload: { direction } })
 }
 
 function feedVideoNal(base64Data: string) {
@@ -142,7 +145,9 @@ onUnmounted(() => {
       </span>
     </div>
 
-    <div class="video-player__viewport">
+    <div class="video-player__viewport"
+         @mouseenter="showPTZ = true"
+         @mouseleave="showPTZ = false">
       <video
         ref="videoRef"
         class="video-player__video"
@@ -156,6 +161,12 @@ onUnmounted(() => {
         class="video-player__snapshot"
         :class="{ 'video-player__snapshot--visible': isSnapshotMode }"
       />
+      <div v-if="showPTZ && hasStream" class="video-player__ptz-overlay">
+        <button class="video-player__ptz-btn video-player__ptz-btn--up"    @mousedown.prevent="ptzMove('up')">▲</button>
+        <button class="video-player__ptz-btn video-player__ptz-btn--left"  @mousedown.prevent="ptzMove('left')">◀</button>
+        <button class="video-player__ptz-btn video-player__ptz-btn--right" @mousedown.prevent="ptzMove('right')">▶</button>
+        <button class="video-player__ptz-btn video-player__ptz-btn--down"  @mousedown.prevent="ptzMove('down')">▼</button>
+      </div>
       <div v-if="!hasStream" class="video-player__placeholder">
         <span class="video-player__placeholder-icon">📷</span>
         <span class="video-player__placeholder-text">等待视频流...</span>
@@ -333,4 +344,24 @@ onUnmounted(() => {
   font-size: 0.72rem;
   text-align: center;
 }
+
+.video-player__ptz-overlay {
+  position: absolute; inset: 0;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.video-player__ptz-btn {
+  position: absolute; width: 40px; height: 40px;
+  border: 1px solid rgba(0,229,160,.3); background: rgba(0,0,0,.5);
+  color: rgba(0,229,160,.7); font-size: 1rem; cursor: pointer;
+  pointer-events: auto; border-radius: 4px; transition: all .15s;
+  display: flex; align-items: center; justify-content: center;
+}
+.video-player__ptz-btn:hover { background: rgba(0,229,160,.15); color: #00e5a0; }
+
+.video-player__ptz-btn--up    { top: 4px; left: 50%; transform: translateX(-50%); }
+.video-player__ptz-btn--down  { bottom: 4px; left: 50%; transform: translateX(-50%); }
+.video-player__ptz-btn--left  { left: 4px; top: 50%; transform: translateY(-50%); }
+.video-player__ptz-btn--right { right: 4px; top: 50%; transform: translateY(-50%); }
 </style>

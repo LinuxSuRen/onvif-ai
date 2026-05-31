@@ -300,12 +300,67 @@ func stripResponseWrapper(xmlStr, tag string) string {
 }
 
 func stripNSPrefix(xmlStr string) string {
-	prefixes := []string{"tds:", "trt:", "tt:", "dn:", "d:", "a:", "s:", "xsd:", "xsi:", "wsse:", "wsu:"}
+	prefixes := []string{"tds:", "trt:", "tt:", "tptz:", "dn:", "d:", "a:", "s:", "xsd:", "xsi:", "wsse:", "wsu:"}
 	for _, p := range prefixes {
 		xmlStr = strings.ReplaceAll(xmlStr, "<"+p, "<")
 		xmlStr = strings.ReplaceAll(xmlStr, "</"+p, "</")
 	}
 	return xmlStr
+}
+
+func (c *Client) PTZContinuousMove(ctx context.Context, profileToken string, pan, tilt, zoom float64, duration time.Duration) error {
+	c.discoverMediaURL(ctx)
+
+	ptzURL := c.serviceURL("/onvif/ptz_service")
+	if c.mediaXAddr != "" {
+		base := c.deviceURL()
+		if idx := strings.Index(base, "/onvif/"); idx > 0 {
+			ptzURL = base[:idx] + "/onvif/ptz_service"
+		}
+	}
+
+	body := c.soapEnvelope(fmt.Sprintf(`
+		<tptz:ContinuousMove>
+			<tptz:ProfileToken>%s</tptz:ProfileToken>
+			<tptz:Velocity>
+				<tt:PanTilt x="%f" y="%f" space="http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace"/>
+				<tt:Zoom x="%f" space="http://www.onvif.org/ver10/tptz/ZoomSpaces/VelocityGenericSpace"/>
+			</tptz:Velocity>
+			<tptz:Timeout>%s</tptz:Timeout>
+		</tptz:ContinuousMove>
+	`, xmlEscape(profileToken), pan, tilt, zoom, duration))
+
+	resp, err := c.soapCall(ctx, c.deviceURL(), ptzURL, "ContinuousMove", body)
+	if err != nil {
+		return err
+	}
+	_ = resp
+	return nil
+}
+
+func (c *Client) PTZStop(ctx context.Context, profileToken string) error {
+	ptzURL := c.serviceURL("/onvif/ptz_service")
+	if c.mediaXAddr != "" {
+		base := c.deviceURL()
+		if idx := strings.Index(base, "/onvif/"); idx > 0 {
+			ptzURL = base[:idx] + "/onvif/ptz_service"
+		}
+	}
+
+	body := c.soapEnvelope(fmt.Sprintf(`
+		<tptz:Stop>
+			<tptz:ProfileToken>%s</tptz:ProfileToken>
+			<tptz:PanTilt>true</tptz:PanTilt>
+			<tptz:Zoom>true</tptz:Zoom>
+		</tptz:Stop>
+	`, xmlEscape(profileToken)))
+
+	resp, err := c.soapCall(ctx, c.deviceURL(), ptzURL, "Stop", body)
+	if err != nil {
+		return err
+	}
+	_ = resp
+	return nil
 }
 
 func xmlEscape(s string) string {

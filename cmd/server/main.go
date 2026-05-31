@@ -115,6 +115,7 @@ type cameraManager struct {
 	cameraAudioBufMax int
 
 	history []llm.Message
+	profileToken string
 }
 
 func (cm *cameraManager) connect(address string) {
@@ -132,7 +133,10 @@ func (cm *cameraManager) connect(address string) {
 		DeviceAddr: address,
 		Timeout:    5 * time.Second,
 	})
+
+	cm.mu.Lock()
 	cm.onvifClient = onvifClient
+	cm.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -215,6 +219,7 @@ func (cm *cameraManager) connect(address string) {
 	cm.stream = stream
 	cm.backchannel = backchannel
 	cm.currentURL = uri.URI
+	cm.profileToken = profiles[0].Token
 	cm.mu.Unlock()
 
 	cm.cameraAudioBufMax = 160000
@@ -322,7 +327,7 @@ func (cm *cameraManager) startSnapshotLoop(snapshotURL string, stopCh chan struc
 }
 
 func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
-	h.SetAudioCallbacks(
+	h.SetCallbacks(
 		func(data []byte) {},
 		func() {},
 		func() {},
@@ -349,6 +354,9 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 			log.Println("Conversation history cleared")
 			hub.BroadcastStatus(ws.StatusIdle)
 		},
+		func(direction string) {
+			cm.handlePTZMove(direction)
+		},
 		func(mode string) {
 			log.Printf("Audio mode: %s", mode)
 		},
@@ -360,6 +368,48 @@ func (cm *cameraManager) getBackchannel() *rtsp.Backchannel {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.backchannel
+}
+
+func (cm *cameraManager) handlePTZMove(direction string) {
+	cm.mu.Lock()
+	client := cm.onvifClient
+	profileToken := cm.profileToken
+	cm.mu.Unlock()
+
+	if client == nil || profileToken == "" {
+		log.Println("PTZ: no camera connected")
+		cm.hub.BroadcastError("云台控制需要先连接摄像头")
+		return
+	}
+
+	var pan, tilt, zoom float64
+	switch direction {
+	case "left":
+		pan = -0.5
+	case "right":
+		pan = 0.5
+	case "up":
+		tilt = 0.5
+	case "down":
+		tilt = -0.5
+	case "zoom_in":
+		zoom = 0.5
+	case "zoom_out":
+		zoom = -0.5
+	default:
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.PTZContinuousMove(ctx, profileToken, pan, tilt, zoom, 500*time.Millisecond); err != nil {
+		log.Printf("PTZ move %s failed: %v", direction, err)
+		cm.hub.BroadcastError("云台转动失败: " + err.Error())
+		return
+	}
+
+	log.Printf("PTZ: moved %s", direction)
 }
 
 func (cm *cameraManager) processCameraAudio() {

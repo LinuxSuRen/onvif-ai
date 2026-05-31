@@ -38,6 +38,7 @@ type Handler struct {
 	onSpeechText  func(string)
 	onCameraListen func()
 	onClearHistory func()
+	onPTZMove     func(direction string)
 	onSwitchMode  func(string)
 	onLLMUpdate   func(baseURL, apiKey, model string)
 	mu            sync.RWMutex
@@ -65,7 +66,7 @@ func NewHandler(hub *ws.Hub, listener *discovery.Listener) *Handler {
 	}
 }
 
-func (h *Handler) SetAudioCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onClear func(), onMode func(string)) {
+func (h *Handler) SetCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onClear func(), onPTZ func(string), onMode func(string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onAudioData = onData
@@ -74,6 +75,7 @@ func (h *Handler) SetAudioCallbacks(onData func([]byte), onStart func(), onStop 
 	h.onSpeechText = onSpeech
 	h.onCameraListen = onCamera
 	h.onClearHistory = onClear
+	h.onPTZMove = onPTZ
 	h.onSwitchMode = onMode
 }
 
@@ -390,6 +392,19 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				h.onClearHistory()
 			}
 			h.mu.RUnlock()
+
+		case ws.MsgTypePTZMove:
+			var payload struct{ Direction string }
+			if msg.Payload != nil {
+				json.Unmarshal(msg.Payload, &payload)
+			}
+			if payload.Direction != "" {
+				h.mu.RLock()
+				if h.onPTZMove != nil {
+					h.onPTZMove(payload.Direction)
+				}
+				h.mu.RUnlock()
+			}
 		}
 	})
 }

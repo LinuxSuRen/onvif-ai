@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -33,19 +34,45 @@ type ImageURL struct {
 	URL string `json:"url"`
 }
 
+type Tool struct {
+	Type     string       `json:"type"`
+	Function ToolFunction `json:"function"`
+}
+
+type ToolFunction struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Parameters  interface{} `json:"parameters"`
+}
+
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
+}
+
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
 type chatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
+	Model      string    `json:"model"`
+	Messages   []Message `json:"messages"`
+	Stream     bool      `json:"stream"`
+	Tools      []Tool    `json:"tools,omitempty"`
+	ToolChoice string    `json:"tool_choice,omitempty"`
 }
 
 type chatResponse struct {
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content   string     `json:"content"`
+			ToolCalls []ToolCall `json:"tool_calls"`
 		} `json:"delta"`
 		Message struct {
-			Content string `json:"content"`
+			Content   string     `json:"content"`
+			ToolCalls []ToolCall `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -189,6 +216,56 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, callback fu
 	}
 
 	return fullText.String(), scanner.Err()
+}
+
+func (c *Client) ChatWithTools(ctx context.Context, messages []Message, tools []Tool) (string, []ToolCall, error) {
+	url := c.buildURL("/chat/completions")
+
+	reqBody := chatRequest{
+		Model:    c.config.Model,
+		Messages: messages,
+		Stream:   false,
+		Tools:    tools,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	log.Printf("[LLM] ChatWithTools: model=%s, tools=%d", c.config.Model, len(tools))
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return "", nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.config.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.config.APIKey)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", nil, fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return "", nil, fmt.Errorf("LLM returned %d: %s", resp.StatusCode, string(errBody[:min(len(errBody), 500)]))
+	}
+
+	var result chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	if len(result.Choices) == 0 {
+		return "", nil, fmt.Errorf("no choices in LLM response")
+	}
+
+	choice := result.Choices[0]
+	return choice.Message.Content, choice.Message.ToolCalls, nil
 }
 
 func (c *Client) Transcribe(ctx context.Context, audioData []byte, format string) (string, error) {
