@@ -206,6 +206,7 @@ func (c *Client) soapEnvelope(body string) string {
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
 	xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
 	xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+	xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"
 	xmlns:tt="http://www.onvif.org/ver10/schema"
 	xmlns:xsd="http://www.w3.org/2001/XMLSchema"
 	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -315,10 +316,62 @@ func xmlEscape(s string) string {
 	return s
 }
 
+// ContinuousMove sends a PTZ continuous move command for the specified direction and duration.
+// After the duration elapses, a Stop command is automatically sent.
+func (c *Client) ContinuousMove(ctx context.Context, profileToken, direction string, duration time.Duration) error {
+	var pan, tilt float64
+	switch direction {
+	case "left":
+		pan = -0.5
+	case "right":
+		pan = 0.5
+	case "up":
+		tilt = 0.5
+	case "down":
+		tilt = -0.5
+	default:
+		return fmt.Errorf("unknown direction: %s", direction)
+	}
+
+	body := c.soapEnvelope(fmt.Sprintf(`
+		<tptz:ContinuousMove>
+			<tptz:ProfileToken>%s</tptz:ProfileToken>
+			<tptz:Velocity>
+				<tt:PanTilt x="%.1f" y="%.1f"/>
+				<tt:Zoom x="0"/>
+			</tptz:Velocity>
+			<tptz:Timeout>PT1S</tptz:Timeout>
+		</tptz:ContinuousMove>
+	`, xmlEscape(profileToken), pan, tilt))
+
+	_, err := c.soapCall(ctx, c.deviceURL(), c.deviceURL(), "ContinuousMove", body)
+	if err != nil {
+		return fmt.Errorf("ContinuousMove %s: %w", direction, err)
+	}
+
+	// Auto-stop after duration
+	time.Sleep(duration)
+
+	stopBody := c.soapEnvelope(fmt.Sprintf(`
+		<tptz:Stop>
+			<tptz:ProfileToken>%s</tptz:ProfileToken>
+			<tptz:PanTilt>true</tptz:PanTilt>
+			<tptz:Zoom>true</tptz:Zoom>
+		</tptz:Stop>
+	`, xmlEscape(profileToken)))
+
+	_, err = c.soapCall(ctx, c.deviceURL(), c.deviceURL(), "Stop", stopBody)
+	return err
+}
+
 func soapActionDomain(action string) string {
 	deviceActions := map[string]bool{"GetCapabilities": true, "GetServices": true, "GetDeviceInformation": true}
+	ptzActions := map[string]bool{"ContinuousMove": true, "Stop": true}
 	if deviceActions[action] {
 		return "device"
+	}
+	if ptzActions[action] {
+		return "ptz"
 	}
 	return "media"
 }

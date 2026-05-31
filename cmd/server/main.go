@@ -99,10 +99,11 @@ func main() {
 }
 
 type cameraManager struct {
-	hub       *ws.Hub
-	llmClient *llm.Client
-	ttsClient *tts.Client
-	handler   *server.Handler
+	hub         *ws.Hub
+	llmClient   *llm.Client
+	ttsClient   *tts.Client
+	handler     *server.Handler
+	onvifClient *onvif.Client
 
 	mu          sync.Mutex
 	stream      *rtsp.Stream
@@ -131,6 +132,7 @@ func (cm *cameraManager) connect(address string) {
 		DeviceAddr: address,
 		Timeout:    5 * time.Second,
 	})
+	cm.onvifClient = onvifClient
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -274,25 +276,20 @@ func (cm *cameraManager) fetchAndShowSnapshot(snapshotURL string) {
 		return
 	}
 
-	httpClient := &http.Client{Timeout: 15 * time.Second}
+	httpClient := &http.Client{Timeout: 5 * time.Second}
 	resp, err := httpClient.Get(snapshotURL)
 	if err != nil {
 		log.Printf("Snapshot fetch failed: %v", err)
+		cm.hub.BroadcastError("快照获取失败: " + err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
 	jpeg, err := io.ReadAll(resp.Body)
 	if err != nil || len(jpeg) == 0 {
-		log.Printf("Snapshot read failed: %v (size=%d)", err, len(jpeg))
-		return
-	}
-	if len(jpeg) < 100 {
-		log.Printf("Snapshot too small (%d bytes), likely not a valid JPEG", len(jpeg))
 		return
 	}
 
-	log.Printf("Snapshot fetched: %d bytes", len(jpeg))
 	cm.hub.BroadcastVideoJPEG(jpeg)
 }
 

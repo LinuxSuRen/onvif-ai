@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -90,8 +89,6 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
 
-	log.Printf("[LLM] Calling %s with model=%s, key=%s...", url, c.config.Model, maskKey(c.config.APIKey))
-
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
@@ -126,8 +123,6 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 
 func (c *Client) ChatStream(ctx context.Context, messages []Message, callback func(chunk string) error) (string, error) {
 	url := c.buildURL("/chat/completions")
-
-	log.Printf("[LLM Stream] Calling %s with model=%s", url, c.config.Model)
 
 	reqBody := chatRequest{
 		Model:    c.config.Model,
@@ -240,13 +235,6 @@ func (c *Client) Transcribe(ctx context.Context, audioData []byte, format string
 	}
 
 	return strings.TrimSpace(result.Text), nil
-}
-
-func maskKey(key string) string {
-	if len(key) <= 8 {
-		return "***"
-	}
-	return key[:5] + "..." + key[len(key)-3:]
 }
 
 func (c *Client) buildURL(path string) string {

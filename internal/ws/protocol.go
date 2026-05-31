@@ -24,6 +24,7 @@ const (
 	MsgTypeError     MessageType = "error"      // Error message
 	MsgTypeAudioOut   MessageType = "audio_out"   // PCM audio for browser playback (base64)
 	MsgTypeDeviceState MessageType = "device_state" // Device connection state update
+	MsgTypePTZCommand  MessageType = "ptz_command"  // PTZ command result (direction + text)
 )
 
 // Message is the JSON envelope for all WebSocket messages.
