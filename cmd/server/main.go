@@ -274,7 +274,7 @@ func (cm *cameraManager) fetchAndShowSnapshot(snapshotURL string) {
 		return
 	}
 
-	httpClient := &http.Client{Timeout: 5 * time.Second}
+	httpClient := &http.Client{Timeout: 15 * time.Second}
 	resp, err := httpClient.Get(snapshotURL)
 	if err != nil {
 		log.Printf("Snapshot fetch failed: %v", err)
