@@ -1,0 +1,158 @@
+/* ===== ONVIF AI Camera Console — Design System ===== */
+/* Aesthetic: Surveillance control room — dark, data-dense, precise */
+
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=DM+Mono:wght@300;400;500&family=DM+Sans:wght@400;500;600&display=swap');
+
+/* ---- Design Tokens ---- */
+:root {
+  /* Palette */
+  --color-bg-base: #060a10;
+  --color-bg-panel: #0c121c;
+  --color-bg-elevated: #111927;
+  --color-bg-hover: #162032;
+  --color-bg-active: #1a2840;
+
+  --color-border-subtle: #142030;
+  --color-border-default: #1e3048;
+  --color-border-strong: #2a4060;
+  --color-border-glow: #00e5a033;
+
+  --color-text-muted: #3a5068;
+  --color-text-dim: #5a7088;
+  --color-text-secondary: #8098b0;
+  --color-text-primary: #b8ccdc;
+  --color-text-bright: #e4eef6;
+
+  --color-accent-green: #00e5a0;
+  --color-accent-blue: #00a8ff;
+  --color-accent-cyan: #00d4e8;
+  --color-accent-amber: #ffb800;
+  --color-accent-red: #ff3d57;
+  --color-accent-purple: #7c5ce7;
+  --color-accent-pink: #ff6b9d;
+
+  /* Semantic */
+  --color-success: var(--color-accent-green);
+  --color-info: var(--color-accent-blue);
+  --color-warning: var(--color-accent-amber);
+  --color-danger: var(--color-accent-red);
+
+  /* Spacing scale (4px base) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* Border radius */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* Typography */
+  --font-display: 'Orbitron', sans-serif;
+  --font-mono: 'DM Mono', 'JetBrains Mono', 'Fira Code', monospace;
+  --font-body: 'DM Sans', -apple-system, sans-serif;
+
+  /* Shadows */
+  --shadow-panel: 0 2px 12px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  --shadow-glow-green: 0 0 20px rgba(0, 229, 160, 0.15);
+  --shadow-glow-blue: 0 0 20px rgba(0, 168, 255, 0.15);
+  --shadow-glow-red: 0 0 20px rgba(255, 61, 87, 0.15);
+
+  /* Transitions */
+  --transition-fast: 150ms ease;
+  --transition-base: 250ms ease;
+  --transition-slow: 400ms ease;
+}
+
+/* ---- Reset & Base ---- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--font-body);
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-base);
+  overflow: hidden;
+  height: 100vh;
+}
+
+#app {
+  height: 100vh;
+  width: 100vw;
+}
+
+/* ---- Scrollbar ---- */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-default);
+  border-radius: var(--radius-full);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-strong);
+}
+
+/* ---- Utility: Visually Hidden ---- */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---- Pulse animation ---- */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
