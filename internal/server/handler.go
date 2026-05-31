@@ -29,6 +29,7 @@ type Handler struct {
 	listener      *discovery.Listener
 	upgrader      websocket.Upgrader
 	deviceState   DeviceState
+	llmConfig     *LLMConfig
 	onConnect     func(address string)
 	onAudioData   func([]byte)
 	onAudioStart  func()
@@ -36,7 +37,14 @@ type Handler struct {
 	onSpeechText  func(string)
 	onCameraListen func()
 	onSwitchMode  func(string)
+	onLLMUpdate   func(baseURL, apiKey, model string)
 	mu            sync.RWMutex
+}
+
+type LLMConfig struct {
+	BaseURL string `json:"base_url"`
+	APIKey  string `json:"api_key"`
+	Model   string `json:"model"`
 }
 
 func NewHandler(hub *ws.Hub, listener *discovery.Listener) *Handler {
@@ -100,6 +108,8 @@ func (h *Handler) RegisterRoutes() http.Handler {
 	r.Get("/api/camera/discover", h.handleDiscover)
 	r.Get("/api/camera/info", h.handleCameraInfo)
 	r.Post("/api/camera/connect", h.handleConnect)
+	r.Get("/api/llm/config", h.handleLLMGetConfig)
+	r.Post("/api/llm/config", h.handleLLMSetConfig)
 
 	fileServer := http.FileServer(http.Dir("web/dist"))
 	r.Handle("/*", fileServer)
@@ -189,6 +199,74 @@ func (h *Handler) handleCameraInfo(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(state)
+}
+
+func (h *Handler) SetLLMUpdateCallback(fn func(baseURL, apiKey, model string)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onLLMUpdate = fn
+}
+
+func (h *Handler) SetLLMConfig(cfg *LLMConfig) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.llmConfig = cfg
+}
+
+func (h *Handler) handleLLMGetConfig(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	cfg := h.llmConfig
+	h.mu.RUnlock()
+
+	resp := map[string]string{}
+	if cfg != nil {
+		resp["base_url"] = cfg.BaseURL
+		resp["api_key"] = maskKey(cfg.APIKey)
+		resp["model"] = cfg.Model
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) handleLLMSetConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+		Model   string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	h.mu.Lock()
+	if h.llmConfig == nil {
+		h.llmConfig = &LLMConfig{}
+	}
+	if req.BaseURL != "" {
+		h.llmConfig.BaseURL = req.BaseURL
+	}
+	if req.APIKey != "" && req.APIKey != "***" {
+		h.llmConfig.APIKey = req.APIKey
+	}
+	if req.Model != "" {
+		h.llmConfig.Model = req.Model
+	}
+	h.mu.Unlock()
+
+	if h.onLLMUpdate != nil {
+		go h.onLLMUpdate(req.BaseURL, req.APIKey, req.Model)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func maskKey(key string) string {
+	if len(key) <= 8 {
+		return "***"
+	}
+	return key[:5] + "***" + key[len(key)-3:]
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {

@@ -3,3 +3,5 @@ bin/
 web/dist/
 web/node_modules/
 *.log
+.sisyphus/
+.DS_Store

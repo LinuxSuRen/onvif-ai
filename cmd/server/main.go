@@ -54,6 +54,12 @@ func main() {
 	llmClient := llm.NewClient(llmCfg)
 	ttsClient := tts.NewClient(ttsCfg)
 
+	h.SetLLMConfig(&server.LLMConfig{
+		BaseURL: llmCfg.BaseURL,
+		APIKey:  llmCfg.APIKey,
+		Model:   llmCfg.Model,
+	})
+
 	cm := &cameraManager{
 		hub:        hub,
 		llmClient:  llmClient,
@@ -64,6 +70,11 @@ func main() {
 
 	h.SetOnConnect(func(addr string) {
 		go cm.connect(addr)
+	})
+
+	h.SetLLMUpdateCallback(func(baseURL, apiKey, model string) {
+		cm.llmClient.UpdateConfig(baseURL, apiKey, model)
+		log.Printf("LLM config updated: %s, model=%s", baseURL, model)
 	})
 
 	setupVoiceCallbacks(h, hub, cm)

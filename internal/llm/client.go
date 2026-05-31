@@ -64,6 +64,18 @@ func NewClient(cfg Config) *Client {
 	}
 }
 
+func (c *Client) UpdateConfig(baseURL, apiKey, model string) {
+	if baseURL != "" {
+		c.config.BaseURL = baseURL
+	}
+	if apiKey != "" {
+		c.config.APIKey = apiKey
+	}
+	if model != "" {
+		c.config.Model = model
+	}
+}
+
 func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 	url := c.buildURL("/chat/completions")
 

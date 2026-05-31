@@ -22,6 +22,11 @@ const deviceState = ref<DeviceState>({ connected: false, streaming: false, addre
 const discovering = ref(false)
 const connecting = ref(false)
 const discoverError = ref('')
+const showLLMSettings = ref(false)
+const llmBaseURL = ref('')
+const llmApiKey = ref('')
+const llmModel = ref('')
+const llmSaving = ref(false)
 
 const { messages, popNewMessages } = useWebSocket('/ws')
 
@@ -90,7 +95,39 @@ onMounted(async () => {
   } catch { /* WebSocket will update */ }
 
   discoverDevices()
+  fetchLLMConfig()
 })
+
+async function fetchLLMConfig() {
+  try {
+    const resp = await fetch('/api/llm/config')
+    if (resp.ok) {
+      const cfg = await resp.json()
+      llmBaseURL.value = cfg.base_url || ''
+      llmApiKey.value = cfg.api_key || ''
+      llmModel.value = cfg.model || ''
+    }
+  } catch { /* ignore */ }
+}
+
+async function saveLLMConfig() {
+  llmSaving.value = true
+  try {
+    await fetch('/api/llm/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base_url: llmBaseURL.value,
+        api_key: llmApiKey.value,
+        model: llmModel.value,
+      }),
+    })
+  } catch (e) {
+    console.error('Save LLM config failed:', e)
+  } finally {
+    llmSaving.value = false
+  }
+}
 </script>
 
 <template>
@@ -121,6 +158,28 @@ onMounted(async () => {
       </div>
     </div>
     <div v-else-if="!discovering && !discoverError" class="device-info__hint">点击「搜索设备」发现局域网 ONVIF 摄像头</div>
+
+    <button class="device-info__settings-toggle" @click="showLLMSettings = !showLLMSettings">
+      ⚙️ AI 模型配置 {{ showLLMSettings ? '▲' : '▼' }}
+    </button>
+
+    <div v-if="showLLMSettings" class="device-info__llm-panel">
+      <div class="device-info__llm-field">
+        <label>API 地址</label>
+        <input v-model="llmBaseURL" placeholder="https://api.openai.com" />
+      </div>
+      <div class="device-info__llm-field">
+        <label>API Key</label>
+        <input v-model="llmApiKey" type="password" placeholder="sk-..." />
+      </div>
+      <div class="device-info__llm-field">
+        <label>模型</label>
+        <input v-model="llmModel" placeholder="gpt-3.5-turbo" />
+      </div>
+      <button class="device-info__llm-save" @click="saveLLMConfig" :disabled="llmSaving">
+        {{ llmSaving ? '保存中...' : '保存' }}
+      </button>
+    </div>
   </div>
 </template>
 
@@ -152,4 +211,36 @@ onMounted(async () => {
 .device-info__scope-tag { font-size: 0.6rem; padding: 1px 6px; background: rgba(0,145,255,.12); color: #0091ff; border-radius: 3px; }
 .device-info__connect-btn { font-size: 0.7rem; padding: 2px 10px; background: rgba(0,229,160,.12); border: 1px solid rgba(0,229,160,.25); border-radius: 4px; color: #00e5a0; cursor: pointer; }
 .device-info__connect-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.device-info__settings-toggle {
+  width: 100%; padding: 6px 10px;
+  background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
+  border-radius: 6px; color: #7a8490; font-size: 0.72rem; cursor: pointer;
+}
+.device-info__settings-toggle:hover { background: rgba(255,255,255,.06); }
+
+.device-info__llm-panel {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px; background: #0a0e14; border-radius: 6px;
+  border: 1px solid #1e2530;
+}
+
+.device-info__llm-field { display: flex; flex-direction: column; gap: 2px; }
+.device-info__llm-field label {
+  font-size: 0.6rem; color: #5a6470; letter-spacing: 0.03em;
+}
+.device-info__llm-field input {
+  padding: 4px 8px; background: #131820; border: 1px solid #1e2530;
+  border-radius: 4px; color: #c8d0d8; font-size: 0.7rem;
+  font-family: monospace;
+}
+.device-info__llm-field input:focus { outline: none; border-color: #0091ff; }
+
+.device-info__llm-save {
+  padding: 5px 12px; background: rgba(0,145,255,.15);
+  border: 1px solid rgba(0,145,255,.25); border-radius: 4px;
+  color: #0091ff; font-size: 0.72rem; cursor: pointer;
+  align-self: flex-end;
+}
+.device-info__llm-save:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>
