@@ -385,17 +385,17 @@ func (cm *cameraManager) handlePTZMove(direction string) {
 	var pan, tilt, zoom float64
 	switch direction {
 	case "left":
-		pan = -0.5
+		pan = -1.0
 	case "right":
-		pan = 0.5
+		pan = 1.0
 	case "up":
-		tilt = 0.5
+		tilt = 1.0
 	case "down":
-		tilt = -0.5
+		tilt = -1.0
 	case "zoom_in":
-		zoom = 0.5
+		zoom = 1.0
 	case "zoom_out":
-		zoom = -0.5
+		zoom = -1.0
 	default:
 		return
 	}
@@ -403,7 +403,7 @@ func (cm *cameraManager) handlePTZMove(direction string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := client.PTZContinuousMove(ctx, profileToken, pan, tilt, zoom, 500*time.Millisecond); err != nil {
+	if err := client.PTZContinuousMove(ctx, profileToken, pan, tilt, zoom, 2*time.Second); err != nil {
 		log.Printf("PTZ move %s failed: %v", direction, err)
 		cm.hub.BroadcastError("云台转动失败: " + err.Error())
 		return
