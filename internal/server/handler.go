@@ -1,18 +1,19 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"log"
 	"net/http"
-	"os"
-	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/gorilla/websocket"
+	"github.com/onvif-ai/internal/onvif"
 	"github.com/onvif-ai/internal/onvif/discovery"
 	"github.com/onvif-ai/internal/ws"
 )
@@ -60,7 +61,7 @@ func NewHandler(hub *ws.Hub, listener *discovery.Listener) *Handler {
 			WriteBufferSize: 1024 * 64,
 		},
 		deviceState: DeviceState{
-			Address: os.Getenv("ONVIF_ADDR"),
+			Address: "",
 		},
 		snapshotFPS: 1,
 	}
@@ -114,6 +115,7 @@ func (h *Handler) RegisterRoutes() http.Handler {
 	r.Get("/api/camera/discover", h.handleDiscover)
 	r.Get("/api/camera/info", h.handleCameraInfo)
 	r.Post("/api/camera/connect", h.handleConnect)
+	r.Get("/api/camera/device-info", h.handleDeviceInfo)
 	r.Get("/api/llm/config", h.handleLLMGetConfig)
 	r.Post("/api/llm/config", h.handleLLMSetConfig)
 	r.Get("/api/settings", h.handleGetSettings)
@@ -142,29 +144,6 @@ func (h *Handler) handleDiscover(w http.ResponseWriter, r *http.Request) {
 			if !seen[d.Address] {
 				allDevices = append(allDevices, d)
 			}
-		}
-	}
-
-	defaultAddr := h.deviceState.Address
-	if defaultAddr == "" || defaultAddr == "未连接" {
-		defaultAddr = ""
-	} else if !strings.HasPrefix(defaultAddr, "http") {
-		defaultAddr = "http://" + defaultAddr
-	}
-
-	hasDefault := false
-	if defaultAddr != "" {
-		for _, d := range allDevices {
-			if d.Address == defaultAddr {
-				hasDefault = true
-				break
-			}
-		}
-		if !hasDefault {
-			allDevices = append([]discovery.Device{{
-				Address: defaultAddr,
-				XAddrs:  []string{defaultAddr},
-			}}, allDevices...)
 		}
 	}
 
@@ -198,6 +177,33 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "connecting", "address": req.Address})
+}
+
+func (h *Handler) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
+	address := r.URL.Query().Get("address")
+	if address == "" {
+		http.Error(w, `{"error":"missing address"}`, http.StatusBadRequest)
+		return
+	}
+
+	client := onvif.NewClient(onvif.Config{
+		DeviceAddr: address,
+		Timeout:    5 * time.Second,
+	})
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	info, err := client.GetDeviceInformation(ctx)
+	if err != nil {
+		log.Printf("GetDeviceInformation for %s failed: %v", address, err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(info)
 }
 
 func (h *Handler) handleCameraInfo(w http.ResponseWriter, r *http.Request) {
