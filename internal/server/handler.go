@@ -30,12 +30,14 @@ type Handler struct {
 	upgrader      websocket.Upgrader
 	deviceState   DeviceState
 	llmConfig     *LLMConfig
+	snapshotFPS   int
 	onConnect     func(address string)
 	onAudioData   func([]byte)
 	onAudioStart  func()
 	onAudioStop   func()
 	onSpeechText  func(string)
 	onCameraListen func()
+	onClearHistory func()
 	onSwitchMode  func(string)
 	onLLMUpdate   func(baseURL, apiKey, model string)
 	mu            sync.RWMutex
@@ -59,10 +61,11 @@ func NewHandler(hub *ws.Hub, listener *discovery.Listener) *Handler {
 		deviceState: DeviceState{
 			Address: os.Getenv("ONVIF_ADDR"),
 		},
+		snapshotFPS: 1,
 	}
 }
 
-func (h *Handler) SetAudioCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onMode func(string)) {
+func (h *Handler) SetAudioCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onClear func(), onMode func(string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onAudioData = onData
@@ -70,6 +73,7 @@ func (h *Handler) SetAudioCallbacks(onData func([]byte), onStart func(), onStop 
 	h.onAudioStop = onStop
 	h.onSpeechText = onSpeech
 	h.onCameraListen = onCamera
+	h.onClearHistory = onClear
 	h.onSwitchMode = onMode
 }
 
@@ -110,6 +114,8 @@ func (h *Handler) RegisterRoutes() http.Handler {
 	r.Post("/api/camera/connect", h.handleConnect)
 	r.Get("/api/llm/config", h.handleLLMGetConfig)
 	r.Post("/api/llm/config", h.handleLLMSetConfig)
+	r.Get("/api/settings", h.handleGetSettings)
+	r.Post("/api/settings", h.handleSetSettings)
 
 	fileServer := http.FileServer(http.Dir("web/dist"))
 	r.Handle("/*", fileServer)
@@ -201,6 +207,15 @@ func (h *Handler) handleCameraInfo(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(state)
 }
 
+func (h *Handler) GetSnapshotFPS() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.snapshotFPS <= 0 {
+		return 1
+	}
+	return h.snapshotFPS
+}
+
 func (h *Handler) SetLLMUpdateCallback(fn func(baseURL, apiKey, model string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -258,6 +273,33 @@ func (h *Handler) handleLLMSetConfig(w http.ResponseWriter, r *http.Request) {
 		go h.onLLMUpdate(req.BaseURL, req.APIKey, req.Model)
 	}
 
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"snapshot_fps": h.snapshotFPS,
+	})
+}
+
+func (h *Handler) handleSetSettings(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SnapshotFPS int `json:"snapshot_fps"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if req.SnapshotFPS < 0 || req.SnapshotFPS > 30 {
+		req.SnapshotFPS = 1
+	}
+	h.mu.Lock()
+	h.snapshotFPS = req.SnapshotFPS
+	h.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
@@ -339,6 +381,13 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			h.mu.RLock()
 			if h.onCameraListen != nil {
 				h.onCameraListen()
+			}
+			h.mu.RUnlock()
+
+		case ws.MsgTypeClearHistory:
+			h.mu.RLock()
+			if h.onClearHistory != nil {
+				h.onClearHistory()
 			}
 			h.mu.RUnlock()
 		}

@@ -27,6 +27,7 @@ const llmBaseURL = ref('')
 const llmApiKey = ref('')
 const llmModel = ref('')
 const llmSaving = ref(false)
+const snapshotFps = ref(1)
 
 const { messages, popNewMessages } = useWebSocket('/ws')
 
@@ -96,7 +97,44 @@ onMounted(async () => {
 
   discoverDevices()
   fetchLLMConfig()
+  loadSettings()
 })
+
+function loadSettings() {
+  try {
+    const saved = localStorage.getItem('onvif-ai-settings')
+    if (saved) {
+      const s = JSON.parse(saved)
+      snapshotFps.value = s.snapshotFps || 1
+    }
+  } catch {}
+  fetchSettings()
+}
+
+async function fetchSettings() {
+  try {
+    const resp = await fetch('/api/settings')
+    if (resp.ok) {
+      const s = await resp.json()
+      snapshotFps.value = s.snapshot_fps || 1
+    }
+  } catch {}
+}
+
+async function saveSettings() {
+  try {
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ snapshot_fps: snapshotFps.value }),
+    })
+    localStorage.setItem('onvif-ai-settings', JSON.stringify({
+      snapshotFps: snapshotFps.value,
+    }))
+  } catch (e) {
+    console.error('Save settings failed:', e)
+  }
+}
 
 async function fetchLLMConfig() {
   try {
@@ -179,6 +217,11 @@ async function saveLLMConfig() {
       <button class="device-info__llm-save" @click="saveLLMConfig" :disabled="llmSaving">
         {{ llmSaving ? '保存中...' : '保存' }}
       </button>
+
+      <div class="device-info__llm-field">
+        <label>快照帧率 ({{ snapshotFps }} FPS)</label>
+        <input type="range" v-model.number="snapshotFps" min="1" max="10" @change="saveSettings" />
+      </div>
     </div>
   </div>
 </template>

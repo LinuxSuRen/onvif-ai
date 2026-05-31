@@ -13,7 +13,8 @@ const (
 	MsgTypeAudioStop   MessageType = "audio_stop"   // Stop mic capture
 	MsgTypeSpeechText   MessageType = "speech_text"   // Recognized speech text from browser
 	MsgTypeCameraListen MessageType = "camera_listen" // Trigger STT on buffered camera audio
-	MsgTypeSwitchMode   MessageType = "switch_mode"   // Switch audio mode
+	MsgTypeClearHistory MessageType = "clear_history"  // Clear conversation history
+	MsgTypeSwitchMode   MessageType = "switch_mode"    // Switch audio mode
 
 	// Server → Client
 	MsgTypeVideoNAL  MessageType = "video_nal"  // H.264 NAL unit (base64)

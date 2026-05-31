@@ -113,7 +113,7 @@ type cameraManager struct {
 	cameraAudioBuf    []byte
 	cameraAudioBufMax int
 
-	snapFetchCount int
+	history []llm.Message
 }
 
 func (cm *cameraManager) connect(address string) {
@@ -292,12 +292,7 @@ func (cm *cameraManager) fetchAndShowSnapshot(snapshotURL string) {
 		return
 	}
 
-	cm.mu.Lock()
-	cm.mu.Unlock()
-	cm.snapFetchCount++
-	if cm.snapFetchCount == 1 || cm.snapFetchCount%30 == 0 {
-		log.Printf("Snapshot: %d bytes (fetch #%d)", len(jpeg), cm.snapFetchCount)
-	}
+	log.Printf("Snapshot fetched: %d bytes", len(jpeg))
 	cm.hub.BroadcastVideoJPEG(jpeg)
 }
 
@@ -306,16 +301,26 @@ func (cm *cameraManager) startSnapshotLoop(snapshotURL string, stopCh chan struc
 		return
 	}
 
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
+	lastTick := time.Now()
 	for {
+		fps := cm.handler.GetSnapshotFPS()
+		interval := time.Second / time.Duration(fps)
+		if interval < 33*time.Millisecond {
+			interval = 33 * time.Millisecond
+		}
+
 		select {
 		case <-stopCh:
 			return
-		case <-ticker.C:
-			cm.fetchAndShowSnapshot(snapshotURL)
+		case <-time.After(interval):
 		}
+
+		now := time.Now()
+		if now.Sub(lastTick) < interval-time.Millisecond*10 {
+			continue
+		}
+		lastTick = now
+		cm.fetchAndShowSnapshot(snapshotURL)
 	}
 }
 
@@ -328,7 +333,7 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 			hub.BroadcastStatus(ws.StatusThinking)
 			go func(prompt string) {
 				bc := cm.getBackchannel()
-				processLLMResponse(cm.llmClient, cm.ttsClient, hub, bc, prompt)
+				processLLMResponseWithHistory(cm.llmClient, cm.ttsClient, hub, bc, prompt, &cm.history)
 				hub.BroadcastStatus(ws.StatusIdle)
 			}(text)
 		},
@@ -339,6 +344,13 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 				cm.processCameraAudio()
 				hub.BroadcastStatus(ws.StatusIdle)
 			}()
+		},
+		func() {
+			cm.mu.Lock()
+			cm.history = nil
+			cm.mu.Unlock()
+			log.Println("Conversation history cleared")
+			hub.BroadcastStatus(ws.StatusIdle)
 		},
 		func(mode string) {
 			log.Printf("Audio mode: %s", mode)
@@ -382,7 +394,7 @@ func (cm *cameraManager) processCameraAudio() {
 	}
 
 	bc := cm.getBackchannel()
-	processLLMResponse(cm.llmClient, cm.ttsClient, cm.hub, bc, text)
+	processLLMResponseWithHistory(cm.llmClient, cm.ttsClient, cm.hub, bc, text, &cm.history)
 }
 
 func (cm *cameraManager) disconnect() {
@@ -406,14 +418,23 @@ func (cm *cameraManager) disconnect() {
 }
 
 func processLLMResponse(llmClient *llm.Client, ttsClient *tts.Client, hub *ws.Hub, backchannel *rtsp.Backchannel, prompt string) {
+	processLLMResponseWithHistory(llmClient, ttsClient, hub, backchannel, prompt, nil)
+}
+
+func processLLMResponseWithHistory(llmClient *llm.Client, ttsClient *tts.Client, hub *ws.Hub, backchannel *rtsp.Backchannel, prompt string, history *[]llm.Message) {
 	ctx := context.Background()
 
 	log.Printf("LLM prompt: %s", prompt)
 
 	messages := []llm.Message{
 		{Role: "system", Content: "你是一个友好的语音助手。请用简洁的中文回答用户的问题，回答控制在2-3句话以内，适合语音播放。"},
-		{Role: "user", Content: prompt},
 	}
+
+	if history != nil {
+		messages = append(messages, *history...)
+	}
+
+	messages = append(messages, llm.Message{Role: "user", Content: prompt})
 
 	fullText, err := llmClient.ChatStream(ctx, messages, func(chunk string) error {
 		hub.BroadcastTranscript(chunk)
@@ -426,6 +447,17 @@ func processLLMResponse(llmClient *llm.Client, ttsClient *tts.Client, hub *ws.Hu
 	}
 
 	log.Printf("LLM response: %s", fullText)
+
+	if history != nil && fullText != "" {
+		*history = append(*history,
+			llm.Message{Role: "user", Content: prompt},
+			llm.Message{Role: "assistant", Content: fullText},
+		)
+		const maxHistory = 20
+		if len(*history) > maxHistory {
+			*history = (*history)[len(*history)-maxHistory:]
+		}
+	}
 
 	hub.BroadcastStatus(ws.StatusSpeaking)
 
