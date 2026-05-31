@@ -300,7 +300,7 @@ func (c *Client) parseSOAPResponse(body []byte, responseTag string, result inter
 }
 
 func stripNSPrefix(xmlStr string) string {
-	prefixes := []string{"tds:", "trt:", "tt:", "tptz:", "dn:", "d:", "a:", "s:", "xsd:", "xsi:", "wsse:", "wsu:"}
+	prefixes := []string{"tds:", "trt:", "tt:", "tptz:", "dn:", "d:", "a:", "s:", "SOAP-ENV:", "xsd:", "xsi:", "wsse:", "wsu:"}
 	for _, p := range prefixes {
 		xmlStr = strings.ReplaceAll(xmlStr, "<"+p, "<")
 		xmlStr = strings.ReplaceAll(xmlStr, "</"+p, "</")
