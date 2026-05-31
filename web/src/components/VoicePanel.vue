@@ -12,6 +12,7 @@ const transcript = ref('')
 const interimText = ref('')
 const errorMsg = ref('')
 const audioMode = ref<AudioMode>('browser_mic')
+let fullResponseText = ''
 
 const { messages, isConnected, send, popNewMessages } = useWebSocket('/ws')
 
@@ -58,6 +59,22 @@ const statusLabel = computed(() => {
 
 const isPressed = ref(false)
 
+function speakResponse() {
+  if (!fullResponseText) return
+  console.log('[VoicePanel] Speaking via SpeechSynthesis:', fullResponseText.substring(0, 50))
+
+  const utterance = new SpeechSynthesisUtterance(fullResponseText)
+  utterance.lang = 'zh-CN'
+  utterance.rate = 1.0
+  utterance.pitch = 1.0
+
+  const voices = speechSynthesis.getVoices()
+  const zhVoice = voices.find(v => v.lang.startsWith('zh'))
+  if (zhVoice) utterance.voice = zhVoice
+
+  speechSynthesis.speak(utterance)
+}
+
 function startTalk() {
   if (!isConnected.value) return
   isPressed.value = true
@@ -93,12 +110,17 @@ watch(messages, () => {
   for (const msg of newMsgs) {
     console.log('[VoicePanel] Received WS message:', msg.type, msg.payload || msg.text || '')
     if (msg.type === 'transcript' && msg.text) {
-      transcript.value += msg.text
+      if (msg.text === '\n\n') {
+        speakResponse()
+      } else {
+        transcript.value += msg.text
+        fullResponseText += msg.text
+      }
     }
     if (msg.type === 'status' && msg.payload?.state) {
       const state = msg.payload.state
       console.log('[VoicePanel] Status change:', state)
-      if (state === 'thinking') talkStatus.value = 'thinking'
+      if (state === 'thinking') { transcript.value = ''; fullResponseText = ''; talkStatus.value = 'thinking' }
       if (state === 'speaking') talkStatus.value = 'speaking'
       if (state === 'idle' && !isPressed.value) {
         talkStatus.value = 'idle'

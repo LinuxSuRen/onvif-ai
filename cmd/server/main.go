@@ -411,27 +411,19 @@ func processLLMResponse(llmClient *llm.Client, ttsClient *tts.Client, hub *ws.Hu
 
 	hub.BroadcastStatus(ws.StatusSpeaking)
 
-	pcmAudio, err := ttsClient.Synthesize(ctx, fullText)
-	if err != nil {
-		log.Printf("TTS error: %v", err)
-		hub.BroadcastError("语音合成失败: " + err.Error())
-		return
-	}
-
-	if len(pcmAudio) == 0 {
-		log.Println("TTS returned empty audio")
-		hub.BroadcastError("语音合成为空")
-		return
-	}
-
-	log.Printf("TTS audio: %d bytes", len(pcmAudio))
-	hub.BroadcastAudioPCM(pcmAudio)
-
 	if backchannel != nil {
-		if err := backchannel.WritePCM(pcmAudio); err != nil {
-			log.Printf("Backchannel error: %v", err)
+		pcmAudio, err := ttsClient.Synthesize(ctx, fullText)
+		if err != nil {
+			log.Printf("TTS error (backchannel only, browser uses SpeechSynthesis): %v", err)
+		} else if len(pcmAudio) > 0 {
+			log.Printf("TTS audio for backchannel: %d bytes", len(pcmAudio))
+			if err := backchannel.WritePCM(pcmAudio); err != nil {
+				log.Printf("Backchannel write error: %v", err)
+			}
 		}
 	}
+
+	hub.BroadcastTranscript("\n\n")
 }
 
 func getEnv(key, defaultVal string) string {
