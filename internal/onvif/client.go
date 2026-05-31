@@ -216,6 +216,34 @@ func (c *Client) GetSnapshotURI(ctx context.Context, profileToken string) (strin
 	return result.MediaURI.URI, nil
 }
 
+func (c *Client) GetDeviceInformation(ctx context.Context) (*DeviceInformation, error) {
+	body := c.soapEnvelope(`<tds:GetDeviceInformation></tds:GetDeviceInformation>`)
+
+	resp, err := c.soapCall(ctx, c.deviceURL(), deviceServiceURL, "GetDeviceInformation", body)
+	if err != nil {
+		return nil, fmt.Errorf("GetDeviceInformation: %w", err)
+	}
+
+	var result struct {
+		Manufacturer    string `xml:"GetDeviceInformationResponse>Manufacturer"`
+		Model           string `xml:"GetDeviceInformationResponse>Model"`
+		FirmwareVersion string `xml:"GetDeviceInformationResponse>FirmwareVersion"`
+		SerialNumber    string `xml:"GetDeviceInformationResponse>SerialNumber"`
+		HardwareID      string `xml:"GetDeviceInformationResponse>HardwareId"`
+	}
+	if err := c.parseSOAPResponse(resp, "GetDeviceInformationResponse", &result); err != nil {
+		return nil, fmt.Errorf("parse device information: %w", err)
+	}
+
+	return &DeviceInformation{
+		Manufacturer:    result.Manufacturer,
+		Model:           result.Model,
+		FirmwareVersion: result.FirmwareVersion,
+		SerialNumber:    result.SerialNumber,
+		HardwareID:      result.HardwareID,
+	}, nil
+}
+
 func (c *Client) soapEnvelope(body string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"

@@ -25,9 +25,10 @@ type SnapshotURI struct {
 	URI string
 }
 
-func DefaultConfig() Config {
-	return Config{
-		DeviceAddr: "192.168.1.138:8089/onvif/device_service",
-		Timeout:    10 * time.Second,
-	}
+type DeviceInformation struct {
+	Manufacturer    string
+	Model           string
+	FirmwareVersion string
+	SerialNumber    string
+	HardwareID      string
 }
