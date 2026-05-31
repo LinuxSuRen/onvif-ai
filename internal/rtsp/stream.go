@@ -2,7 +2,7 @@ package rtsp
 
 import (
 	"fmt"
-	"net/url"
+	"strings"
 
 	"github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
@@ -37,7 +37,11 @@ func (s *Stream) OnAudioPCM(handler func([]byte)) {
 }
 
 func (s *Stream) Connect() error {
-	u, err := url.Parse(s.rawURL)
+	if !strings.HasPrefix(s.rawURL, "rtsp://") && !strings.HasPrefix(s.rawURL, "rtsps://") {
+		return fmt.Errorf("not an RTSP URL: %s", s.rawURL)
+	}
+
+	u, err := parseRTSPURL(s.rawURL)
 	if err != nil {
 		return fmt.Errorf("parse RTSP URL: %w", err)
 	}
@@ -150,4 +154,25 @@ func (s *Stream) Close() {
 	if s.client != nil {
 		s.client.Close()
 	}
+}
+
+type rtspURLInfo struct {
+	Scheme string
+	Host   string
+}
+
+func parseRTSPURL(rawURL string) (rtspURLInfo, error) {
+	s := rawURL
+	scheme := "rtsp"
+	if after, found := strings.CutPrefix(s, "rtsp://"); found {
+		s = after
+	} else if after, found := strings.CutPrefix(s, "rtsps://"); found {
+		s = after
+		scheme = "rtsps"
+	}
+	host := s
+	if idx := strings.IndexByte(s, '/'); idx >= 0 {
+		host = s[:idx]
+	}
+	return rtspURLInfo{Scheme: scheme, Host: host}, nil
 }
