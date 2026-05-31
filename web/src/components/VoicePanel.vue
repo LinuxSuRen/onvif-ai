@@ -13,6 +13,8 @@ const interimText = ref('')
 const errorMsg = ref('')
 const audioMode = ref<AudioMode>('browser_mic')
 let fullResponseText = ''
+const availableVoices = ref<SpeechSynthesisVoice[]>([])
+const selectedVoice = ref('')
 
 const { messages, isConnected, send, popNewMessages } = useWebSocket('/ws')
 
@@ -68,11 +70,24 @@ function speakResponse() {
   utterance.rate = 1.0
   utterance.pitch = 1.0
 
-  const voices = speechSynthesis.getVoices()
-  const zhVoice = voices.find(v => v.lang.startsWith('zh'))
-  if (zhVoice) utterance.voice = zhVoice
+  loadVoices()
+  if (selectedVoice.value) {
+    const v = availableVoices.value.find(vo => vo.name === selectedVoice.value)
+    if (v) utterance.voice = v
+  } else {
+    const zhCN = availableVoices.value.find(v => v.lang === 'zh-CN')
+    const zh = availableVoices.value.find(v => v.lang.startsWith('zh-CN'))
+    utterance.voice = zhCN || zh || null
+  }
 
   speechSynthesis.speak(utterance)
+}
+
+function loadVoices() {
+  const voices = speechSynthesis.getVoices()
+  if (voices.length > 0) {
+    availableVoices.value = voices.filter(v => v.lang.startsWith('zh'))
+  }
 }
 
 function startTalk() {
@@ -179,6 +194,15 @@ watch(messages, () => {
       </button>
 
       <div v-if="errorMsg" class="voice-panel__error">{{ errorMsg }}</div>
+
+      <div class="voice-panel__voice-select">
+        <select v-model="selectedVoice" @focus="loadVoices" class="voice-panel__voice-dropdown">
+          <option value="">自动选择（普通话）</option>
+          <option v-for="v in availableVoices" :key="v.name" :value="v.name">
+            {{ v.name }} ({{ v.lang }})
+          </option>
+        </select>
+      </div>
 
       <div v-if="transcript" class="voice-panel__transcript">
         <div class="voice-panel__transcript-label">对话记录</div>
@@ -322,13 +346,19 @@ watch(messages, () => {
 }
 
 .voice-panel__error {
-  font-size: 0.7rem;
-  color: #ff3d57;
-  background: rgba(255, 61, 87, 0.08);
-  padding: 6px 10px;
-  border-radius: 4px;
+  font-size: 0.7rem; color: #ff3d57;
+  background: rgba(255, 61, 87, 0.08); padding: 6px 10px;
+  border-radius: 4px; width: 100%; text-align: center;
+}
+
+.voice-panel__voice-select {
   width: 100%;
-  text-align: center;
+}
+
+.voice-panel__voice-dropdown {
+  width: 100%; padding: 4px 8px;
+  background: #0a0e14; border: 1px solid #1e2530;
+  border-radius: 4px; color: #7a8490; font-size: 0.65rem;
 }
 
 .voice-panel__transcript {

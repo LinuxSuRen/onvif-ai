@@ -112,6 +112,8 @@ type cameraManager struct {
 
 	cameraAudioBuf    []byte
 	cameraAudioBufMax int
+
+	snapFetchCount int
 }
 
 func (cm *cameraManager) connect(address string) {
@@ -269,16 +271,13 @@ func tryFallbackSnapshotURL(deviceAddr string) string {
 
 func (cm *cameraManager) fetchAndShowSnapshot(snapshotURL string) {
 	if snapshotURL == "" {
-		log.Println("No snapshot URL available")
 		return
 	}
 
-	log.Printf("Fetching snapshot from: %s", snapshotURL)
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	resp, err := httpClient.Get(snapshotURL)
 	if err != nil {
 		log.Printf("Snapshot fetch failed: %v", err)
-		cm.hub.BroadcastError("快照获取失败: " + err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -286,11 +285,19 @@ func (cm *cameraManager) fetchAndShowSnapshot(snapshotURL string) {
 	jpeg, err := io.ReadAll(resp.Body)
 	if err != nil || len(jpeg) == 0 {
 		log.Printf("Snapshot read failed: %v (size=%d)", err, len(jpeg))
-		cm.hub.BroadcastError("快照数据为空")
+		return
+	}
+	if len(jpeg) < 100 {
+		log.Printf("Snapshot too small (%d bytes), likely not a valid JPEG", len(jpeg))
 		return
 	}
 
-	log.Printf("Snapshot fetched: %d bytes", len(jpeg))
+	cm.mu.Lock()
+	cm.mu.Unlock()
+	cm.snapFetchCount++
+	if cm.snapFetchCount == 1 || cm.snapFetchCount%30 == 0 {
+		log.Printf("Snapshot: %d bytes (fetch #%d)", len(jpeg), cm.snapFetchCount)
+	}
 	cm.hub.BroadcastVideoJPEG(jpeg)
 }
 

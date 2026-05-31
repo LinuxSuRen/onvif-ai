@@ -279,7 +279,23 @@ func (c *Client) parseSOAPResponse(body []byte, responseTag string, result inter
 		return fmt.Errorf("unmarshal SOAP envelope: %w", err)
 	}
 	cleaned := stripNSPrefix(envelope.Body.InnerXML)
+	cleaned = stripResponseWrapper(cleaned, responseTag)
 	return xml.Unmarshal([]byte("<root>"+cleaned+"</root>"), result)
+}
+
+func stripResponseWrapper(xmlStr, tag string) string {
+	if idx := strings.Index(xmlStr, "<"+tag); idx >= 0 {
+		end := strings.Index(xmlStr[idx:], ">")
+		if end > 0 {
+			xmlStr = xmlStr[idx+end+1:]
+		}
+	}
+	xmlStr = strings.TrimSpace(xmlStr)
+	suffix := "</" + tag + ">"
+	if strings.HasSuffix(xmlStr, suffix) {
+		xmlStr = xmlStr[:len(xmlStr)-len(suffix)]
+	}
+	return xmlStr
 }
 
 func stripNSPrefix(xmlStr string) string {
