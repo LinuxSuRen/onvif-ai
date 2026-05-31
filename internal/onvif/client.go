@@ -86,11 +86,10 @@ func (c *Client) discoverServices(ctx context.Context) error {
 	}
 
 	var result struct {
-		XMLName  xml.Name `xml:"GetServicesResponse"`
 		Services []struct {
 			Namespace string `xml:"Namespace"`
 			XAddr     string `xml:"XAddr"`
-		} `xml:"Service"`
+		} `xml:"GetServicesResponse>Service"`
 	}
 	if err := c.parseSOAPResponse(resp, "GetServicesResponse", &result); err != nil {
 		return fmt.Errorf("parse services: %w", err)
@@ -138,11 +137,10 @@ func (c *Client) GetProfiles(ctx context.Context) ([]Profile, error) {
 	}
 
 	var result struct {
-		XMLName  xml.Name `xml:"GetProfilesResponse"`
 		Profiles []struct {
 			Token string `xml:"token,attr"`
 			Name  string `xml:"Name"`
-		} `xml:"Profiles"`
+		} `xml:"GetProfilesResponse>Profiles"`
 	}
 	if err := c.parseSOAPResponse(resp, "GetProfilesResponse", &result); err != nil {
 		return nil, fmt.Errorf("parse profiles: %w", err)
@@ -174,13 +172,12 @@ func (c *Client) GetStreamURI(ctx context.Context, profileToken string) (*Stream
 	}
 
 	var result struct {
-		XMLName xml.Name `xml:"GetStreamUriResponse"`
 		MediaURI struct {
 			URI                 string `xml:"Uri"`
 			Timeout             string `xml:"Timeout"`
 			InvalidAfterConnect bool   `xml:"InvalidAfterConnect"`
 			InvalidAfterReboot  bool   `xml:"InvalidAfterReboot"`
-		} `xml:"MediaUri"`
+		} `xml:"GetStreamUriResponse>MediaUri"`
 	}
 	if err := c.parseSOAPResponse(resp, "GetStreamUriResponse", &result); err != nil {
 		return nil, fmt.Errorf("parse stream URI: %w", err)
@@ -209,10 +206,9 @@ func (c *Client) GetSnapshotURI(ctx context.Context, profileToken string) (strin
 	}
 
 	var result struct {
-		XMLName  xml.Name `xml:"GetSnapshotUriResponse"`
 		MediaURI struct {
 			URI string `xml:"Uri"`
-		} `xml:"MediaUri"`
+		} `xml:"GetSnapshotUriResponse>MediaUri"`
 	}
 	if err := c.parseSOAPResponse(resp, "GetSnapshotUriResponse", &result); err != nil {
 		return "", fmt.Errorf("parse snapshot URI: %w", err)

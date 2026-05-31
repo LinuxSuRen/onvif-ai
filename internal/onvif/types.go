@@ -1,7 +1,5 @@
 package onvif
 
-import "encoding/xml"
-
 const (
 	deviceNamespace  = "http://www.onvif.org/ver10/device/wsdl"
 	mediaNamespace   = "http://www.onvif.org/ver10/media/wsdl"
@@ -11,11 +9,10 @@ const (
 )
 
 type Capabilities struct {
-	XMLName xml.Name              `xml:"GetCapabilitiesResponse"`
-	Device  *DeviceCapabilities  `xml:"Device"`
-	Media   *MediaCapabilities   `xml:"Media"`
-	PTZ     *PTZCapabilities     `xml:"PTZ"`
-	Imaging *ImagingCapabilities `xml:"Imaging"`
+	Device  *DeviceCapabilities  `xml:"GetCapabilitiesResponse>Device"`
+	Media   *MediaCapabilities   `xml:"GetCapabilitiesResponse>Media"`
+	PTZ     *PTZCapabilities     `xml:"GetCapabilitiesResponse>PTZ"`
+	Imaging *ImagingCapabilities `xml:"GetCapabilitiesResponse>Imaging"`
 }
 
 type DeviceCapabilities struct {
