@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, computed, watch, reactive } from 'vue'
 import { useWebSocket } from '../composables/useWebSocket'
 
 interface DiscoveredDevice {
@@ -8,6 +8,14 @@ interface DiscoveredDevice {
   scopes: string[]
   xaddrs: string[]
   metadata_version: number
+}
+
+interface DeviceInfo {
+  Manufacturer: string
+  Model: string
+  FirmwareVersion: string
+  SerialNumber: string
+  HardwareID: string
 }
 
 interface DeviceState {
@@ -23,6 +31,65 @@ const discovering = ref(false)
 const connecting = ref(false)
 const discoverError = ref('')
 const showLLMSettings = ref(false)
+const expandedAddress = ref<string | null>(null)
+const deviceInfoMap = reactive<Record<string, { loading: boolean; data?: DeviceInfo; error?: string }>>({})
+
+async function fetchDeviceInfo(addr: string) {
+  if (deviceInfoMap[addr]?.data || deviceInfoMap[addr]?.loading) return
+  deviceInfoMap[addr] = { loading: true }
+  try {
+    const resp = await fetch(`/api/camera/device-info?address=${encodeURIComponent(addr)}`)
+    if (resp.ok) {
+      deviceInfoMap[addr] = { loading: false, data: await resp.json() }
+    } else {
+      const err = await resp.json().catch(() => ({ error: 'unknown' }))
+      deviceInfoMap[addr] = { loading: false, error: err.error || '获取失败' }
+    }
+  } catch {
+    deviceInfoMap[addr] = { loading: false, error: '网络错误' }
+  }
+}
+
+function scopeValue(scopes: string[], key: string): string {
+  const prefix = `onvif://www.onvif.org/${key}/`
+  for (const s of scopes || []) {
+    if (s.startsWith(prefix)) return s.slice(prefix.length)
+  }
+  return ''
+}
+
+function friendlyAddress(addr: string): string {
+  try {
+    const u = new URL(addr.startsWith('http') ? addr : 'http://' + addr)
+    return u.hostname
+  } catch {
+    return addr
+  }
+}
+
+function toggleDetail(addr: string) {
+  const isExpanding = expandedAddress.value !== addr
+  expandedAddress.value = isExpanding ? addr : null
+  if (isExpanding) fetchDeviceInfo(addr)
+}
+
+function getDeviceName(d: DiscoveredDevice): string {
+  return scopeValue(d.scopes, 'name') || scopeValue(d.scopes, 'hardware') || friendlyAddress(d.address)
+}
+
+function getDeviceType(d: DiscoveredDevice): string {
+  for (const t of d.types || []) {
+    // e.g. "dn:NetworkVideoTransmitter" → "Network Video Transmitter"
+    const parts = t.split(':')
+    const name = parts[parts.length - 1]
+    if (name) return name.replace(/([A-Z])/g, ' $1').trim()
+  }
+  return ''
+}
+
+function scopeTags(scopes: string[]): string[] {
+  return (scopes || []).map(s => (s || '').split('/').pop() || '').filter(Boolean)
+}
 const llmBaseURL = ref('')
 const llmApiKey = ref('')
 const llmModel = ref('')
@@ -185,14 +252,92 @@ async function saveLLMConfig() {
     <div v-if="discoverError" class="device-info__error">{{ discoverError }}</div>
     <div v-if="devices.length > 0" class="device-info__list">
       <div v-for="d in devices" :key="d.address" class="device-info__device"
-        :class="{ 'device-info__device--active': deviceState.address === d.address }">
-        <div class="device-info__device-addr">{{ d.address }}</div>
-        <div class="device-info__device-scopes">
-          <span v-for="s in (d.scopes || []).slice(0, 3)" :key="s" class="device-info__scope-tag">{{ (s || '').split('/').pop() }}</span>
+        :class="{
+          'device-info__device--active': deviceState.address === d.address,
+          'device-info__device--expanded': expandedAddress === d.address
+        }"
+        @click="toggleDetail(d.address)">
+        <div class="device-info__device-row">
+          <div class="device-info__device-main">
+            <span class="device-info__device-name">{{ getDeviceName(d) }}</span>
+            <span v-if="getDeviceType(d)" class="device-info__device-type-tag">{{ getDeviceType(d) }}</span>
+          </div>
+          <div class="device-info__device-meta">
+            <span class="device-info__device-ip">{{ friendlyAddress(d.address) }}</span>
+            <button class="device-info__connect-btn" :disabled="connecting" @click.stop="connectDevice(d.address)">
+              {{ connecting && deviceState.address === d.address ? '连接中...' : '连接' }}
+            </button>
+          </div>
         </div>
-        <button class="device-info__connect-btn" :disabled="connecting" @click.stop="connectDevice(d.address)">
-          {{ connecting && deviceState.address === d.address ? '连接中...' : '连接' }}
-        </button>
+        <div v-if="expandedAddress === d.address" class="device-info__device-detail" @click.stop>
+          <div v-if="deviceInfoMap[d.address]?.loading" class="device-info__detail-section">
+            <span class="device-info__detail-label">信息</span>
+            <span class="device-info__detail-value" style="color: #7a8490;">加载中...</span>
+          </div>
+          <div v-else-if="deviceInfoMap[d.address]?.data" class="device-info__detail-section">
+            <span class="device-info__detail-label">信息</span>
+            <div class="device-info__detail-grid">
+              <div v-if="deviceInfoMap[d.address]!.data!.Manufacturer" class="device-info__detail-grid-item">
+                <span class="device-info__detail-grid-label">厂家</span>
+                <span class="device-info__detail-value">{{ deviceInfoMap[d.address]!.data!.Manufacturer }}</span>
+              </div>
+              <div v-if="deviceInfoMap[d.address]!.data!.Model" class="device-info__detail-grid-item">
+                <span class="device-info__detail-grid-label">型号</span>
+                <span class="device-info__detail-value">{{ deviceInfoMap[d.address]!.data!.Model }}</span>
+              </div>
+              <div v-if="deviceInfoMap[d.address]!.data!.FirmwareVersion" class="device-info__detail-grid-item">
+                <span class="device-info__detail-grid-label">固件</span>
+                <span class="device-info__detail-value device-info__detail-value--mono">{{ deviceInfoMap[d.address]!.data!.FirmwareVersion }}</span>
+              </div>
+              <div v-if="deviceInfoMap[d.address]!.data!.SerialNumber" class="device-info__detail-grid-item">
+                <span class="device-info__detail-grid-label">序列号</span>
+                <span class="device-info__detail-value device-info__detail-value--mono">{{ deviceInfoMap[d.address]!.data!.SerialNumber }}</span>
+              </div>
+              <div v-if="deviceInfoMap[d.address]!.data!.HardwareID" class="device-info__detail-grid-item">
+                <span class="device-info__detail-grid-label">硬件 ID</span>
+                <span class="device-info__detail-value device-info__detail-value--mono">{{ deviceInfoMap[d.address]!.data!.HardwareID }}</span>
+              </div>
+            </div>
+          </div>
+          <div v-else-if="deviceInfoMap[d.address]?.error" class="device-info__detail-section">
+            <span class="device-info__detail-label">信息</span>
+            <span class="device-info__detail-value" style="color: #ff3d57;">{{ deviceInfoMap[d.address]!.error }}</span>
+          </div>
+          <div class="device-info__detail-section">
+            <span class="device-info__detail-label">地址</span>
+            <span class="device-info__detail-value device-info__detail-value--mono">{{ d.address }}</span>
+          </div>
+          <div v-if="scopeValue(d.scopes, 'hardware')" class="device-info__detail-section">
+            <span class="device-info__detail-label">硬件</span>
+            <span class="device-info__detail-value">{{ scopeValue(d.scopes, 'hardware') }}</span>
+          </div>
+          <div v-if="scopeValue(d.scopes, 'location')" class="device-info__detail-section">
+            <span class="device-info__detail-label">位置</span>
+            <span class="device-info__detail-value">{{ scopeValue(d.scopes, 'location') }}</span>
+          </div>
+          <div v-if="scopeTags(d.scopes).length" class="device-info__detail-section">
+            <span class="device-info__detail-label">Scopes</span>
+            <div class="device-info__detail-tags">
+              <span v-for="s in scopeTags(d.scopes)" :key="s" class="device-info__scope-tag">{{ s }}</span>
+            </div>
+          </div>
+          <div v-if="d.xaddrs?.length" class="device-info__detail-section">
+            <span class="device-info__detail-label">XAddrs</span>
+            <div class="device-info__detail-list">
+              <span v-for="x in d.xaddrs" :key="x" class="device-info__detail-value device-info__detail-value--mono">{{ x }}</span>
+            </div>
+          </div>
+          <div v-if="d.types?.length" class="device-info__detail-section">
+            <span class="device-info__detail-label">类型</span>
+            <div class="device-info__detail-tags">
+              <span v-for="t in d.types" :key="t" class="device-info__scope-tag device-info__scope-tag--type">{{ t }}</span>
+            </div>
+          </div>
+          <div class="device-info__detail-section">
+            <span class="device-info__detail-label">元数据版本</span>
+            <span class="device-info__detail-value">{{ d.metadata_version }}</span>
+          </div>
+        </div>
       </div>
     </div>
     <div v-else-if="!discovering && !discoverError" class="device-info__hint">点击「搜索设备」发现局域网 ONVIF 摄像头</div>
@@ -218,7 +363,7 @@ async function saveLLMConfig() {
         {{ llmSaving ? '保存中...' : '保存' }}
       </button>
 
-      <div class="device-info__llm-field">
+      <div v-if="deviceState.snapshot_mode" class="device-info__llm-field">
         <label>快照帧率 ({{ snapshotFps }} FPS)</label>
         <input type="range" v-model.number="snapshotFps" min="1" max="10" @change="saveSettings" />
       </div>
@@ -245,14 +390,36 @@ async function saveLLMConfig() {
 @keyframes spin { to { transform: rotate(360deg); } }
 .device-info__error { color: #ff3d57; font-size: 0.75rem; padding: 6px 8px; background: rgba(255,61,87,.1); border-radius: 4px; }
 .device-info__hint { color: #5a6470; font-size: 0.75rem; text-align: center; padding: 8px; }
-.device-info__list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
+.device-info__list { display: flex; flex-direction: column; gap: 6px; max-height: 360px; overflow-y: auto; }
 .device-info__device { padding: 8px 10px; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06); border-radius: 6px; cursor: pointer; transition: all .15s; }
 .device-info__device:hover { background: rgba(255,255,255,.06); }
 .device-info__device--active { border-color: rgba(0,229,160,.3); background: rgba(0,229,160,.05); }
-.device-info__device-addr { font-size: 0.75rem; color: #c8d0d8; margin-bottom: 4px; word-break: break-all; }
-.device-info__device-scopes { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
-.device-info__scope-tag { font-size: 0.6rem; padding: 1px 6px; background: rgba(0,145,255,.12); color: #0091ff; border-radius: 3px; }
-.device-info__connect-btn { font-size: 0.7rem; padding: 2px 10px; background: rgba(0,229,160,.12); border: 1px solid rgba(0,229,160,.25); border-radius: 4px; color: #00e5a0; cursor: pointer; }
+.device-info__device--expanded { border-color: rgba(0,145,255,.25); background: rgba(0,145,255,.04); }
+
+.device-info__device-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.device-info__device-main { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 1; }
+.device-info__device-name { font-size: 0.78rem; color: #c8d0d8; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.device-info__device-type-tag { font-size: 0.55rem; padding: 1px 5px; background: rgba(122,132,144,.15); color: #7a8490; border-radius: 3px; white-space: nowrap; flex-shrink: 0; }
+.device-info__device-meta { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.device-info__device-ip { font-size: 0.65rem; color: #5a6470; font-family: monospace; }
+
+.device-info__device-detail { margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,.06); display: flex; flex-direction: column; gap: 6px; }
+.device-info__detail-section { display: flex; align-items: flex-start; gap: 8px; }
+.device-info__detail-label { font-size: 0.62rem; color: #5a6470; text-transform: uppercase; letter-spacing: 0.04em; min-width: 55px; flex-shrink: 0; padding-top: 1px; }
+.device-info__detail-value { font-size: 0.68rem; color: #9098a4; word-break: break-all; }
+.device-info__detail-value--mono { font-family: monospace; font-size: 0.62rem; }
+.device-info__detail-tags { display: flex; flex-wrap: wrap; gap: 3px; }
+.device-info__detail-list { display: flex; flex-direction: column; gap: 2px; }
+
+.device-info__detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; width: 100%; }
+.device-info__detail-grid-item { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.device-info__detail-grid-label { font-size: 0.58rem; color: #5a6470; text-transform: uppercase; letter-spacing: 0.03em; }
+
+.device-info__scope-tag { font-size: 0.58rem; padding: 1px 6px; background: rgba(0,145,255,.12); color: #0091ff; border-radius: 3px; white-space: nowrap; }
+.device-info__scope-tag--type { background: rgba(122,132,144,.12); color: #7a8490; }
+
+.device-info__connect-btn { font-size: 0.7rem; padding: 3px 10px; background: rgba(0,229,160,.12); border: 1px solid rgba(0,229,160,.25); border-radius: 4px; color: #00e5a0; cursor: pointer; white-space: nowrap; }
+.device-info__connect-btn:hover:not(:disabled) { background: rgba(0,229,160,.2); }
 .device-info__connect-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .device-info__settings-toggle {
