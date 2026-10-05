@@ -154,6 +154,20 @@ func (h *Hub) RegisterClient(conn *websocket.Conn) *Client {
 	return client
 }
 
+// Send delivers a message to this client only. It is used to seed freshly
+// connected clients with the current device state, which they would otherwise
+// miss until the next state broadcast.
+func (c *Client) Send(msg *Message) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	select {
+	case c.send <- data:
+	default:
+	}
+}
+
 func (c *Client) WritePump() {
 	defer func() {
 		c.conn.Close()

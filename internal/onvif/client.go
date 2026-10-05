@@ -16,11 +16,11 @@ import (
 )
 
 type Client struct {
-	config       Config
-	http         *http.Client
-	mediaXAddr   string
-	ptzXAddr     string
-	discovered   bool
+	config     Config
+	http       *http.Client
+	mediaXAddr string
+	ptzXAddr   string
+	discovered bool
 }
 
 func NewClient(cfg Config) *Client {
@@ -138,8 +138,11 @@ func (c *Client) GetProfiles(ctx context.Context) ([]Profile, error) {
 
 	var result struct {
 		Profiles []struct {
-			Token string `xml:"token,attr"`
-			Name  string `xml:"Name"`
+			Token            string `xml:"token,attr"`
+			Name             string `xml:"Name"`
+			PTZConfiguration *struct {
+				Token string `xml:"token,attr"`
+			} `xml:"PTZConfiguration"`
 		} `xml:"GetProfilesResponse>Profiles"`
 	}
 	if err := c.parseSOAPResponse(resp, "GetProfilesResponse", &result); err != nil {
@@ -148,7 +151,11 @@ func (c *Client) GetProfiles(ctx context.Context) ([]Profile, error) {
 
 	profiles := make([]Profile, len(result.Profiles))
 	for i, p := range result.Profiles {
-		profiles[i] = Profile{Token: p.Token, Name: p.Name}
+		ptzToken := ""
+		if p.PTZConfiguration != nil {
+			ptzToken = p.PTZConfiguration.Token
+		}
+		profiles[i] = Profile{Token: p.Token, Name: p.Name, PTZToken: ptzToken}
 	}
 	return profiles, nil
 }
