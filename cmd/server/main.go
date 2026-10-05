@@ -169,10 +169,11 @@ func (cm *cameraManager) connect(address string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	profiles, err := onvifClient.GetProfiles(ctx)
+	profiles, err := cm.getProfilesWithRetry(onvifClient, ctx, life, address)
 	if err != nil {
 		log.Printf("GetProfiles failed: %v", err)
 		cm.handler.SetDeviceState(true, false, false, address)
+		cm.hub.BroadcastError("连接摄像头失败: " + err.Error())
 		return
 	}
 
@@ -242,6 +243,35 @@ func (cm *cameraManager) connect(address string) {
 	go cm.runRTSPLoop(uri.URI, life, address, snapshotURL != "")
 }
 
+// getProfilesWithRetry keeps polling the ONVIF endpoint: WiFi cameras are
+// often briefly unreachable right after a reboot/drop, and the RTSP-level
+// retry loop can only kick in once profiles are known.
+func (cm *cameraManager) getProfilesWithRetry(client *onvif.Client, ctx context.Context, life *streamLife, address string) ([]onvif.Profile, error) {
+	const maxAttempts = 12
+	const retryWait = 5 * time.Second
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if !cm.isCurrent(life) {
+			return nil, lastErr
+		}
+		profiles, err := client.GetProfiles(ctx)
+		if err == nil {
+			return profiles, nil
+		}
+		lastErr = err
+		log.Printf("GetProfiles attempt %d/%d failed: %v", attempt, maxAttempts, err)
+		if attempt == maxAttempts {
+			return nil, err
+		}
+		select {
+		case <-life.stopCh:
+			return nil, lastErr
+		case <-time.After(retryWait):
+		}
+	}
+	return nil, lastErr
+}
+
 // runRTSPLoop keeps retrying the RTSP connection for a while: cameras that
 // only start publishing after the client connects (e.g. an app-powered sport
 // camera answering 503 until its encoder produces frames) would otherwise
@@ -300,6 +330,20 @@ func (cm *cameraManager) runRTSPLoop(rtspURL string, life *streamLife, address s
 			if cm.isCurrent(life) {
 				cm.handler.SetDeviceState(true, true, false, address)
 			}
+			// Watch for connection loss (WiFi cameras drop all the time):
+			// flip the stale streaming flag and re-run the full connect flow
+			// (ONVIF + RTSP retries) after a short backoff.
+			stream.WatchDisconnect(func() {
+				if !cm.isCurrent(life) {
+					return // superseded by a newer connection or closed by us
+				}
+				log.Println("RTSP stream disconnected — reconnecting")
+				cm.handler.SetDeviceState(true, false, hasSnapshot, address)
+				time.Sleep(2 * time.Second)
+				if cm.isCurrent(life) {
+					cm.connect(address)
+				}
+			})
 			return
 		}
 

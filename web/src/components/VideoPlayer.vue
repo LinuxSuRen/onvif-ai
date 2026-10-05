@@ -284,9 +284,9 @@ onUnmounted(() => {
       <div
         v-if="hasStream && !isSnapshotMode && latencyMs > 0"
         class="video-player__latency"
-        title="后端收到画面（RTSP）到浏览器呈现的端到端延迟"
+        title="从后端收到 RTSP 帧到画面呈现的延迟。不含摄像头采集/编码、以及摄像头到后端的网络传输延迟（这部分无法从外部测量，需要设备发送 RTCP 发送者报告）"
       >
-        ⏱ {{ latencyMs }}ms
+        ⏱ {{ latencyMs }}ms·自后端
       </div>
       <div v-if="!hasStream" class="video-player__placeholder">
         <span class="video-player__placeholder-icon">📷</span>

@@ -194,6 +194,20 @@ func isIDRNAL(nalu []byte) bool {
 	return len(nalu) > 0 && nalu[0]&0x1F == 5
 }
 
+// WatchDisconnect must be called after a successful Connect: it invokes fn
+// once the RTSP session ends, whether because the server went away or because
+// Close() was called. Callers combine it with their own connection-generation
+// guard to distinguish the two cases.
+func (s *Stream) WatchDisconnect(fn func()) {
+	if s.client == nil || fn == nil {
+		return
+	}
+	go func() {
+		_ = s.client.Wait()
+		fn()
+	}()
+}
+
 type rtspURLInfo struct {
 	Scheme string
 	Host   string
