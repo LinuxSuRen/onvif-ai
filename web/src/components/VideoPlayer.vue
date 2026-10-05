@@ -10,6 +10,7 @@ const hasStream = ref(false)
 const isSnapshotMode = ref(false)
 const videoError = ref('')
 const showPTZ = ref(false)
+const ptzSupported = ref(false)
 let frameCount = 0
 let lastFrameTime = 0
 
@@ -38,9 +39,16 @@ function feedVideoNal(base64Data: string) {
   if (!jmuxer) return
 
   const binary = atob(base64Data)
-  const bytes = new Uint8Array(binary.length)
+  // jmuxer's H.264 parser splits Annex-B streams on start codes
+  // (00 00 00 01); bare NAL units would never be extracted, so frame
+  // each NAL unit with a start code before feeding it.
+  const bytes = new Uint8Array(4 + binary.length)
+  bytes[0] = 0
+  bytes[1] = 0
+  bytes[2] = 0
+  bytes[3] = 1
   for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i)
+    bytes[i + 4] = binary.charCodeAt(i)
   }
 
   jmuxer.feed({ video: bytes })
@@ -53,6 +61,12 @@ watch(isConnected, (connected) => {
   if (connected) {
     connectionStatus.value = 'connected'
     nextTick(() => {
+      if (jmuxer) {
+        // Recreate the muxer on reconnect so no stale half-parsed data
+        // from the previous session lingers in its buffer.
+        jmuxer.destroy()
+        jmuxer = null
+      }
       if (!jmuxer && videoRef.value) {
         initJMuxer()
       }
@@ -97,6 +111,7 @@ watch(messages, () => {
     if (msg.type === 'device_state' && msg.payload) {
       const state = msg.payload as any
       console.log('[VideoPlayer] Device state:', state)
+      ptzSupported.value = !!state.ptz_supported
       if (state.streaming) {
         videoError.value = ''
       } else if (state.snapshot_mode) {
@@ -161,7 +176,7 @@ onUnmounted(() => {
         class="video-player__snapshot"
         :class="{ 'video-player__snapshot--visible': isSnapshotMode }"
       />
-      <div v-if="showPTZ && hasStream" class="video-player__ptz-overlay">
+      <div v-if="showPTZ && hasStream && ptzSupported" class="video-player__ptz-overlay">
         <button class="video-player__ptz-btn video-player__ptz-btn--up"    @mousedown.prevent="ptzMove('up')">▲</button>
         <button class="video-player__ptz-btn video-player__ptz-btn--left"  @mousedown.prevent="ptzMove('left')">◀</button>
         <button class="video-player__ptz-btn video-player__ptz-btn--right" @mousedown.prevent="ptzMove('right')">▶</button>
