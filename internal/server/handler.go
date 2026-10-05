@@ -333,6 +333,11 @@ func maskKey(key string) string {
 	return key[:5] + "***" + key[len(key)-3:]
 }
 
+func mustMarshal(v interface{}) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
+}
+
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -437,6 +442,21 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 				h.mu.RUnlock()
 			}
+
+		case ws.MsgTypeClockSync:
+			// Echo the client timestamp together with the server clock so
+			// the browser can estimate the clock offset (RTT/2 correction)
+			// and compute end-to-end video latency from frame timestamps.
+			var payload struct {
+				T0 int64 `json:"t0"`
+			}
+			if msg.Payload != nil {
+				json.Unmarshal(msg.Payload, &payload)
+			}
+			client.Send(&ws.Message{
+				Type:    ws.MsgTypeClockSync,
+				Payload: mustMarshal(map[string]int64{"t0": payload.T0, "t1": time.Now().UnixMilli()}),
+			})
 		}
 	})
 }

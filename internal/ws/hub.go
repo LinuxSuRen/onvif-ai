@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -84,6 +85,7 @@ func (h *Hub) BroadcastVideoNAL(nalu []byte) {
 	msg := &Message{
 		Type: MsgTypeVideoNAL,
 		Data: base64.StdEncoding.EncodeToString(nalu),
+		Ts:   time.Now().UnixMilli(),
 	}
 	h.BroadcastMessage(msg)
 }
