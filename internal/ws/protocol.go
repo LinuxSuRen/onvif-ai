@@ -38,6 +38,11 @@ type Message struct {
 	// Ts is the server wall-clock time (unix ms) at which a frame was
 	// received from the RTSP source; used by the browser to measure latency.
 	Ts int64 `json:"ts,omitempty"`
+	// Cam identifies which camera (media profile token) a frame belongs to
+	// when a single ONVIF device exposes multiple cameras. Empty in the
+	// legacy single-camera case, where the frontend treats it as the only
+	// camera.
+	Cam string `json:"cam,omitempty"`
 }
 
 // StatusState represents the system state.

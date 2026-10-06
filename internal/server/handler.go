@@ -24,6 +24,19 @@ type DeviceState struct {
 	Address      string `json:"address"`
 	SnapshotMode bool   `json:"snapshot_mode"`
 	PTZSupported bool   `json:"ptz_supported"`
+	// Cameras 列出单设备多摄像头（多 media profile）时每一路画面的状态
+	Cameras []CameraState `json:"cameras,omitempty"`
+}
+
+// CameraState 是一路画面（一个 media profile）的运行状态。
+type CameraState struct {
+	Token        string `json:"token"`
+	Name         string `json:"name"`
+	PTZSupported bool   `json:"ptz_supported"`
+	Streaming    bool   `json:"streaming"`
+	SnapshotMode bool   `json:"snapshot_mode"`
+	// MJPEG 表示该路为 JPEG 帧流（RTSP MJPEG），前端按连续图片渲染而非 H.264
+	MJPEG bool `json:"mjpeg,omitempty"`
 }
 
 type Handler struct {
@@ -40,7 +53,7 @@ type Handler struct {
 	onSpeechText   func(string)
 	onCameraListen func()
 	onClearHistory func()
-	onPTZMove      func(direction string)
+	onPTZMove      func(camera, direction string)
 	onSwitchMode   func(string)
 	onLLMUpdate    func(baseURL, apiKey, model string)
 	mu             sync.RWMutex
@@ -68,7 +81,7 @@ func NewHandler(hub *ws.Hub, listener *discovery.Listener) *Handler {
 	}
 }
 
-func (h *Handler) SetCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onClear func(), onPTZ func(string), onMode func(string)) {
+func (h *Handler) SetCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onClear func(), onPTZ func(camera, direction string), onMode func(string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onAudioData = onData
@@ -87,26 +100,32 @@ func (h *Handler) SetOnConnect(fn func(address string)) {
 	h.onConnect = fn
 }
 
+// SetDeviceState updates the aggregate device fields; an empty addr keeps the
+// current address. Cameras 与 PTZ 汇总字段由 SetCameras 维护，此处保留。
 func (h *Handler) SetDeviceState(connected, streaming, snapshot bool, addr string) {
 	h.mu.Lock()
-	h.deviceState = DeviceState{
-		Connected:    connected,
-		Streaming:    streaming,
-		Address:      addr,
-		SnapshotMode: snapshot,
-		PTZSupported: h.deviceState.PTZSupported,
+	if addr == "" {
+		addr = h.deviceState.Address
 	}
+	h.deviceState.Connected = connected
+	h.deviceState.Streaming = streaming
+	h.deviceState.SnapshotMode = snapshot
+	h.deviceState.Address = addr
 	state := h.deviceState
 	h.mu.Unlock()
 	h.hub.BroadcastDeviceState(state)
 }
 
-// SetPTZSupported updates the PTZ capability flag (derived from the ONVIF
-// media profile) and re-broadcasts the device state so the UI can show or
-// hide pan/tilt/zoom controls accordingly.
-func (h *Handler) SetPTZSupported(supported bool) {
+// SetCameras 更新多摄像头（多 media profile）列表及每路状态，同时刷新
+// 汇总的 PTZ 能力字段（取第一路），并重新广播 device_state。
+func (h *Handler) SetCameras(cams []CameraState) {
 	h.mu.Lock()
-	h.deviceState.PTZSupported = supported
+	h.deviceState.Cameras = cams
+	if len(cams) > 0 {
+		h.deviceState.PTZSupported = cams[0].PTZSupported
+	} else {
+		h.deviceState.PTZSupported = false
+	}
 	state := h.deviceState
 	h.mu.Unlock()
 	h.hub.BroadcastDeviceState(state)
@@ -431,14 +450,17 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			h.mu.RUnlock()
 
 		case ws.MsgTypePTZMove:
-			var payload struct{ Direction string }
+			var payload struct {
+				Camera    string
+				Direction string
+			}
 			if msg.Payload != nil {
 				json.Unmarshal(msg.Payload, &payload)
 			}
 			if payload.Direction != "" {
 				h.mu.RLock()
 				if h.onPTZMove != nil {
-					h.onPTZMove(payload.Direction)
+					h.onPTZMove(payload.Camera, payload.Direction)
 				}
 				h.mu.RUnlock()
 			}
