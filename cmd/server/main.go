@@ -308,6 +308,10 @@ func (cm *cameraManager) runRTSPLoop(rtspURL string, life *streamLife, address s
 		stream.OnVideoNAL(func(nalu []byte) {
 			cm.hub.BroadcastVideoNAL(nalu)
 		})
+		stream.OnVideoJPEG(func(jpeg []byte) {
+			// MJPEG（RFC 2435）帧为完整 JPEG，复用快照通道推给浏览器
+			cm.hub.BroadcastVideoJPEG(jpeg)
+		})
 		stream.OnAudioPCM(func(pcm []byte) {
 			cm.hub.BroadcastAudioPCM(pcm)
 

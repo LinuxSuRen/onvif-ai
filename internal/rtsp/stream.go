@@ -11,6 +11,7 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtplpcm"
+	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpmjpeg"
 	"github.com/pion/rtp"
 )
 
@@ -18,8 +19,10 @@ type Stream struct {
 	rawURL string
 	client *gortsplib.Client
 
-	h264Dec *rtph264.Decoder
-	g711Dec *rtplpcm.Decoder
+	h264Dec   *rtph264.Decoder
+	mjpegDec  *rtpmjpeg.Decoder
+	mjpegForm *format.MJPEG
+	g711Dec   *rtplpcm.Decoder
 
 	// SPS/PPS from the SDP. Many encoders put the parameter sets only in the
 	// SDP (sprop-parameter-sets) and never resend them in-band; downstream
@@ -30,8 +33,9 @@ type Stream struct {
 
 	closeOnce sync.Once
 
-	videoNALHandler func([]byte)
-	audioPCMHandler func([]byte)
+	videoNALHandler  func([]byte)
+	videoJPEGHandler func([]byte)
+	audioPCMHandler  func([]byte)
 }
 
 func NewStream(rtspURL string) *Stream {
@@ -40,6 +44,12 @@ func NewStream(rtspURL string) *Stream {
 
 func (s *Stream) OnVideoNAL(handler func([]byte)) {
 	s.videoNALHandler = handler
+}
+
+// OnVideoJPEG registers the handler for complete JPEG frames (MJPEG over
+// RTP, RFC 2435). Each delivered buffer is a full, decodable JPEG image.
+func (s *Stream) OnVideoJPEG(handler func([]byte)) {
+	s.videoJPEGHandler = handler
 }
 
 func (s *Stream) OnAudioPCM(handler func([]byte)) {
@@ -79,7 +89,8 @@ func (s *Stream) Connect() error {
 
 	var videoMedia *description.Media
 	var audioMedia *description.Media
-	var videoFormat *format.H264
+	var videoH264 *format.H264
+	var videoMJPEG *format.MJPEG
 	var audioFormat *format.G711
 	needsSetup := false
 
@@ -92,7 +103,12 @@ func (s *Stream) Connect() error {
 			case *format.H264:
 				if media.Type == description.MediaTypeVideo && videoMedia == nil {
 					videoMedia = media
-					videoFormat = ft
+					videoH264 = ft
+				}
+			case *format.MJPEG:
+				if media.Type == description.MediaTypeVideo && videoMedia == nil {
+					videoMedia = media
+					videoMJPEG = ft
 				}
 			case *format.G711:
 				if media.Type == description.MediaTypeAudio && audioMedia == nil {
@@ -103,20 +119,35 @@ func (s *Stream) Connect() error {
 		}
 	}
 
-	if videoMedia != nil && videoFormat != nil {
+	if videoMedia != nil {
 		if _, err := s.client.Setup(baseURL, videoMedia, 0, 0); err != nil {
 			s.Close()
 			return fmt.Errorf("setup video: %w", err)
 		}
-		dec, err := videoFormat.CreateDecoder()
-		if err != nil {
-			s.Close()
-			return fmt.Errorf("create H264 decoder: %w", err)
+		if videoH264 != nil {
+			dec, err := videoH264.CreateDecoder()
+			if err != nil {
+				s.Close()
+				return fmt.Errorf("create H264 decoder: %w", err)
+			}
+			dec.Init()
+			s.h264Dec = dec
+			s.sps = videoH264.SPS
+			s.pps = videoH264.PPS
 		}
-		dec.Init()
-		s.h264Dec = dec
-		s.sps = videoFormat.SPS
-		s.pps = videoFormat.PPS
+		if videoMJPEG != nil {
+			dec, err := videoMJPEG.CreateDecoder()
+			if err != nil {
+				s.Close()
+				return fmt.Errorf("create MJPEG decoder: %w", err)
+			}
+			if err := dec.Init(); err != nil {
+				s.Close()
+				return fmt.Errorf("init MJPEG decoder: %w", err)
+			}
+			s.mjpegDec = dec
+			s.mjpegForm = videoMJPEG
+		}
 		needsSetup = true
 	}
 
@@ -143,7 +174,7 @@ func (s *Stream) Connect() error {
 	}
 
 	if s.h264Dec != nil {
-		s.client.OnPacketRTP(videoMedia, videoFormat, func(pkt *rtp.Packet) {
+		s.client.OnPacketRTP(videoMedia, videoH264, func(pkt *rtp.Packet) {
 			nalus, err := s.h264Dec.Decode(pkt)
 			if err != nil || s.videoNALHandler == nil {
 				return
@@ -163,6 +194,17 @@ func (s *Stream) Connect() error {
 				}
 				s.videoNALHandler(nalu)
 			}
+		})
+	}
+
+	if s.mjpegDec != nil {
+		s.client.OnPacketRTP(videoMedia, s.mjpegForm, func(pkt *rtp.Packet) {
+			img, err := s.mjpegDec.Decode(pkt)
+			if err != nil || len(img) == 0 || s.videoJPEGHandler == nil {
+				return
+			}
+			// RFC 2435 解出的每帧即完整 JPEG，直接走快照同款浏览器通道
+			s.videoJPEGHandler(img)
 		})
 	}
 
