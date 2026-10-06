@@ -18,6 +18,8 @@ const props = defineProps<{
   active: boolean
   showLabel: boolean
   clockOffset: number | null
+  // 变化时重建解码管线（WS 重连后由父组件递增）
+  resetKey: number
 }>()
 
 const emit = defineEmits<{
@@ -35,6 +37,8 @@ let transitEma: number | null = null
 let presentedMediaTime = 0
 let rVfcHandle = 0
 let latencyTimer: ReturnType<typeof setInterval> | null = null
+let jmuxerErrTimes: number[] = []
+let lastCatchUpAt = 0
 
 // 向父组件注册本 tile 的数据入口（生命周期内自管理，避免 ref 顺序竞态）
 const registry = inject<{
@@ -42,7 +46,18 @@ const registry = inject<{
   unregister: (token: string, api: { feedNal: typeof feedNal; feedJpeg: typeof feedJpeg }) => void
 } | null>('cameraTileRegistry', null)
 
-function initJMuxer() {
+function destroyJMuxer() {
+  if (jmuxer) {
+    try {
+      jmuxer.destroy()
+    } catch {
+      /* destroy 在 MSE 已关闭时可能抛错，忽略 */
+    }
+    jmuxer = null
+  }
+}
+
+function createJMuxer() {
   if (!videoRef.value || jmuxer) return
   jmuxer = new JMuxer({
     node: videoRef.value,
@@ -50,12 +65,41 @@ function initJMuxer() {
     videoCodec: 'H264',
     flushingTime: 100,
     debug: false,
-    onError: () => {},
+    onError: handleJMuxerError,
   })
+  videoRef.value.play()?.catch(() => {})
+  hasVideo.value = false // 等待新管线首帧
+  presentedMediaTime = 0
+}
+
+// jmuxer 错误分三类：QuotaExceeded（内部自动清理）、InvalidStateError
+// （内部自动 reset）、其余（endMSE，管线永久失效）。前两类之外的错误，
+// 或 60s 内反复出错时直接重建管线 —— 后端在每个 IDR 前重发 SPS/PPS，
+// 一个 GOP 内即可自动恢复画面。
+function handleJMuxerError(error: unknown) {
+  console.warn('[CameraTile] jmuxer error:', error)
+  const data = error as { name?: string } | null | undefined
+  const now = Date.now()
+  jmuxerErrTimes = jmuxerErrTimes.filter((t) => now - t < 60_000)
+  jmuxerErrTimes.push(now)
+  const fatal = data && data.name !== 'QuotaExceeded' && data.name !== 'InvalidStateError'
+  if (fatal || jmuxerErrTimes.length >= 3) {
+    jmuxerErrTimes = []
+    destroyJMuxer()
+    createJMuxer()
+  }
+}
+
+// 重建整条展示管线（WS 重连 / 显式重置时调用）
+function resetPipeline() {
+  destroyJMuxer()
+  transitEma = null
+  latencyMs.value = 0
+  createJMuxer()
 }
 
 onMounted(() => {
-  initJMuxer()
+  createJMuxer()
   const video = videoRef.value as any
   if (video && typeof video.requestVideoFrameCallback === 'function') {
     const onFrame = (_now: number, metadata: { mediaTime: number }) => {
@@ -83,7 +127,7 @@ onUnmounted(() => {
 })
 
 function feedNal(serverTs: number | undefined, base64Data: string) {
-  if (!jmuxer) initJMuxer()
+  if (!jmuxer) createJMuxer()
   if (!jmuxer) return
 
   // 传输延迟：服务器收帧时刻 → 本端收到（时钟偏移由父组件校准）
@@ -107,6 +151,8 @@ function feedNal(serverTs: number | undefined, base64Data: string) {
   }
 
   jmuxer.feed({ video: bytes })
+  // RTSP 恢复直播后退出快照视图（video 元素重新可见）
+  if (inSnapshot.value && !props.cam.mjpeg) inSnapshot.value = false
   hasVideo.value = true
 }
 
@@ -136,7 +182,32 @@ function measurePresentationLag() {
   if (total > 0 && total < 30000) {
     latencyMs.value = Math.round(total / 10) * 10
   }
+
+  // 追帧：落后超过 3s（后台标签页、解码抖动等）时跳到直播沿，
+  // 保留 0.3s 余量避免反复 seek；页面不可见时浏览器 seek 行为不可靠，跳过
+  const now = Date.now()
+  if (
+    lagMs > 3000 &&
+    !video.seeking &&
+    document.visibilityState === 'visible' &&
+    now - lastCatchUpAt > 3000
+  ) {
+    try {
+      video.currentTime = Math.max(0, bufferedEnd - 0.3)
+      lastCatchUpAt = now
+    } catch {
+      /* seek 失败忽略，下个节拍重试 */
+    }
+  }
 }
+
+// WS 重连后递增 resetKey：旧管线的 MSE 时间轴已作废，重建
+watch(
+  () => props.resetKey,
+  (key) => {
+    if (key > 0) resetPipeline()
+  },
+)
 
 // 摄像头切换到快照降级时显示角标
 watch(

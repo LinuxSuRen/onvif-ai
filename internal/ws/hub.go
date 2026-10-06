@@ -3,10 +3,21 @@ package ws
 import (
 	"encoding/base64"
 	"encoding/json"
+	"log"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+// 客户端发送缓冲与慢客户端策略：
+// 视频流高峰约 70 条消息/秒，页面偶发的 JS 停顿（GC、渲染）会让消费短暂
+// 变慢。缓冲满时先丢弃消息（视频流丢帧可由下一个 IDR 自动恢复），
+// 持续落后超过 slowClientGrace 才断开，避免正常客户端被误杀。
+const (
+	clientSendBuffer = 1024
+	slowClientGrace  = 3 * time.Second
+	writeTimeout     = 10 * time.Second
 )
 
 type Hub struct {
@@ -23,6 +34,9 @@ type Client struct {
 	send   chan []byte
 	mu     sync.Mutex
 	closed bool
+
+	// slowSince 由 Run 循环独占访问：send 持续满仓的起始时刻
+	slowSince time.Time
 }
 
 func NewHub() *Hub {
@@ -58,8 +72,17 @@ func (h *Hub) Run() {
 			for client := range h.clients {
 				select {
 				case client.send <- message:
+					client.slowSince = time.Time{}
 				default:
-					go h.removeClient(client)
+					// 缓冲满：宽限期内丢消息（下个 IDR 自动恢复画面），
+					// 持续落后才移除，防止卡死客户端拖垮广播
+					if client.slowSince.IsZero() {
+						client.slowSince = time.Now()
+						continue
+					}
+					if time.Since(client.slowSince) > slowClientGrace {
+						go h.removeClient(client)
+					}
 				}
 			}
 			h.mu.RUnlock()
@@ -76,6 +99,7 @@ func (h *Hub) removeClient(client *Client) {
 	h.mu.Unlock()
 	if stillRegistered {
 		client.markClosed()
+		log.Printf("[ws] slow client removed (send buffer full): %s", client.conn.RemoteAddr())
 	}
 }
 
@@ -161,7 +185,7 @@ func (h *Hub) RegisterClient(conn *websocket.Conn) *Client {
 	client := &Client{
 		hub:  h,
 		conn: conn,
-		send: make(chan []byte, 256),
+		send: make(chan []byte, clientSendBuffer),
 	}
 	h.register <- client
 	return client
@@ -213,6 +237,8 @@ func (c *Client) WritePump() {
 			c.mu.Unlock()
 			return
 		}
+		// 卡死的 TCP 连接若无写超时会永久阻塞排空，拖垮整个客户端
+		c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		err := c.conn.WriteMessage(websocket.TextMessage, message)
 		c.mu.Unlock()
 		if err != nil {

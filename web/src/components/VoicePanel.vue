@@ -16,7 +16,7 @@ let fullResponseText = ''
 const availableVoices = ref<SpeechSynthesisVoice[]>([])
 const selectedVoice = ref('')
 
-const { messages, isConnected, send, popNewMessages } = useWebSocket('/ws')
+const { isConnected, send, subscribe } = useWebSocket('/ws')
 
 watch(isConnected, (connected) => {
   console.log('[VoicePanel] WebSocket connected:', connected)
@@ -120,10 +120,8 @@ function stopTalk() {
   micStop()
 }
 
-watch(messages, () => {
-  const newMsgs = popNewMessages()
-  for (const msg of newMsgs) {
-    console.log('[VoicePanel] Received WS message:', msg.type, msg.payload || msg.text || '')
+subscribe(['transcript', 'status', 'audio_out', 'error'], (msg) => {
+  {
     if (msg.type === 'transcript' && msg.text) {
       if (msg.text === '\n\n') {
         speakResponse()
@@ -151,7 +149,7 @@ watch(messages, () => {
       talkStatus.value = 'idle'
     }
   }
-}, { deep: false })
+})
 </script>
 
 <template>

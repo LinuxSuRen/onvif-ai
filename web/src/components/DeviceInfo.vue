@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch, reactive } from 'vue'
+import { ref, onMounted, computed, reactive } from "vue"
 import { useWebSocket } from '../composables/useWebSocket'
 
 interface DiscoveredDevice {
@@ -96,7 +96,7 @@ const llmModel = ref('')
 const llmSaving = ref(false)
 const snapshotFps = ref(1)
 
-const { messages, popNewMessages } = useWebSocket('/ws')
+const { subscribe } = useWebSocket('/ws')
 
 const streamStatus = computed(() => {
   if (deviceState.value.snapshot_mode) return '快照模式'
@@ -112,14 +112,11 @@ const statusClass = computed(() => {
   return 'offline'
 })
 
-watch(messages, () => {
-  const newMsgs = popNewMessages()
-  for (const msg of newMsgs) {
-    if (msg.type === 'device_state' && msg.payload) {
-      const state = msg.payload as unknown as DeviceState
-      if (state && typeof state.connected === 'boolean') {
-        deviceState.value = state
-      }
+subscribe(['device_state'], (msg) => {
+  if (msg.type === 'device_state' && msg.payload) {
+    const state = msg.payload as unknown as DeviceState
+    if (state && typeof state.connected === 'boolean') {
+      deviceState.value = state
     }
   }
 })
