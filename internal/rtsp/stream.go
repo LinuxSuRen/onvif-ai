@@ -3,6 +3,7 @@ package rtsp
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
@@ -19,6 +20,15 @@ type Stream struct {
 
 	h264Dec *rtph264.Decoder
 	g711Dec *rtplpcm.Decoder
+
+	// SPS/PPS from the SDP. Many encoders put the parameter sets only in the
+	// SDP (sprop-parameter-sets) and never resend them in-band; downstream
+	// muxers (e.g. jmuxer in the browser) cannot initialize without them,
+	// so we re-inject them ahead of every IDR frame.
+	sps []byte
+	pps []byte
+
+	closeOnce sync.Once
 
 	videoNALHandler func([]byte)
 	audioPCMHandler func([]byte)
@@ -95,23 +105,29 @@ func (s *Stream) Connect() error {
 
 	if videoMedia != nil && videoFormat != nil {
 		if _, err := s.client.Setup(baseURL, videoMedia, 0, 0); err != nil {
+			s.Close()
 			return fmt.Errorf("setup video: %w", err)
 		}
 		dec, err := videoFormat.CreateDecoder()
 		if err != nil {
+			s.Close()
 			return fmt.Errorf("create H264 decoder: %w", err)
 		}
 		dec.Init()
 		s.h264Dec = dec
+		s.sps = videoFormat.SPS
+		s.pps = videoFormat.PPS
 		needsSetup = true
 	}
 
 	if audioMedia != nil && audioFormat != nil {
 		if _, err := s.client.Setup(baseURL, audioMedia, 0, 0); err != nil {
+			s.Close()
 			return fmt.Errorf("setup audio: %w", err)
 		}
 		dec, err := audioFormat.CreateDecoder()
 		if err != nil {
+			s.Close()
 			return fmt.Errorf("create G711 decoder: %w", err)
 		}
 		dec.Init()
@@ -121,6 +137,7 @@ func (s *Stream) Connect() error {
 
 	if needsSetup {
 		if _, err := s.client.Play(nil); err != nil {
+			s.Close()
 			return fmt.Errorf("play: %w", err)
 		}
 	}
@@ -132,6 +149,18 @@ func (s *Stream) Connect() error {
 				return
 			}
 			for _, nalu := range nalus {
+				if isIDRNAL(nalu) {
+					// Parameter sets usually live only in the SDP; re-send
+					// them ahead of each keyframe so any client that just
+					// joined (or re-initialized its decoder) can start
+					// decoding immediately.
+					if len(s.sps) > 0 {
+						s.videoNALHandler(s.sps)
+					}
+					if len(s.pps) > 0 {
+						s.videoNALHandler(s.pps)
+					}
+				}
 				s.videoNALHandler(nalu)
 			}
 		})
@@ -150,10 +179,33 @@ func (s *Stream) Connect() error {
 	return nil
 }
 
+// Close tears the stream down and is safe to call multiple times (failed
+// connect attempts already close the client; reconnect loops may close again).
 func (s *Stream) Close() {
-	if s.client != nil {
-		s.client.Close()
+	s.closeOnce.Do(func() {
+		if s.client != nil {
+			s.client.Close()
+		}
+	})
+}
+
+// isIDRNAL reports whether the NAL unit is an IDR slice (type 5).
+func isIDRNAL(nalu []byte) bool {
+	return len(nalu) > 0 && nalu[0]&0x1F == 5
+}
+
+// WatchDisconnect must be called after a successful Connect: it invokes fn
+// once the RTSP session ends, whether because the server went away or because
+// Close() was called. Callers combine it with their own connection-generation
+// guard to distinguish the two cases.
+func (s *Stream) WatchDisconnect(fn func()) {
+	if s.client == nil || fn == nil {
+		return
 	}
+	go func() {
+		_ = s.client.Wait()
+		fn()
+	}()
 }
 
 type rtspURLInfo struct {

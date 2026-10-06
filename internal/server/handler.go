@@ -23,26 +23,27 @@ type DeviceState struct {
 	Streaming    bool   `json:"streaming"`
 	Address      string `json:"address"`
 	SnapshotMode bool   `json:"snapshot_mode"`
+	PTZSupported bool   `json:"ptz_supported"`
 }
 
 type Handler struct {
-	hub           *ws.Hub
-	listener      *discovery.Listener
-	upgrader      websocket.Upgrader
-	deviceState   DeviceState
-	llmConfig     *LLMConfig
-	snapshotFPS   int
-	onConnect     func(address string)
-	onAudioData   func([]byte)
-	onAudioStart  func()
-	onAudioStop   func()
-	onSpeechText  func(string)
+	hub            *ws.Hub
+	listener       *discovery.Listener
+	upgrader       websocket.Upgrader
+	deviceState    DeviceState
+	llmConfig      *LLMConfig
+	snapshotFPS    int
+	onConnect      func(address string)
+	onAudioData    func([]byte)
+	onAudioStart   func()
+	onAudioStop    func()
+	onSpeechText   func(string)
 	onCameraListen func()
 	onClearHistory func()
-	onPTZMove     func(direction string)
-	onSwitchMode  func(string)
-	onLLMUpdate   func(baseURL, apiKey, model string)
-	mu            sync.RWMutex
+	onPTZMove      func(direction string)
+	onSwitchMode   func(string)
+	onLLMUpdate    func(baseURL, apiKey, model string)
+	mu             sync.RWMutex
 }
 
 type LLMConfig struct {
@@ -56,7 +57,7 @@ func NewHandler(hub *ws.Hub, listener *discovery.Listener) *Handler {
 		hub:      hub,
 		listener: listener,
 		upgrader: websocket.Upgrader{
-			CheckOrigin:    func(r *http.Request) bool { return true },
+			CheckOrigin:     func(r *http.Request) bool { return true },
 			ReadBufferSize:  1024 * 64,
 			WriteBufferSize: 1024 * 64,
 		},
@@ -88,14 +89,27 @@ func (h *Handler) SetOnConnect(fn func(address string)) {
 
 func (h *Handler) SetDeviceState(connected, streaming, snapshot bool, addr string) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.deviceState = DeviceState{
 		Connected:    connected,
 		Streaming:    streaming,
 		Address:      addr,
 		SnapshotMode: snapshot,
+		PTZSupported: h.deviceState.PTZSupported,
 	}
-	h.hub.BroadcastDeviceState(h.deviceState)
+	state := h.deviceState
+	h.mu.Unlock()
+	h.hub.BroadcastDeviceState(state)
+}
+
+// SetPTZSupported updates the PTZ capability flag (derived from the ONVIF
+// media profile) and re-broadcasts the device state so the UI can show or
+// hide pan/tilt/zoom controls accordingly.
+func (h *Handler) SetPTZSupported(supported bool) {
+	h.mu.Lock()
+	h.deviceState.PTZSupported = supported
+	state := h.deviceState
+	h.mu.Unlock()
+	h.hub.BroadcastDeviceState(state)
 }
 
 func (h *Handler) RegisterRoutes() http.Handler {
@@ -319,6 +333,11 @@ func maskKey(key string) string {
 	return key[:5] + "***" + key[len(key)-3:]
 }
 
+func mustMarshal(v interface{}) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
+}
+
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -335,6 +354,18 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := h.hub.RegisterClient(conn)
+
+	// Seed the new client with the current device state so a page that loads
+	// mid-session immediately knows about streaming/snapshot/PTZ flags.
+	h.mu.RLock()
+	state := h.deviceState
+	h.mu.RUnlock()
+	if state.Address != "" {
+		payload, err := json.Marshal(state)
+		if err == nil {
+			client.Send(&ws.Message{Type: ws.MsgTypeDeviceState, Payload: payload})
+		}
+	}
 
 	go client.WritePump()
 	go client.ReadPump(func(msg *ws.Message) {
@@ -411,6 +442,21 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 				h.mu.RUnlock()
 			}
+
+		case ws.MsgTypeClockSync:
+			// Echo the client timestamp together with the server clock so
+			// the browser can estimate the clock offset (RTT/2 correction)
+			// and compute end-to-end video latency from frame timestamps.
+			var payload struct {
+				T0 int64 `json:"t0"`
+			}
+			if msg.Payload != nil {
+				json.Unmarshal(msg.Payload, &payload)
+			}
+			client.Send(&ws.Message{
+				Type:    ws.MsgTypeClockSync,
+				Payload: mustMarshal(map[string]int64{"t0": payload.T0, "t1": time.Now().UnixMilli()}),
+			})
 		}
 	})
 }

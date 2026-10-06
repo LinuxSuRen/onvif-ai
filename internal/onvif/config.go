@@ -12,11 +12,19 @@ type Config struct {
 type Profile struct {
 	Token string
 	Name  string
+	// PTZToken is non-empty when the profile carries a PTZConfiguration,
+	// i.e. the camera exposes pan/tilt/zoom control on this profile.
+	PTZToken string
+}
+
+// HasPTZ reports whether this media profile supports PTZ control.
+func (p Profile) HasPTZ() bool {
+	return p.PTZToken != ""
 }
 
 type StreamURI struct {
-	URI                string
-	Timeout            string
+	URI                 string
+	Timeout             string
 	InvalidAfterConnect bool
 	InvalidAfterReboot  bool
 }

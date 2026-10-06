@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -61,11 +62,10 @@ func main() {
 	})
 
 	cm := &cameraManager{
-		hub:        hub,
-		llmClient:  llmClient,
-		ttsClient:  ttsClient,
-		handler:    h,
-		stopCh:     make(chan struct{}),
+		hub:       hub,
+		llmClient: llmClient,
+		ttsClient: ttsClient,
+		handler:   h,
 	}
 
 	h.SetOnConnect(func(addr string) {
@@ -109,22 +109,50 @@ type cameraManager struct {
 	stream      *rtsp.Stream
 	backchannel *rtsp.Backchannel
 	currentURL  string
-	stopCh      chan struct{}
+	life        *streamLife
 
 	cameraAudioBuf    []byte
 	cameraAudioBufMax int
 
-	history []llm.Message
+	history      []llm.Message
 	profileToken string
+}
+
+// streamLife owns the stop channel of one connection attempt. The channel is
+// closed at most once (close of a closed channel panics and would take the
+// whole process down), and its identity lets late goroutines detect that a
+// newer connection has superseded them.
+type streamLife struct {
+	stopCh chan struct{}
+	once   sync.Once
+}
+
+func newStreamLife() *streamLife {
+	return &streamLife{stopCh: make(chan struct{})}
+}
+
+func (l *streamLife) stop() {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() { close(l.stopCh) })
+}
+
+// isCurrent reports whether life is still the active connection of cm.
+func (cm *cameraManager) isCurrent(life *streamLife) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.life == life
 }
 
 func (cm *cameraManager) connect(address string) {
 	cm.disconnect()
 
 	cm.mu.Lock()
-	cm.stopCh = make(chan struct{})
-	stopCh := cm.stopCh
+	life := newStreamLife()
+	cm.life = life
 	cm.mu.Unlock()
+	stopCh := life.stopCh
 
 	log.Printf("Connecting to camera: %s", address)
 	cm.handler.SetDeviceState(true, false, false, address)
@@ -141,14 +169,20 @@ func (cm *cameraManager) connect(address string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	profiles, err := onvifClient.GetProfiles(ctx)
+	profiles, err := cm.getProfilesWithRetry(onvifClient, ctx, life, address)
 	if err != nil {
 		log.Printf("GetProfiles failed: %v", err)
 		cm.handler.SetDeviceState(true, false, false, address)
+		cm.hub.BroadcastError("连接摄像头失败: " + err.Error())
 		return
 	}
 
 	log.Printf("Found %d profiles", len(profiles))
+
+	// PTZ capability comes from the profile itself: only show pan/tilt/zoom
+	// controls when the camera actually advertises a PTZConfiguration.
+	ptzSupported := len(profiles) > 0 && profiles[0].HasPTZ()
+	cm.handler.SetPTZSupported(ptzSupported)
 
 	snapshotURL := ""
 	if len(profiles) > 0 {
@@ -169,79 +203,169 @@ func (cm *cameraManager) connect(address string) {
 	}
 
 	if snapshotURL != "" {
-		go cm.fetchAndShowSnapshot(snapshotURL)
+		go func() {
+			if err := cm.fetchAndShowSnapshot(snapshotURL); err != nil {
+				log.Printf("Initial snapshot fetch failed: %v", err)
+			}
+		}()
 		go cm.startSnapshotLoop(snapshotURL, stopCh)
 		cm.handler.SetDeviceState(true, false, true, address)
 	} else {
-		log.Println("WARNING: No snapshot available at all")
-		cm.hub.BroadcastError("摄像头不支持快照功能，且 RTSP 流不可用")
+		log.Println("WARNING: no snapshot endpoint found, relying on RTSP alone")
 	}
 
 	if len(profiles) == 0 {
 		log.Println("No media profiles, using snapshot only")
-		cm.handler.SetDeviceState(true, false, true, address)
+		if snapshotURL == "" {
+			cm.hub.BroadcastError("摄像头未返回任何媒体配置（profile），无法取流")
+		}
+		cm.handler.SetDeviceState(true, false, snapshotURL != "", address)
 		return
 	}
 
 	uri, err := onvifClient.GetStreamURI(ctx, profiles[0].Token)
 	if err != nil {
 		log.Printf("GetStreamUri failed: %v, using snapshot", err)
-		cm.handler.SetDeviceState(true, false, true, address)
+		if snapshotURL == "" {
+			cm.hub.BroadcastError("获取 RTSP 地址失败: " + err.Error())
+		}
+		cm.handler.SetDeviceState(true, false, snapshotURL != "", address)
 		return
 	}
 
 	log.Printf("RTSP URL: %s", uri.URI)
 
-	stream := rtsp.NewStream(uri.URI)
-	backchannel := rtsp.NewBackchannel(uri.URI)
-
-	stream.OnVideoNAL(func(nalu []byte) {
-		cm.hub.BroadcastVideoNAL(nalu)
-	})
-	stream.OnAudioPCM(func(pcm []byte) {
-		cm.hub.BroadcastAudioPCM(pcm)
-
-		cm.mu.Lock()
-		maxBuf := cm.cameraAudioBufMax
-		if maxBuf == 0 {
-			cm.mu.Unlock()
-			return
-		}
-		cm.cameraAudioBuf = append(cm.cameraAudioBuf, pcm...)
-		if len(cm.cameraAudioBuf) > maxBuf {
-			excess := len(cm.cameraAudioBuf) - maxBuf
-			cm.cameraAudioBuf = cm.cameraAudioBuf[excess:]
-		}
-		cm.mu.Unlock()
-	})
-
 	cm.mu.Lock()
-	cm.stream = stream
-	cm.backchannel = backchannel
-	cm.currentURL = uri.URI
 	cm.profileToken = profiles[0].Token
 	cm.mu.Unlock()
 
 	cm.cameraAudioBufMax = 160000
+	go cm.runRTSPLoop(uri.URI, life, address, snapshotURL != "")
+}
+
+// getProfilesWithRetry keeps polling the ONVIF endpoint: WiFi cameras are
+// often briefly unreachable right after a reboot/drop, and the RTSP-level
+// retry loop can only kick in once profiles are known.
+func (cm *cameraManager) getProfilesWithRetry(client *onvif.Client, ctx context.Context, life *streamLife, address string) ([]onvif.Profile, error) {
+	const maxAttempts = 12
+	const retryWait = 5 * time.Second
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if !cm.isCurrent(life) {
+			return nil, lastErr
+		}
+		profiles, err := client.GetProfiles(ctx)
+		if err == nil {
+			return profiles, nil
+		}
+		lastErr = err
+		log.Printf("GetProfiles attempt %d/%d failed: %v", attempt, maxAttempts, err)
+		if attempt == maxAttempts {
+			return nil, err
+		}
+		select {
+		case <-life.stopCh:
+			return nil, lastErr
+		case <-time.After(retryWait):
+		}
+	}
+	return nil, lastErr
+}
+
+// runRTSPLoop keeps retrying the RTSP connection for a while: cameras that
+// only start publishing after the client connects (e.g. an app-powered sport
+// camera answering 503 until its encoder produces frames) would otherwise
+// need a manual re-connect.
+func (cm *cameraManager) runRTSPLoop(rtspURL string, life *streamLife, address string, hasSnapshot bool) {
+	backchannel := rtsp.NewBackchannel(rtspURL)
+	cm.mu.Lock()
+	cm.backchannel = backchannel
+	cm.mu.Unlock()
 
 	go func() {
-		if err := stream.Connect(); err != nil {
-			log.Printf("RTSP stream failed: %v, keeping snapshot mode", err)
-			cm.handler.SetDeviceState(true, false, true, address)
-			return
-		}
-		log.Println("RTSP stream connected — switching to live video")
-		close(stopCh)
-		cm.handler.SetDeviceState(true, true, false, address)
-	}()
-
-			go func() {
 		if err := backchannel.Connect(); err != nil {
 			log.Printf("Audio backchannel unavailable: %v", err)
 			return
 		}
 		log.Println("Audio backchannel connected")
 	}()
+
+	const maxAttempts = 12
+	const retryWait = 5 * time.Second
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if !cm.isCurrent(life) {
+			return
+		}
+
+		stream := rtsp.NewStream(rtspURL)
+		stream.OnVideoNAL(func(nalu []byte) {
+			cm.hub.BroadcastVideoNAL(nalu)
+		})
+		stream.OnAudioPCM(func(pcm []byte) {
+			cm.hub.BroadcastAudioPCM(pcm)
+
+			cm.mu.Lock()
+			if cm.cameraAudioBufMax > 0 {
+				cm.cameraAudioBuf = append(cm.cameraAudioBuf, pcm...)
+				if len(cm.cameraAudioBuf) > cm.cameraAudioBufMax {
+					excess := len(cm.cameraAudioBuf) - cm.cameraAudioBufMax
+					cm.cameraAudioBuf = cm.cameraAudioBuf[excess:]
+				}
+			}
+			cm.mu.Unlock()
+		})
+
+		cm.mu.Lock()
+		if cm.stream != nil {
+			cm.stream.Close()
+		}
+		cm.stream = stream
+		cm.currentURL = rtspURL
+		cm.mu.Unlock()
+
+		err := stream.Connect()
+		if err == nil {
+			log.Println("RTSP stream connected — switching to live video")
+			life.stop() // stop the snapshot fallback loop
+			if cm.isCurrent(life) {
+				cm.handler.SetDeviceState(true, true, false, address)
+			}
+			// Watch for connection loss (WiFi cameras drop all the time):
+			// flip the stale streaming flag and re-run the full connect flow
+			// (ONVIF + RTSP retries) after a short backoff.
+			stream.WatchDisconnect(func() {
+				if !cm.isCurrent(life) {
+					return // superseded by a newer connection or closed by us
+				}
+				log.Println("RTSP stream disconnected — reconnecting")
+				cm.handler.SetDeviceState(true, false, hasSnapshot, address)
+				time.Sleep(2 * time.Second)
+				if cm.isCurrent(life) {
+					cm.connect(address)
+				}
+			})
+			return
+		}
+
+		log.Printf("RTSP stream attempt %d/%d failed: %v", attempt, maxAttempts, err)
+		if attempt == 1 && !hasSnapshot {
+			cm.hub.BroadcastError("RTSP 暂不可用（" + err.Error() + "），自动重试中")
+		}
+		if attempt == maxAttempts {
+			log.Printf("RTSP stream giving up after %d attempts", maxAttempts)
+			if cm.isCurrent(life) {
+				cm.handler.SetDeviceState(true, false, hasSnapshot, address)
+			}
+			cm.hub.BroadcastError("RTSP 连接失败: " + err.Error())
+			return
+		}
+
+		select {
+		case <-life.stopCh:
+			return
+		case <-time.After(retryWait):
+		}
+	}
 }
 
 func tryFallbackSnapshotURL(deviceAddr string) string {
@@ -262,40 +386,54 @@ func tryFallbackSnapshotURL(deviceAddr string) string {
 		base + "/web/cgi-bin/hi3510/snap.cgi",
 	}
 
-	httpClient := &http.Client{Timeout: 2 * time.Second}
+	httpClient := &http.Client{Timeout: 3 * time.Second}
 	for _, url := range candidates {
-		resp, err := httpClient.Head(url)
-		if err == nil && resp.StatusCode == 200 {
-			resp.Body.Close()
+		if probeJPEG(httpClient, url) {
 			return url
-		}
-		if resp != nil {
-			resp.Body.Close()
 		}
 	}
 	return ""
 }
 
-func (cm *cameraManager) fetchAndShowSnapshot(snapshotURL string) {
+// probeJPEG reports whether url really serves a JPEG image. Some devices
+// answer HTTP 200 with a SOAP/XML document on every path; trusting the status
+// code alone would put a broken image on screen.
+func probeJPEG(httpClient *http.Client, url string) bool {
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	magic := make([]byte, 2)
+	n, err := io.ReadFull(resp.Body, magic)
+	return err == nil && n == 2 && magic[0] == 0xFF && magic[1] == 0xD8
+}
+
+func (cm *cameraManager) fetchAndShowSnapshot(snapshotURL string) error {
 	if snapshotURL == "" {
-		return
+		return fmt.Errorf("empty snapshot URL")
 	}
 
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	resp, err := httpClient.Get(snapshotURL)
 	if err != nil {
-		log.Printf("Snapshot fetch failed: %v", err)
-		cm.hub.BroadcastError("快照获取失败: " + err.Error())
-		return
+		return fmt.Errorf("snapshot fetch: %w", err)
 	}
 	defer resp.Body.Close()
 
 	jpeg, err := io.ReadAll(resp.Body)
 	if err != nil || len(jpeg) == 0 {
-		return
+		return fmt.Errorf("empty snapshot body")
+	}
+	if jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
+		return fmt.Errorf("snapshot at %s is not a JPEG (content-type %s)", snapshotURL, resp.Header.Get("Content-Type"))
 	}
 
 	cm.hub.BroadcastVideoJPEG(jpeg)
+	return nil
 }
 
 func (cm *cameraManager) startSnapshotLoop(snapshotURL string, stopCh chan struct{}) {
@@ -304,6 +442,7 @@ func (cm *cameraManager) startSnapshotLoop(snapshotURL string, stopCh chan struc
 	}
 
 	lastTick := time.Now()
+	consecutiveFails := 0
 	for {
 		fps := cm.handler.GetSnapshotFPS()
 		interval := time.Second / time.Duration(fps)
@@ -322,7 +461,16 @@ func (cm *cameraManager) startSnapshotLoop(snapshotURL string, stopCh chan struc
 			continue
 		}
 		lastTick = now
-		cm.fetchAndShowSnapshot(snapshotURL)
+
+		if err := cm.fetchAndShowSnapshot(snapshotURL); err != nil {
+			consecutiveFails++
+			if consecutiveFails == 3 {
+				log.Printf("Snapshot loop failing repeatedly: %v", err)
+				cm.hub.BroadcastError("快照获取失败: " + err.Error())
+			}
+			continue
+		}
+		consecutiveFails = 0
 	}
 }
 
@@ -446,11 +594,8 @@ func (cm *cameraManager) processCameraAudio() {
 
 func (cm *cameraManager) disconnect() {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	if cm.stopCh != nil {
-		close(cm.stopCh)
-	}
+	life := cm.life
+	cm.life = nil
 	if cm.stream != nil {
 		cm.stream.Close()
 		cm.stream = nil
@@ -460,7 +605,11 @@ func (cm *cameraManager) disconnect() {
 		cm.backchannel = nil
 	}
 	cm.currentURL = ""
+	cm.mu.Unlock()
+
+	life.stop()
 	cm.handler.SetDeviceState(false, false, false, "未连接")
+	cm.handler.SetPTZSupported(false)
 	cm.hub.BroadcastStatus(ws.StatusIdle)
 }
 

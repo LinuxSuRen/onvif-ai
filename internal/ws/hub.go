@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -84,6 +85,7 @@ func (h *Hub) BroadcastVideoNAL(nalu []byte) {
 	msg := &Message{
 		Type: MsgTypeVideoNAL,
 		Data: base64.StdEncoding.EncodeToString(nalu),
+		Ts:   time.Now().UnixMilli(),
 	}
 	h.BroadcastMessage(msg)
 }
@@ -152,6 +154,20 @@ func (h *Hub) RegisterClient(conn *websocket.Conn) *Client {
 	}
 	h.register <- client
 	return client
+}
+
+// Send delivers a message to this client only. It is used to seed freshly
+// connected clients with the current device state, which they would otherwise
+// miss until the next state broadcast.
+func (c *Client) Send(msg *Message) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	select {
+	case c.send <- data:
+	default:
+	}
 }
 
 func (c *Client) WritePump() {

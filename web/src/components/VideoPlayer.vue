@@ -10,6 +10,7 @@ const hasStream = ref(false)
 const isSnapshotMode = ref(false)
 const videoError = ref('')
 const showPTZ = ref(false)
+const ptzSupported = ref(false)
 let frameCount = 0
 let lastFrameTime = 0
 
@@ -38,9 +39,16 @@ function feedVideoNal(base64Data: string) {
   if (!jmuxer) return
 
   const binary = atob(base64Data)
-  const bytes = new Uint8Array(binary.length)
+  // jmuxer's H.264 parser splits Annex-B streams on start codes
+  // (00 00 00 01); bare NAL units would never be extracted, so frame
+  // each NAL unit with a start code before feeding it.
+  const bytes = new Uint8Array(4 + binary.length)
+  bytes[0] = 0
+  bytes[1] = 0
+  bytes[2] = 0
+  bytes[3] = 1
   for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i)
+    bytes[i + 4] = binary.charCodeAt(i)
   }
 
   jmuxer.feed({ video: bytes })
@@ -49,17 +57,117 @@ function feedVideoNal(base64Data: string) {
   }
 }
 
+// ---- 延迟测量：后端收到帧（RTSP）→ 浏览器画面呈现 ----
+// 组成部分：
+//   1. 传输延迟：WS 消息里帧的时间戳（服务器时钟）+ 时钟偏移估算
+//   2. 呈现延迟：MSE 已追加的最新媒体时间 − 当前正在呈现的媒体时间
+const latencyMs = ref(0)
+let clockOffset: number | null = null      // serverMs - browserMs（取 RTT 最小的样本）
+let bestSyncRtt = Number.POSITIVE_INFINITY
+let transitEma: number | null = null       // 传输延迟指数平滑值
+let presentedMediaTime = 0                 // 当前画面在媒体时间轴上的位置（秒）
+
+function sendClockSyncProbe() {
+  send({ type: 'clock_sync', payload: { t0: Date.now() } })
+}
+
+function handleClockSyncReply(payload: any) {
+  const t0 = Number(payload?.t0)
+  const t1 = Number(payload?.t1)
+  if (!Number.isFinite(t0) || !Number.isFinite(t1)) return
+  const rtt = Date.now() - t0
+  if (rtt < bestSyncRtt) {
+    bestSyncRtt = rtt
+    clockOffset = t1 + rtt / 2 - Date.now()
+  }
+}
+
+function measureTransit(serverTs?: number) {
+  if (!serverTs || clockOffset === null) return
+  const raw = Date.now() + clockOffset - serverTs
+  if (raw < 0 || raw > 5000) return // 时钟未同步好或异常样本，丢弃
+  transitEma = transitEma === null ? raw : transitEma * 0.85 + raw * 0.15
+}
+
+function measurePresentationLag() {
+  const video = videoRef.value
+  if (!video || !hasStream.value || isSnapshotMode.value) return
+  const presented = presentedMediaTime > 0 ? presentedMediaTime : video.currentTime
+  if (presented <= 0) return
+  const buffered = video.buffered
+  if (buffered.length === 0) return
+  // 找到包含当前播放位置的 buffer 区间，取其末尾（= 已送入 MSE 的最新帧）
+  let bufferedEnd = -1
+  for (let i = 0; i < buffered.length; i++) {
+    if (buffered.start(i) <= presented + 0.25 && buffered.end(i) > bufferedEnd) {
+      bufferedEnd = buffered.end(i)
+    }
+  }
+  if (bufferedEnd <= 0) return
+  const lagMs = Math.max(0, (bufferedEnd - presented) * 1000)
+  const total = (transitEma ?? 0) + lagMs
+  if (total > 0 && total < 30000) {
+    latencyMs.value = Math.round(total / 10) * 10
+  }
+}
+
+let clockSyncTimer: ReturnType<typeof setInterval> | null = null
+let latencyTimer: ReturnType<typeof setInterval> | null = null
+let rVfcHandle = 0
+
+function startLatencyTracking() {
+  // 连上后先快速同步 3 次，之后低频校准
+  for (let i = 0; i < 3; i++) {
+    setTimeout(sendClockSyncProbe, i * 300)
+  }
+  clockSyncTimer = setInterval(sendClockSyncProbe, 15000)
+
+  const video = videoRef.value as any
+  // requestVideoFrameCallback 能拿到"正在呈现帧"的精确媒体时间
+  if (video && typeof video.requestVideoFrameCallback === 'function') {
+    const onFrame = (_now: number, metadata: { mediaTime: number }) => {
+      presentedMediaTime = metadata.mediaTime
+      rVfcHandle = video.requestVideoFrameCallback(onFrame)
+    }
+    rVfcHandle = video.requestVideoFrameCallback(onFrame)
+  }
+  latencyTimer = setInterval(measurePresentationLag, 500)
+}
+
+function stopLatencyTracking() {
+  if (clockSyncTimer) { clearInterval(clockSyncTimer); clockSyncTimer = null }
+  if (latencyTimer) { clearInterval(latencyTimer); latencyTimer = null }
+  const video = videoRef.value as any
+  if (video && rVfcHandle && typeof video.cancelVideoFrameCallback === 'function') {
+    video.cancelVideoFrameCallback(rVfcHandle)
+  }
+  rVfcHandle = 0
+  clockOffset = null
+  bestSyncRtt = Number.POSITIVE_INFINITY
+  transitEma = null
+  presentedMediaTime = 0
+  latencyMs.value = 0
+}
+
 watch(isConnected, (connected) => {
   if (connected) {
     connectionStatus.value = 'connected'
     nextTick(() => {
+      if (jmuxer) {
+        // Recreate the muxer on reconnect so no stale half-parsed data
+        // from the previous session lingers in its buffer.
+        jmuxer.destroy()
+        jmuxer = null
+      }
       if (!jmuxer && videoRef.value) {
         initJMuxer()
       }
+      startLatencyTracking()
     })
   } else {
     connectionStatus.value = 'disconnected'
     hasStream.value = false
+    stopLatencyTracking()
   }
 })
 
@@ -86,7 +194,11 @@ watch(messages, () => {
       frameCount++
       lastFrameTime = Date.now()
       if (frameCount === 1) console.log('[VideoPlayer] First H.264 NAL received')
+      measureTransit(msg.ts)
       feedVideoNal(msg.data)
+    }
+    if (msg.type === 'clock_sync' && msg.payload) {
+      handleClockSyncReply(msg.payload)
     }
     if (msg.type === 'video_jpeg' && msg.data) {
       frameCount++
@@ -97,6 +209,7 @@ watch(messages, () => {
     if (msg.type === 'device_state' && msg.payload) {
       const state = msg.payload as any
       console.log('[VideoPlayer] Device state:', state)
+      ptzSupported.value = !!state.ptz_supported
       if (state.streaming) {
         videoError.value = ''
       } else if (state.snapshot_mode) {
@@ -126,6 +239,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  stopLatencyTracking()
   if (jmuxer) {
     jmuxer.destroy()
     jmuxer = null
@@ -161,11 +275,18 @@ onUnmounted(() => {
         class="video-player__snapshot"
         :class="{ 'video-player__snapshot--visible': isSnapshotMode }"
       />
-      <div v-if="showPTZ && hasStream" class="video-player__ptz-overlay">
+      <div v-if="showPTZ && hasStream && ptzSupported" class="video-player__ptz-overlay">
         <button class="video-player__ptz-btn video-player__ptz-btn--up"    @mousedown.prevent="ptzMove('up')">▲</button>
         <button class="video-player__ptz-btn video-player__ptz-btn--left"  @mousedown.prevent="ptzMove('left')">◀</button>
         <button class="video-player__ptz-btn video-player__ptz-btn--right" @mousedown.prevent="ptzMove('right')">▶</button>
         <button class="video-player__ptz-btn video-player__ptz-btn--down"  @mousedown.prevent="ptzMove('down')">▼</button>
+      </div>
+      <div
+        v-if="hasStream && !isSnapshotMode && latencyMs > 0"
+        class="video-player__latency"
+        title="从后端收到 RTSP 帧到画面呈现的延迟。不含摄像头采集/编码、以及摄像头到后端的网络传输延迟（这部分无法从外部测量，需要设备发送 RTCP 发送者报告）"
+      >
+        ⏱ {{ latencyMs }}ms·自后端
       </div>
       <div v-if="!hasStream" class="video-player__placeholder">
         <span class="video-player__placeholder-icon">📷</span>
@@ -349,6 +470,22 @@ onUnmounted(() => {
   position: absolute; inset: 0;
   pointer-events: none;
   z-index: 10;
+}
+
+.video-player__latency {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 5;
+  pointer-events: none;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm, 4px);
+  background: rgba(0, 0, 0, 0.55);
+  color: rgba(0, 229, 160, 0.95);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  backdrop-filter: blur(2px);
 }
 
 .video-player__ptz-btn {

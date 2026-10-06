@@ -8,22 +8,23 @@ type MessageType string
 
 const (
 	// Client → Server
-	MsgTypeAudioStart  MessageType = "audio_start"  // Start mic capture
-	MsgTypeAudioData   MessageType = "audio_data"   // Audio chunk (base64 PCM)
-	MsgTypeAudioStop   MessageType = "audio_stop"   // Stop mic capture
+	MsgTypeAudioStart   MessageType = "audio_start"   // Start mic capture
+	MsgTypeAudioData    MessageType = "audio_data"    // Audio chunk (base64 PCM)
+	MsgTypeAudioStop    MessageType = "audio_stop"    // Stop mic capture
 	MsgTypeSpeechText   MessageType = "speech_text"   // Recognized speech text from browser
 	MsgTypeCameraListen MessageType = "camera_listen" // Trigger STT on buffered camera audio
-	MsgTypeClearHistory MessageType = "clear_history"  // Clear conversation history
-	MsgTypePTZMove      MessageType = "ptz_move"       // PTZ direction command
-	MsgTypeSwitchMode   MessageType = "switch_mode"     // Switch audio mode
+	MsgTypeClearHistory MessageType = "clear_history" // Clear conversation history
+	MsgTypePTZMove      MessageType = "ptz_move"      // PTZ direction command
+	MsgTypeSwitchMode   MessageType = "switch_mode"   // Switch audio mode
+	MsgTypeClockSync    MessageType = "clock_sync"    // Clock offset probe (both directions)
 
 	// Server → Client
-	MsgTypeVideoNAL  MessageType = "video_nal"  // H.264 NAL unit (base64)
-	MsgTypeVideoJPEG MessageType = "video_jpeg" // JPEG snapshot frame (base64)
-	MsgTypeTranscript MessageType = "transcript" // LLM text response
-	MsgTypeStatus    MessageType = "status"     // System status
-	MsgTypeError     MessageType = "error"      // Error message
-	MsgTypeAudioOut   MessageType = "audio_out"   // PCM audio for browser playback (base64)
+	MsgTypeVideoNAL    MessageType = "video_nal"    // H.264 NAL unit (base64)
+	MsgTypeVideoJPEG   MessageType = "video_jpeg"   // JPEG snapshot frame (base64)
+	MsgTypeTranscript  MessageType = "transcript"   // LLM text response
+	MsgTypeStatus      MessageType = "status"       // System status
+	MsgTypeError       MessageType = "error"        // Error message
+	MsgTypeAudioOut    MessageType = "audio_out"    // PCM audio for browser playback (base64)
 	MsgTypeDeviceState MessageType = "device_state" // Device connection state update
 	MsgTypePTZCommand  MessageType = "ptz_command"  // PTZ command result (direction + text)
 )
@@ -34,6 +35,9 @@ type Message struct {
 	Data    string          `json:"data,omitempty"`    // base64 encoded binary data
 	Text    string          `json:"text,omitempty"`    // text content
 	Payload json.RawMessage `json:"payload,omitempty"` // structured data
+	// Ts is the server wall-clock time (unix ms) at which a frame was
+	// received from the RTSP source; used by the browser to measure latency.
+	Ts int64 `json:"ts,omitempty"`
 }
 
 // StatusState represents the system state.
