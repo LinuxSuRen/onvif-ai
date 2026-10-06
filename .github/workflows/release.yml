@@ -15,7 +15,7 @@ env:
 
 jobs:
   binaries:
-    name: Binaries (${{ matrix.goos }}/${{ matrix.goarch }})
+    name: Binaries (${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -28,6 +28,9 @@ jobs:
           - goos: linux
             goarch: arm
             goarm: '6'
+          - goos: linux
+            goarch: arm
+            goarm: '7'
           - goos: darwin
             goarch: amd64
           - goos: darwin
