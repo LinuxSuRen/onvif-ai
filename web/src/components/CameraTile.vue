@@ -251,10 +251,10 @@ defineExpose({ feedNal, feedJpeg })
     </div>
 
     <div v-if="active && cam.ptz && cam.streaming" class="cam-tile__ptz">
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--up" @mousedown.prevent="ptzMove('up')">▲</button>
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--left" @mousedown.prevent="ptzMove('left')">◀</button>
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--right" @mousedown.prevent="ptzMove('right')">▶</button>
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--down" @mousedown.prevent="ptzMove('down')">▼</button>
+      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--up" @pointerdown.prevent="ptzMove('up')">▲</button>
+      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--left" @pointerdown.prevent="ptzMove('left')">◀</button>
+      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--right" @pointerdown.prevent="ptzMove('right')">▶</button>
+      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--down" @pointerdown.prevent="ptzMove('down')">▼</button>
     </div>
 
     <div v-if="!hasVideo" class="cam-tile__placeholder">暂无画面</div>
@@ -364,6 +364,15 @@ defineExpose({ feedNal, feedJpeg })
 .cam-tile__ptz-btn:hover {
   background: rgba(0, 229, 160, 0.15);
   color: #00e5a0;
+}
+
+/* 触屏：触摸目标不小于 44px，避免误触 */
+@media (pointer: coarse) {
+  .cam-tile__ptz-btn {
+    width: 44px;
+    height: 44px;
+    font-size: 1.1rem;
+  }
 }
 
 .cam-tile__ptz-btn--up { top: 4px; left: 50%; transform: translateX(-50%); }

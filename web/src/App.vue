@@ -155,4 +155,25 @@ onUnmounted(() => {
   min-height: 0;
   overflow-y: auto;
 }
+
+/* ---- 移动端适配：窄屏单栏堆叠，视频优先 ---- */
+@media (max-width: 960px) {
+  .app-main {
+    grid-template-columns: 1fr;
+    padding: var(--space-3);
+    gap: var(--space-3);
+  }
+
+  .app-main__sidebar {
+    overflow-y: visible; /* 移动端跟随页面滚动，避免嵌套滚动 */
+  }
+
+  .app-header {
+    padding: var(--space-2) var(--space-3);
+  }
+
+  .app-header__subtitle {
+    display: none; /* 窄屏隐藏副标题，保留品牌与时间 */
+  }
+}
 </style>

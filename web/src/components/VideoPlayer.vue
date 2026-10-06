@@ -506,4 +506,25 @@ onUnmounted(() => {
   font-size: 0.72rem;
   text-align: center;
 }
+
+/* ---- 触屏 / 窄屏适配 ---- */
+@media (pointer: coarse) {
+  .video-player__mode-btn,
+  .video-player__cam-btn {
+    padding: 8px 16px; /* 触摸目标高度 ≥40px */
+    font-size: 0.8rem;
+  }
+}
+
+@media (max-width: 960px) {
+  .video-player__viewport {
+    /* 竖屏手机上 16:9 过扁，放宽到 3:2 保证可视面积 */
+    aspect-ratio: 3 / 2;
+  }
+
+  .video-player__mode-switch,
+  .video-player__cam-switch {
+    background: rgba(0, 0, 0, 0.7);
+  }
+}
 </style>
