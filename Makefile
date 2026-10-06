@@ -1,4 +1,12 @@
-.PHONY: all run build test clean dev
+.PHONY: all run build test clean dev release
+
+# === Release ===
+# make release VERSION=0.0.1 —— 打 tag 并推送，触发 GitHub Actions：
+# 多平台二进制 + ghcr.io Docker 镜像 + GitHub Release
+release:
+	@test -n "$(VERSION)" || (echo "usage: make release VERSION=0.0.1"; exit 1)
+	git tag -a "v$(VERSION)" -m "release v$(VERSION)"
+	git push origin "v$(VERSION)"
 
 # === Server ===
 run:
