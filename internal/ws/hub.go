@@ -44,11 +44,14 @@ func (h *Hub) Run() {
 
 		case client := <-h.unregister:
 			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
+			_, stillRegistered := h.clients[client]
+			if stillRegistered {
 				delete(h.clients, client)
-				close(client.send)
 			}
 			h.mu.Unlock()
+			if stillRegistered {
+				client.markClosed() // 关闭 send 前置 closed 标志，Send 不再竞态
+			}
 
 		case message := <-h.broadcast:
 			h.mu.RLock()
@@ -66,11 +69,14 @@ func (h *Hub) Run() {
 
 func (h *Hub) removeClient(client *Client) {
 	h.mu.Lock()
-	if _, ok := h.clients[client]; ok {
+	_, stillRegistered := h.clients[client]
+	if stillRegistered {
 		delete(h.clients, client)
-		close(client.send)
 	}
 	h.mu.Unlock()
+	if stillRegistered {
+		client.markClosed()
+	}
 }
 
 func (h *Hub) BroadcastMessage(msg *Message) {
@@ -81,19 +87,24 @@ func (h *Hub) BroadcastMessage(msg *Message) {
 	h.broadcast <- data
 }
 
-func (h *Hub) BroadcastVideoNAL(nalu []byte) {
+// BroadcastVideoNAL sends one H.264 NAL unit; cam is the media profile token
+// of the camera it belongs to (may be empty for single-camera devices).
+func (h *Hub) BroadcastVideoNAL(cam string, nalu []byte) {
 	msg := &Message{
 		Type: MsgTypeVideoNAL,
 		Data: base64.StdEncoding.EncodeToString(nalu),
 		Ts:   time.Now().UnixMilli(),
+		Cam:  cam,
 	}
 	h.BroadcastMessage(msg)
 }
 
-func (h *Hub) BroadcastVideoJPEG(jpeg []byte) {
+// BroadcastVideoJPEG sends one JPEG snapshot frame for the given camera.
+func (h *Hub) BroadcastVideoJPEG(cam string, jpeg []byte) {
 	msg := &Message{
 		Type: MsgTypeVideoJPEG,
 		Data: base64.StdEncoding.EncodeToString(jpeg),
+		Cam:  cam,
 	}
 	h.BroadcastMessage(msg)
 }
@@ -159,14 +170,35 @@ func (h *Hub) RegisterClient(conn *websocket.Conn) *Client {
 // Send delivers a message to this client only. It is used to seed freshly
 // connected clients with the current device state, which they would otherwise
 // miss until the next state broadcast.
+//
+// The hub may concurrently remove the client and close its send channel (e.g.
+// after a write timeout); the closed flag below closes that race — sending on
+// a closed channel would panic and take the whole process down.
 func (c *Client) Send(msg *Message) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
 	select {
 	case c.send <- data:
 	default:
+	}
+	c.mu.Unlock()
+}
+
+// markClosed marks the client closed and closes its send channel exactly
+// once, waking the WritePump. Callers must hold no other locks.
+func (c *Client) markClosed() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed {
+		c.closed = true
+		close(c.send)
 	}
 }
 
@@ -212,7 +244,5 @@ func (c *Client) ReadPump(handler func(*Message)) {
 }
 
 func (c *Client) Close() {
-	c.mu.Lock()
-	c.closed = true
-	c.mu.Unlock()
+	c.markClosed()
 }

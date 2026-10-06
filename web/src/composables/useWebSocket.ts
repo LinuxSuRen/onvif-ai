@@ -8,6 +8,7 @@ export interface WsMessage {
   data?: string
   text?: string
   ts?: number
+  cam?: string
   payload?: {
     state?: string
     [key: string]: unknown
