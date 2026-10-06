@@ -55,7 +55,7 @@ docker run --network host --env-file .env onvif-ai
 make release VERSION=0.0.1
 ```
 
-自动完成：多平台二进制（linux amd64/arm64/armv6、darwin amd64/arm64、windows amd64，
+自动完成：多平台二进制（linux amd64/arm64/armv6/armv7、darwin amd64/arm64、windows amd64，
 含前端静态资源）→ GitHub Release 附件；多架构 Docker 镜像（linux amd64/arm64）→ ghcr.io。
 
 ## 环境变量
