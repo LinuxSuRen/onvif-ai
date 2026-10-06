@@ -37,6 +37,27 @@ make web-dev # 前端 :5173 (新终端)
 
 打开 `http://localhost:5173`
 
+### Docker
+
+```bash
+docker build -t onvif-ai .
+# WS-Discovery 依赖 UDP 3702 组播，Linux 下建议 --network host
+docker run --network host --env-file .env onvif-ai
+```
+
+镜像同时发布到 ghcr.io：`ghcr.io/linuxsuren/onvif-ai:<version>`
+
+### 发布
+
+推送 `v*` tag 触发 [Release workflow](.github/workflows/release.yml)：
+
+```bash
+make release VERSION=0.0.1
+```
+
+自动完成：多平台二进制（linux amd64/arm64/armv6、darwin amd64/arm64、windows amd64，
+含前端静态资源）→ GitHub Release 附件；多架构 Docker 镜像（linux amd64/arm64）→ ghcr.io。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |

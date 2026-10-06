@@ -24,8 +24,15 @@ import (
 	"github.com/onvif-ai/internal/ws"
 )
 
+// version / commit 由构建注入（-ldflags -X），release 二进制与 Docker 镜像携带。
+var (
+	version = "dev"
+	commit  = "unknown"
+)
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Printf("onvif-ai %s (commit %s)", version, commit)
 
 	hub := ws.NewHub()
 	go hub.Run()

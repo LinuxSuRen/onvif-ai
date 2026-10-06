@@ -1,0 +1,8 @@
+.git
+.env
+bin/
+web/node_modules/
+web/dist/
+*.log
+.sisyphus/
+.DS_Store
