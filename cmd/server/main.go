@@ -133,11 +133,12 @@ type camUnit struct {
 	snapshotURL string
 
 	// 运行时状态（受 cm.mu 保护）
-	streaming  bool
-	snapshotOn bool
-	mjpeg      bool // 该路为 MJPEG（JPEG 帧流）而非 H.264
-	stream     *rtsp.Stream
-	snapLife   *streamLife // 控制该路快照循环；RTSP 起流后停止
+	streaming   bool
+	snapshotOn  bool
+	mjpeg       bool // 该路为 MJPEG（JPEG 帧流）而非 H.264
+	stream      *rtsp.Stream
+	snapLife    *streamLife // 控制该路快照循环；RTSP 起流后停止
+	loopRunning bool        // runUnit 防重入：避免断流重连派生并发循环
 }
 
 // streamLife owns the stop channel of one connection attempt. The channel is
@@ -286,11 +287,24 @@ func (cm *cameraManager) setUnitMode(u *camUnit, streaming, snapshotOn bool) {
 }
 
 // runUnit 启动一路画面：先起快照降级，再进入 RTSP 重试循环。
+// 同一 unit 同时只允许一个循环在跑：断流回调若恰逢循环仍在运行（例如
+// 被并发循环关闭旧连接触发），直接跳过，否则会指数级派生 RTSP 连接。
 func (cm *cameraManager) runUnit(u *camUnit, life *streamLife, address string) {
 	cm.mu.Lock()
+	if u.loopRunning {
+		cm.mu.Unlock()
+		log.Printf("[%s] unit loop already running, skip re-entry", u.token)
+		return
+	}
+	u.loopRunning = true
 	u.snapLife = newStreamLife()
 	snapStop := u.snapLife.stopCh
 	cm.mu.Unlock()
+	defer func() {
+		cm.mu.Lock()
+		u.loopRunning = false
+		cm.mu.Unlock()
+	}()
 
 	if u.snapshotURL != "" {
 		go func() {
@@ -386,7 +400,7 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 				log.Printf("[%s] RTSP stream disconnected — reconnecting", u.token)
 				cm.setUnitMode(u, false, u.snapshotURL != "")
 				time.Sleep(2 * time.Second)
-				if cm.isCurrent(life) && cm.ownsUnit(u) {
+				if cm.isCurrent(life) && cm.ownsUnit(u) && !cm.unitLoopBusy(u) {
 					cm.runUnit(u, life, address)
 				}
 			})
@@ -417,6 +431,13 @@ func (cm *cameraManager) firstUnitIs(u *camUnit) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return len(cm.units) > 0 && cm.units[0] == u
+}
+
+// unitLoopBusy 判断该路的循环是否仍在运行（防重入检查用）。
+func (cm *cameraManager) unitLoopBusy(u *camUnit) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return u.loopRunning
 }
 
 // ownsUnit 判断 u 是否仍属于当前连接（未被新连接替换）。

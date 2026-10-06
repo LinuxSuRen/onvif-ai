@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onUnmounted, provide } from 'vue'
-import { useWebSocket } from '../composables/useWebSocket'
+import { useWebSocket, type WsMessage } from '../composables/useWebSocket'
 import CameraTile from './CameraTile.vue'
 
 /**
@@ -27,7 +27,39 @@ const mode = ref<'grid' | 'single'>(
 const activeCam = ref('')
 const videoError = ref('')
 
-const { messages, isConnected, isConnecting, popNewMessages, send } = useWebSocket('/ws')
+const { isConnected, isConnecting, send, subscribe } = useWebSocket('/ws')
+
+let lastErrorText = ''
+function handleMessage(msg: WsMessage) {
+  if (msg.type === 'video_nal' && msg.data) {
+    lastFrameTime = Date.now()
+    const data = msg.data
+    routeToTile(msg.cam, (tile) => tile.feedNal(msg.ts, data))
+    return
+  }
+  if (msg.type === 'video_jpeg' && msg.data) {
+    lastFrameTime = Date.now()
+    const data = msg.data
+    routeToTile(msg.cam, (tile) => tile.feedJpeg(data))
+    return
+  }
+  if (msg.type === 'device_state' && msg.payload) {
+    applyDeviceState(msg.payload)
+    return
+  }
+  if (msg.type === 'clock_sync' && msg.payload) {
+    handleClockSyncReply(msg.payload)
+    return
+  }
+  if (msg.type === 'error' && msg.text) {
+    if (msg.text !== lastErrorText) {
+      lastErrorText = msg.text
+      console.error('[VideoPlayer] Error:', msg.text)
+    }
+    videoError.value = msg.text
+  }
+}
+subscribe(['video_nal', 'video_jpeg', 'device_state', 'clock_sync', 'error'], handleMessage)
 
 // tile 自注册表：v-for 的函数 ref 在模式切换时挂载/卸载回调顺序不确定，
 // 由 CameraTile 在自身生命周期内注册/注销，避免 Map 被旧实例误删。
@@ -89,12 +121,15 @@ function handleClockSyncReply(payload: unknown) {
 }
 
 let clockSyncTimer: ReturnType<typeof setInterval> | null = null
+// 重连代际：tiles 据此重建解码管线（旧 MSE 时间轴已作废）
+const resetKey = ref(0)
 
 watch(isConnected, (connected) => {
   if (connected) {
     connectionStatus.value = 'connected'
     bestSyncRtt = Number.POSITIVE_INFINITY
     clockOffsetRef.value = null
+    resetKey.value++
     for (let i = 0; i < 3; i++) {
       setTimeout(sendClockSyncProbe, i * 300)
     }
@@ -117,31 +152,7 @@ watch(isConnecting, (connecting) => {
 
 let lastFrameTime = 0
 
-watch(messages, () => {
-  const newMsgs = popNewMessages()
-  for (const msg of newMsgs) {
-    if (msg.type === 'video_nal' && msg.data) {
-      lastFrameTime = Date.now()
-      const data = msg.data
-      routeToTile(msg.cam, (tile) => tile.feedNal(msg.ts, data))
-    }
-    if (msg.type === 'video_jpeg' && msg.data) {
-      lastFrameTime = Date.now()
-      const data = msg.data
-      routeToTile(msg.cam, (tile) => tile.feedJpeg(data))
-    }
-    if (msg.type === 'device_state' && msg.payload) {
-      applyDeviceState(msg.payload)
-    }
-    if (msg.type === 'clock_sync' && msg.payload) {
-      handleClockSyncReply(msg.payload)
-    }
-    if (msg.type === 'error' && msg.text) {
-      console.error('[VideoPlayer] Error:', msg.text)
-      videoError.value = msg.text
-    }
-  }
-}, { deep: false })
+
 
 function routeToTile(cam: string | undefined, feed: (tile: TileAPI) => void) {
   if (!cameras.value.length) return
@@ -240,6 +251,7 @@ onUnmounted(() => {
           :active="false"
           :show-label="true"
           :clock-offset="clockOffsetRef"
+          :reset-key="resetKey"
         />
       </div>
 
@@ -252,6 +264,7 @@ onUnmounted(() => {
           :active="true"
           :show-label="false"
           :clock-offset="clockOffsetRef"
+          :reset-key="resetKey"
           @ptz="ptzMove"
         />
       </div>
