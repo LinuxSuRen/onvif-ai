@@ -162,18 +162,27 @@ func (s *Stream) Connect() error {
 	needsSetup := false
 
 	// 音频格式选择分两轮，保证优先级与 SDP 中 m=audio 的出现顺序无关：
-	// 第一轮只认 G.711（ONVIF 对讲事实标准、现有回传链路依赖）；
-	// 第二轮在没有任何 G.711 时才接受 AAC-LC（RFC 3640 mpeg4-generic）。
+	// 第一轮优先 AAC-LC（宽频立体声，听感明显优于 8kHz 电话音质的 G.711；
+	// 同时提供两种音轨的源——如 ohos-ipcam-streamer——自动选优）；
+	// 第二轮在没有任何 AAC-LC 时接受 G.711（ONVIF 对讲事实标准，兜底）。
 	for _, media := range desc.Medias {
 		if media.IsBackChannel {
 			continue
 		}
 		for _, f := range media.Formats {
-			if g711, ok := f.(*format.G711); ok &&
-				media.Type == description.MediaTypeAudio && audioMedia == nil {
-				audioMedia = media
-				audioG711 = g711
+			m4a, ok := f.(*format.MPEG4Audio)
+			if !ok || media.Type != description.MediaTypeAudio {
+				continue
 			}
+			// 仅接受 AAC-LC（解码器能力边界）；HE-AAC 等仍走不支持告警
+			if m4a.Config != nil && m4a.Config.Type == mpeg4audio.ObjectTypeAACLC {
+				audioMedia = media
+				audioAAC = m4a
+				break
+			}
+		}
+		if audioAAC != nil {
+			break
 		}
 	}
 	if audioMedia == nil {
@@ -182,19 +191,11 @@ func (s *Stream) Connect() error {
 				continue
 			}
 			for _, f := range media.Formats {
-				m4a, ok := f.(*format.MPEG4Audio)
-				if !ok || media.Type != description.MediaTypeAudio {
-					continue
-				}
-				// 仅接受 AAC-LC（解码器能力边界）；HE-AAC 等仍走不支持告警
-				if m4a.Config != nil && m4a.Config.Type == mpeg4audio.ObjectTypeAACLC {
+				if g711, ok := f.(*format.G711); ok &&
+					media.Type == description.MediaTypeAudio && audioMedia == nil {
 					audioMedia = media
-					audioAAC = m4a
-					break
+					audioG711 = g711
 				}
-			}
-			if audioAAC != nil {
-				break
 			}
 		}
 	}
