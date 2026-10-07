@@ -79,6 +79,12 @@ make release VERSION=0.0.1
 | `TTS_VOICE` | `zh-CN-XiaoxiaoNeural` | 语音名称 |
 | `PORT` | `8080` | HTTP 端口 |
 
+命令行参数 `--port` 可指定端口，优先级高于 `PORT` 环境变量：
+
+```bash
+./server --port 3000    # 监听 3000，忽略 PORT 环境变量
+```
+
 ## 架构
 
 ```
