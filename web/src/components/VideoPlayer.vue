@@ -18,6 +18,8 @@ interface CamInfo {
   streaming: boolean
   snapshot: boolean
   mjpeg: boolean
+  width: number
+  height: number
 }
 
 const connectionStatus = ref<'disconnected' | 'connecting' | 'connected'>('connecting')
@@ -172,6 +174,8 @@ function applyDeviceState(state: any) {
     streaming: !!c.streaming,
     snapshot: !!c.snapshot_mode,
     mjpeg: !!c.mjpeg,
+    width: c.width > 0 ? c.width : 0,
+    height: c.height > 0 ? c.height : 0,
   }))
 
   // 兼容未携带 cameras 列表的旧后端：退化为单路隐式摄像头
@@ -183,6 +187,8 @@ function applyDeviceState(state: any) {
       streaming: !!state.streaming,
       snapshot: !!state.snapshot_mode,
       mjpeg: false,
+      width: 0,
+      height: 0,
     })
   }
 

@@ -145,6 +145,8 @@ type camUnit struct {
 	stream      *rtsp.Stream
 	snapLife    *streamLife // 控制该路快照循环；RTSP 起流后停止
 	loopRunning bool        // runUnit 防重入：避免断流重连派生并发循环
+	width       int         // 画面分辨率（SDP SPS / 带内 SPS / JPEG SOF 解析）
+	height      int
 }
 
 // streamLife owns the stop channel of one connection attempt. The channel is
@@ -273,6 +275,8 @@ func (cm *cameraManager) syncCameraStates() {
 			Streaming:    u.streaming,
 			SnapshotMode: u.snapshotOn,
 			MJPEG:        u.mjpeg,
+			Width:        u.width,
+			Height:       u.height,
 		})
 		anyStreaming = anyStreaming || u.streaming
 		anySnapshot = anySnapshot || u.snapshotOn
@@ -288,6 +292,22 @@ func (cm *cameraManager) setUnitMode(u *camUnit, streaming, snapshotOn bool) {
 	cm.mu.Lock()
 	u.streaming = streaming
 	u.snapshotOn = snapshotOn
+	cm.mu.Unlock()
+	cm.syncCameraStates()
+}
+
+// setUnitResolution 首次解析出某路画面的分辨率时更新并广播 device_state。
+func (cm *cameraManager) setUnitResolution(u *camUnit, width, height int) {
+	if width <= 0 || height <= 0 {
+		return
+	}
+	cm.mu.Lock()
+	if u.width == width && u.height == height {
+		cm.mu.Unlock()
+		return
+	}
+	u.width = width
+	u.height = height
 	cm.mu.Unlock()
 	cm.syncCameraStates()
 }
@@ -314,11 +334,11 @@ func (cm *cameraManager) runUnit(u *camUnit, life *streamLife, address string) {
 
 	if u.snapshotURL != "" {
 		go func() {
-			if err := cm.fetchAndShowSnapshot(u.token, u.snapshotURL); err != nil {
+			if err := cm.fetchAndShowSnapshot(u, u.snapshotURL); err != nil {
 				log.Printf("Initial snapshot(%s) fetch failed: %v", u.token, err)
 			}
 		}()
-		go cm.startSnapshotLoop(u.token, u.snapshotURL, snapStop)
+		go cm.startSnapshotLoop(u, u.snapshotURL, snapStop)
 		cm.setUnitMode(u, false, true)
 	}
 
@@ -349,6 +369,10 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 		// MJPEG（RFC 2435）帧为完整 JPEG，复用快照通道推给浏览器
 		stream.OnVideoJPEG(func(jpeg []byte) {
 			cm.hub.BroadcastVideoJPEG(cam, jpeg)
+		})
+		// 分辨率（H.264 SDP/带内 SPS、MJPEG JPEG SOF）解析出即上报
+		stream.OnVideoResolution(func(width, height int) {
+			cm.setUnitResolution(u, width, height)
 		})
 		stream.OnAudioPCM(func(pcm []byte, sampleRate, channels int) {
 			// 音频按设备级处理：只取第一路，供浏览器播放与语音识别
@@ -589,7 +613,7 @@ func probeJPEG(httpClient *http.Client, url string) bool {
 	return err == nil && n == 2 && magic[0] == 0xFF && magic[1] == 0xD8
 }
 
-func (cm *cameraManager) fetchAndShowSnapshot(cam, snapshotURL string) error {
+func (cm *cameraManager) fetchAndShowSnapshot(u *camUnit, snapshotURL string) error {
 	if snapshotURL == "" {
 		return fmt.Errorf("empty snapshot URL")
 	}
@@ -609,11 +633,16 @@ func (cm *cameraManager) fetchAndShowSnapshot(cam, snapshotURL string) error {
 		return fmt.Errorf("snapshot at %s is not a JPEG (content-type %s)", snapshotURL, resp.Header.Get("Content-Type"))
 	}
 
-	cm.hub.BroadcastVideoJPEG(cam, jpeg)
+	// 首帧快照即可解析出分辨率（快照模式也能展示分辨率角标）
+	if w, h := rtsp.JPEGResolution(jpeg); w > 0 {
+		cm.setUnitResolution(u, w, h)
+	}
+
+	cm.hub.BroadcastVideoJPEG(u.token, jpeg)
 	return nil
 }
 
-func (cm *cameraManager) startSnapshotLoop(cam, snapshotURL string, stopCh chan struct{}) {
+func (cm *cameraManager) startSnapshotLoop(u *camUnit, snapshotURL string, stopCh chan struct{}) {
 	if snapshotURL == "" {
 		return
 	}
@@ -639,7 +668,7 @@ func (cm *cameraManager) startSnapshotLoop(cam, snapshotURL string, stopCh chan 
 		}
 		lastTick = now
 
-		if err := cm.fetchAndShowSnapshot(cam, snapshotURL); err != nil {
+		if err := cm.fetchAndShowSnapshot(u, snapshotURL); err != nil {
 			consecutiveFails++
 			if consecutiveFails == 3 {
 				log.Printf("Snapshot loop failing repeatedly: %v", err)

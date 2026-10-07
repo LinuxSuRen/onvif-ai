@@ -67,3 +67,23 @@ func TestDeviceStateAudioJSON(t *testing.T) {
 		t.Fatalf("unexpected round-trip: %+v", st.Audio)
 	}
 }
+
+// TestCameraStateResolutionJSON 校验摄像头条目分辨率字段的序列化契约：
+// 未知时省略，已知时携带 width/height。
+func TestCameraStateResolutionJSON(t *testing.T) {
+	b, err := json.Marshal(DeviceState{Cameras: []CameraState{{Token: "t1", Name: "cam"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"width"`) || strings.Contains(string(b), `"height"`) {
+		t.Fatalf("unknown resolution must be omitted, got %s", b)
+	}
+
+	b, err = json.Marshal(DeviceState{Cameras: []CameraState{{Token: "t1", Width: 1280, Height: 720}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"width":1280`) || !strings.Contains(string(b), `"height":720`) {
+		t.Fatalf("resolution expected, got %s", b)
+	}
+}

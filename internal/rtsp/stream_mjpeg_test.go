@@ -56,6 +56,13 @@ func TestStreamMJPEG(t *testing.T) {
 	cl := NewStream("rtsp://" + addr + "/mjpeg")
 	jpegs := make(chan []byte, 4)
 	cl.OnVideoJPEG(func(img []byte) { jpegs <- img })
+	res := make(chan [2]int, 1)
+	cl.OnVideoResolution(func(width, height int) {
+		select {
+		case res <- [2]int{width, height}:
+		default:
+		}
+	})
 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -89,6 +96,16 @@ func TestStreamMJPEG(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("no MJPEG frame received in time")
+	}
+
+	// 首帧 JPEG 的 SOF 解析出分辨率（发布端画布为 160x120）
+	select {
+	case wh := <-res:
+		if wh[0] != 160 || wh[1] != 120 {
+			t.Fatalf("expected resolution 160x120, got %dx%d", wh[0], wh[1])
+		}
+	case <-ctx.Done():
+		t.Fatal("resolution not reported in time")
 	}
 }
 

@@ -51,6 +51,10 @@ type CameraState struct {
 	SnapshotMode bool   `json:"snapshot_mode"`
 	// MJPEG 表示该路为 JPEG 帧流（RTSP MJPEG），前端按连续图片渲染而非 H.264
 	MJPEG bool `json:"mjpeg,omitempty"`
+	// Width/Height 是该路画面的像素分辨率（H.264 SPS / JPEG SOF 解析），
+	// 0 表示尚未得知，前端不展示角标
+	Width  int `json:"width,omitempty"`
+	Height int `json:"height,omitempty"`
 }
 
 type Handler struct {

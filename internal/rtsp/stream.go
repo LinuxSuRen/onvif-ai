@@ -54,6 +54,11 @@ type Stream struct {
 	sps []byte
 	pps []byte
 
+	// videoResHandler 在分辨率首次得知时回调一次（H.264 解析 SDP SPS，
+	// SDP 没带则嗅探带内首个 SPS NAL；MJPEG/快照解析首帧 JPEG SOF）。
+	videoResHandler func(width, height int)
+	resKnown        bool
+
 	closeOnce sync.Once
 
 	videoNALHandler  func([]byte)
@@ -79,6 +84,24 @@ func (s *Stream) OnVideoJPEG(handler func([]byte)) {
 // instead of an H.264 NAL stream.
 func (s *Stream) IsMJPEG() bool {
 	return s.mjpegDec != nil
+}
+
+// OnVideoResolution registers the handler for the stream's pixel resolution.
+// It fires exactly once per connection attempt, as soon as the resolution is
+// known: from the SDP's sprop-parameter-sets (H.264), from the first in-band
+// SPS NAL when the SDP carries none, or from the first JPEG frame's SOF
+// segment (MJPEG). Must be registered before Connect.
+func (s *Stream) OnVideoResolution(handler func(width, height int)) {
+	s.videoResHandler = handler
+}
+
+// reportResolution 记录并上报分辨率，每路连接只报一次。
+func (s *Stream) reportResolution(w, h int) {
+	if s.resKnown || w <= 0 || h <= 0 || s.videoResHandler == nil {
+		return
+	}
+	s.resKnown = true
+	s.videoResHandler(w, h)
 }
 
 // OnAudioPCM registers the handler for linear PCM decoded from the stream's
@@ -235,6 +258,11 @@ func (s *Stream) Connect() error {
 			s.h264Dec = dec
 			s.sps = videoH264.SPS
 			s.pps = videoH264.PPS
+			// SDP 携带 sprop-parameter-sets 时建流即可知分辨率；
+			// 没带则等带内首个 SPS NAL（见下方回调）
+			if w, h := resolutionFromSPS(s.sps); w > 0 {
+				s.reportResolution(w, h)
+			}
 		}
 		if videoMJPEG != nil {
 			dec, err := videoMJPEG.CreateDecoder()
@@ -325,6 +353,12 @@ func (s *Stream) Connect() error {
 				return
 			}
 			for _, nalu := range nalus {
+				if !s.resKnown && len(nalu) > 0 && nalu[0]&0x1F == 7 {
+					// SDP 未携带参数集时，从带内首个 SPS NAL 解析分辨率
+					if w, h := resolutionFromSPS(nalu); w > 0 {
+						s.reportResolution(w, h)
+					}
+				}
 				if isIDRNAL(nalu) {
 					// Parameter sets usually live only in the SDP; re-send
 					// them ahead of each keyframe so any client that just
@@ -347,6 +381,11 @@ func (s *Stream) Connect() error {
 			img, err := s.mjpegDec.Decode(pkt)
 			if err != nil || len(img) == 0 || s.videoJPEGHandler == nil {
 				return
+			}
+			if !s.resKnown {
+				if w, h := JPEGResolution(img); w > 0 {
+					s.reportResolution(w, h)
+				}
 			}
 			// RFC 2435 解出的每帧即完整 JPEG，直接复用快照的浏览器通道
 			s.videoJPEGHandler(img)
