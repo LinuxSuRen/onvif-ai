@@ -40,8 +40,12 @@ type Stream struct {
 
 	// 音频轨道的实际参数（来自 SDP 协商结果），随 OnAudioPCM 回调透出，
 	// 下游按此播放/处理，不写死采样率。
+	audioCodec      string // 展示用编码名："G.711" / "AAC-LC"
 	audioSampleRate int
 	audioChannels   int
+
+	// audioDegradedHandler 在音频解码首次失败（进入降级）时回调一次
+	audioDegradedHandler func(reason string)
 
 	// SPS/PPS from the SDP. Many encoders put the parameter sets only in the
 	// SDP (sprop-parameter-sets) and never resend them in-band; downstream
@@ -90,6 +94,32 @@ func (s *Stream) OnAudioPCM(handler func(pcm []byte, sampleRate, channels int)) 
 // track. It is only meaningful after a successful Connect.
 func (s *Stream) HasAudio() bool {
 	return s.g711Dec != nil || s.aacDec != nil
+}
+
+// AudioTrackInfo 描述协商成功的音频轨道（展示用）。
+type AudioTrackInfo struct {
+	Codec      string // "G.711" / "AAC-LC"
+	SampleRate int
+	Channels   int
+}
+
+// AudioTrack 返回 SDP 协商出的音频轨道信息；无（受支持的）音频轨时返回
+// nil。仅在 Connect 成功后有意义。
+func (s *Stream) AudioTrack() *AudioTrackInfo {
+	if !s.HasAudio() {
+		return nil
+	}
+	return &AudioTrackInfo{
+		Codec:      s.audioCodec,
+		SampleRate: s.audioSampleRate,
+		Channels:   s.audioChannels,
+	}
+}
+
+// OnAudioDegraded 注册音频解码降级回调：比特流损坏等导致解码失败时触发
+// 一次（后续错误不再重复上报），reason 为人类可读原因。
+func (s *Stream) OnAudioDegraded(handler func(reason string)) {
+	s.audioDegradedHandler = handler
 }
 
 func (s *Stream) Connect() error {
@@ -234,6 +264,7 @@ func (s *Stream) Connect() error {
 		}
 		dec.Init()
 		s.g711Dec = dec
+		s.audioCodec = "G.711"
 		s.audioSampleRate = audioG711.SampleRate
 		s.audioChannels = audioG711.ChannelCount
 		needsSetup = true
@@ -258,6 +289,7 @@ func (s *Stream) Connect() error {
 			s.aacRTPDec = dec
 			s.aacDec = d
 			s.aacFreqIndex = freqIdx
+			s.audioCodec = "AAC-LC"
 			s.audioSampleRate = audioAAC.Config.SampleRate
 			s.audioChannels = audioAAC.Config.ChannelCount
 			log.Printf("[rtsp] AAC audio track enabled: %d Hz, %d ch", s.audioSampleRate, s.audioChannels)
@@ -347,6 +379,9 @@ func (s *Stream) Connect() error {
 				if !s.aacRTPOnce {
 					s.aacRTPOnce = true
 					log.Printf("[rtsp] AAC RTP decode error (subsequent ones suppressed): %v", err)
+					if s.audioDegradedHandler != nil {
+						s.audioDegradedHandler("音频传输解码失败: " + err.Error())
+					}
 				}
 				return
 			}
@@ -363,6 +398,9 @@ func (s *Stream) Connect() error {
 					if !s.aacErrOnce {
 						s.aacErrOnce = true
 						log.Printf("[rtsp] AAC decode error, decoder rebuilt (subsequent ones suppressed): %v", derr)
+						if s.audioDegradedHandler != nil {
+							s.audioDegradedHandler("音频解码失败: " + derr.Error())
+						}
 					}
 					if d := aacNewDecoder(); d != nil {
 						s.aacDec = d

@@ -122,6 +122,9 @@ type cameraManager struct {
 	// cameraAudioRate 是当前音频源的实际采样率（SDP 协商结果），
 	// 供 STT 的 WAV 封装使用；0 表示尚未收到音频，按 G.711 常规值兜底。
 	cameraAudioRate int
+	// audioState 是设备级音频轨状态（第一路画面），随 RTSP 协商与
+	// 解码降级/自愈更新，经 device_state 广播给前端。
+	audioState *server.AudioState
 
 	history []llm.Message
 }
@@ -356,6 +359,15 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 
 			cm.mu.Lock()
 			cm.cameraAudioRate = sampleRate
+			// 解码器重建后恢复出声：清除降级标记并广播一次
+			var recovered *server.AudioState
+			if cm.audioState != nil && cm.audioState.Degraded {
+				r := *cm.audioState
+				r.Degraded = false
+				r.Reason = ""
+				cm.audioState = &r
+				recovered = &r
+			}
 			if cm.cameraAudioBufMax > 0 {
 				cm.cameraAudioBuf = append(cm.cameraAudioBuf, pcm...)
 				if len(cm.cameraAudioBuf) > cm.cameraAudioBufMax {
@@ -364,6 +376,9 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 				}
 			}
 			cm.mu.Unlock()
+			if recovered != nil {
+				cm.handler.SetAudio(recovered)
+			}
 		})
 
 		cm.mu.Lock()
@@ -395,6 +410,33 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 					}
 					log.Println("Audio backchannel connected")
 				}()
+
+				// 设备级音频状态：协商结果即刻可见（无音频也明确告知），
+				// 解码降级时更新，后续 PCM 恢复到达则视为自愈
+				audioSt := &server.AudioState{Available: false}
+				if info := stream.AudioTrack(); info != nil {
+					audioSt = &server.AudioState{
+						Available:  true,
+						Codec:      info.Codec,
+						SampleRate: info.SampleRate,
+						Channels:   info.Channels,
+					}
+				}
+				cm.setAudioState(audioSt)
+				stream.OnAudioDegraded(func(reason string) {
+					cm.mu.Lock()
+					cur := cm.audioState
+					if cur == nil || !cur.Available || cur.Degraded {
+						cm.mu.Unlock()
+						return
+					}
+					r := *cur
+					r.Degraded = true
+					r.Reason = reason
+					cm.audioState = &r
+					cm.mu.Unlock()
+					cm.handler.SetAudio(&r)
+				})
 			}
 
 			stream.WatchDisconnect(func() {
@@ -403,6 +445,7 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 				}
 				log.Printf("[%s] RTSP stream disconnected — reconnecting", u.token)
 				cm.setUnitMode(u, false, u.snapshotURL != "")
+				cm.resetAudioState(u)
 				time.Sleep(2 * time.Second)
 				if cm.isCurrent(life) && cm.ownsUnit(u) && !cm.unitLoopBusy(u) {
 					cm.runUnit(u, life, address)
@@ -418,6 +461,7 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 		if attempt == maxAttempts {
 			log.Printf("[%s] RTSP stream giving up after %d attempts", u.token, maxAttempts)
 			cm.setUnitMode(u, false, u.snapshotURL != "")
+			cm.resetAudioState(u)
 			cm.hub.BroadcastError("RTSP 连接失败: " + err.Error())
 			return
 		}
@@ -435,6 +479,22 @@ func (cm *cameraManager) firstUnitIs(u *camUnit) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return len(cm.units) > 0 && cm.units[0] == u
+}
+
+// setAudioState 更新设备级音频状态并立即广播（device_state 携带）。
+func (cm *cameraManager) setAudioState(st *server.AudioState) {
+	cm.mu.Lock()
+	cm.audioState = st
+	cm.mu.Unlock()
+	cm.handler.SetAudio(st)
+}
+
+// resetAudioState 在承载设备级音频的画面断流/放弃时把音频状态置回未知。
+func (cm *cameraManager) resetAudioState(u *camUnit) {
+	if !cm.firstUnitIs(u) {
+		return
+	}
+	cm.setAudioState(nil)
 }
 
 // unitLoopBusy 判断该路的循环是否仍在运行（防重入检查用）。
@@ -741,6 +801,9 @@ func (cm *cameraManager) disconnect() {
 		u.snapLife.stop()
 	}
 	cm.units = nil
+	cm.cameraAudioBuf = nil
+	cm.cameraAudioRate = 0
+	cm.audioState = nil
 	if cm.backchannel != nil {
 		cm.backchannel.Close()
 		cm.backchannel = nil
@@ -749,6 +812,7 @@ func (cm *cameraManager) disconnect() {
 
 	life.stop()
 	cm.handler.SetCameras(nil)
+	cm.handler.SetAudio(nil)
 	cm.handler.SetDeviceState(false, false, false, "未连接")
 	cm.hub.BroadcastStatus(ws.StatusIdle)
 }

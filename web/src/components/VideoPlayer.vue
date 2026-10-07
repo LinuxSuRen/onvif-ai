@@ -2,6 +2,7 @@
 import { ref, computed, watch, onUnmounted, provide } from 'vue'
 import { useWebSocket, type WsMessage } from '../composables/useWebSocket'
 import CameraTile from './CameraTile.vue'
+import AudioMonitor from './AudioMonitor.vue'
 
 /**
  * 视频区域：支持单设备多摄像头（多 media profile）。
@@ -280,6 +281,9 @@ onUnmounted(() => {
           @click="switchCamera(cam.token)"
         >{{ camDisplayName(cam, i) }}</button>
       </div>
+
+      <!-- 右下角：设备级音频状态与播放控制（浮层，不占布局空间） -->
+      <AudioMonitor />
 
       <div v-if="!hasAnyStream" class="video-player__placeholder">
         <span class="video-player__placeholder-icon">📷</span>

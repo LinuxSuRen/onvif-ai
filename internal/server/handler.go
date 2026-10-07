@@ -26,6 +26,20 @@ type DeviceState struct {
 	PTZSupported bool   `json:"ptz_supported"`
 	// Cameras 列出单设备多摄像头（多 media profile）时每一路画面的状态
 	Cameras []CameraState `json:"cameras,omitempty"`
+	// Audio 是设备级音频轨状态（取第一路画面的音频）。
+	// nil 表示尚未协商（未连接/还在建流）；非 nil 且 Available=false
+	// 表示已确认无音频轨；Available=true 时携带编码与参数。
+	Audio *AudioState `json:"audio,omitempty"`
+}
+
+// AudioState 描述设备级音频轨的可见状态。
+type AudioState struct {
+	Available  bool   `json:"available"`
+	Codec      string `json:"codec,omitempty"`       // "G.711" / "AAC-LC"
+	SampleRate int    `json:"sample_rate,omitempty"` // Hz
+	Channels   int    `json:"channels,omitempty"`
+	Degraded   bool   `json:"degraded,omitempty"` // 解码失败已降级（视频不受影响）
+	Reason     string `json:"reason,omitempty"`
 }
 
 // CameraState 是一路画面（一个 media profile）的运行状态。
@@ -126,6 +140,17 @@ func (h *Handler) SetCameras(cams []CameraState) {
 	} else {
 		h.deviceState.PTZSupported = false
 	}
+	state := h.deviceState
+	h.mu.Unlock()
+	h.hub.BroadcastDeviceState(state)
+}
+
+// SetAudio 更新设备级音频轨状态并重新广播 device_state。
+// nil 表示回到“未协商/未知”。新客户端连接时由 handleWebSocket 下发完整
+// 状态种子，前端因此无需轮询。
+func (h *Handler) SetAudio(st *AudioState) {
+	h.mu.Lock()
+	h.deviceState.Audio = st
 	state := h.deviceState
 	h.mu.Unlock()
 	h.hub.BroadcastDeviceState(state)

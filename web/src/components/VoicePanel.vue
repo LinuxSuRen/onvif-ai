@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import { useMicCapture } from '../composables/useMicCapture'
-import { useAudioPlayer } from '../composables/useAudioPlayer'
 import { useWebSocket } from '../composables/useWebSocket'
 
 type TalkStatus = 'idle' | 'listening' | 'thinking' | 'speaking'
@@ -47,7 +46,8 @@ const { start: micStart, stop: micStop } = useMicCapture({
   },
 })
 
-const { playChunk } = useAudioPlayer()
+// 摄像头实时音频的播放已移至 AudioMonitor（视频画面右下角），
+// 本面板只负责语音对话；浏览器侧 TTS 播报用 SpeechSynthesis。
 
 const statusLabel = computed(() => {
   const labels: Record<TalkStatus, string> = {
@@ -120,7 +120,7 @@ function stopTalk() {
   micStop()
 }
 
-subscribe(['transcript', 'status', 'audio_out', 'error'], (msg) => {
+subscribe(['transcript', 'status', 'error'], (msg) => {
   {
     if (msg.type === 'transcript' && msg.text) {
       if (msg.text === '\n\n') {
@@ -138,15 +138,6 @@ subscribe(['transcript', 'status', 'audio_out', 'error'], (msg) => {
       if (state === 'idle' && !isPressed.value) {
         talkStatus.value = 'idle'
       }
-    }
-    if (msg.type === 'audio_out' && msg.data) {
-      // 摄像头实时音频：采样率/声道由后端按流内音频轨道动态携带，
-      // 无音频轨道时不会有 audio_out，不受影响
-      const meta = msg.payload as { rate?: unknown; channels?: unknown } | undefined
-      const rate = typeof meta?.rate === 'number' && meta.rate > 0 ? meta.rate : undefined
-      const channels =
-        typeof meta?.channels === 'number' && meta.channels > 0 ? meta.channels : undefined
-      playChunk(msg.data, rate, channels)
     }
     if (msg.type === 'error' && msg.text) {
       console.error('[VoicePanel] Error:', msg.text)
