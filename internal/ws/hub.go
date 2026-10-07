@@ -133,10 +133,18 @@ func (h *Hub) BroadcastVideoJPEG(cam string, jpeg []byte) {
 	h.BroadcastMessage(msg)
 }
 
-func (h *Hub) BroadcastAudioPCM(pcm []byte) {
+// BroadcastAudioPCM sends one linear PCM chunk from the camera's audio track.
+// sampleRate/channels describe the chunk and are forwarded in the payload so
+// the browser can set up playback dynamically (no hard-coded rate).
+func (h *Hub) BroadcastAudioPCM(pcm []byte, sampleRate, channels int) {
+	payload, _ := json.Marshal(AudioOutPayload{
+		Rate:     sampleRate,
+		Channels: channels,
+	})
 	msg := &Message{
-		Type: MsgTypeAudioOut,
-		Data: base64.StdEncoding.EncodeToString(pcm),
+		Type:    MsgTypeAudioOut,
+		Data:    base64.StdEncoding.EncodeToString(pcm),
+		Payload: payload,
 	}
 	h.BroadcastMessage(msg)
 }

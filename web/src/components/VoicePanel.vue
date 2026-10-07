@@ -140,8 +140,13 @@ subscribe(['transcript', 'status', 'audio_out', 'error'], (msg) => {
       }
     }
     if (msg.type === 'audio_out' && msg.data) {
-      console.log('[VoicePanel] Playing audio chunk, length:', msg.data.length)
-      playChunk(msg.data)
+      // 摄像头实时音频：采样率/声道由后端按流内音频轨道动态携带，
+      // 无音频轨道时不会有 audio_out，不受影响
+      const meta = msg.payload as { rate?: unknown; channels?: unknown } | undefined
+      const rate = typeof meta?.rate === 'number' && meta.rate > 0 ? meta.rate : undefined
+      const channels =
+        typeof meta?.channels === 'number' && meta.channels > 0 ? meta.channels : undefined
+      playChunk(msg.data, rate, channels)
     }
     if (msg.type === 'error' && msg.text) {
       console.error('[VoicePanel] Error:', msg.text)

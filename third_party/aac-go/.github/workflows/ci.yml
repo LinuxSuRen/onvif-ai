@@ -1,0 +1,57 @@
+# CI for aac-go. Three thin layers, each runnable locally with the same
+# command (see README "Testing"):
+#
+#   1. test:         go test ./...            — hermetic, no external tools;
+#                    includes decoding all committed real-world vectors
+#                    against their RMS fingerprints and the fuzz seed corpus
+#   2. oracle:       scripts/accept.sh        — verifies both directions
+#                    against a test oracle (independent reference decoder:
+#                    ffmpeg, invoked as a subprocess only; afconvert works
+#                    as a local macOS cross-check via ORACLE=afconvert)
+#   3. fuzz-smoke:   go test -fuzz            — time-boxed exploration;
+#                    a failure here is a real decoder bug, not a PR issue
+#
+# Committed vectors under testdata/realworld are immutable inputs curated
+# locally by scripts/genvectors.sh; CI never regenerates them.
+name: ci
+
+# Runs on pull requests only (no push trigger).
+on:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  oracle-ffmpeg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install ffmpeg (reference decoder)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: ORACLE=ffmpeg scripts/accept.sh all
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go test -fuzz=FuzzDecode -fuzztime 60s .
+      - name: Keep crash inputs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crashers
+          path: testdata/fuzz/

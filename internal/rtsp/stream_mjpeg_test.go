@@ -73,6 +73,9 @@ func TestStreamMJPEG(t *testing.T) {
 	if !cl.IsMJPEG() {
 		t.Fatal("expected stream to be detected as MJPEG")
 	}
+	if cl.HasAudio() {
+		t.Fatal("MJPEG-only stream must not be detected as carrying audio")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()

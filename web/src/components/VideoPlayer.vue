@@ -438,6 +438,13 @@ onUnmounted(() => {
   inset: 0;
 }
 
+/* tile 必须填满定位容器：否则其高度跟随视频流自身的宽高比
+   （height:100% 在 auto 高度的父级上失效），画面比例与视口不一致时
+   视频盒子会高于视口被裁切，object-fit: contain 无法生效 */
+.video-player__single :deep(.cam-tile) {
+  height: 100%;
+}
+
 /* 单画面模式下的摄像头切换器 */
 .video-player__cam-switch {
   position: absolute;
@@ -520,6 +527,10 @@ onUnmounted(() => {
   .video-player__viewport {
     /* 竖屏手机上 16:9 过扁，放宽到 3:2 保证可视面积 */
     aspect-ratio: 3 / 2;
+    /* 横屏窄高时 3:2 的画面自身就超过屏高，会把页面撑坏；
+       限高后画面按 object-fit: contain 居中-letterbox */
+    max-height: 70vh;
+    max-height: 70dvh;
   }
 
   .video-player__mode-switch,

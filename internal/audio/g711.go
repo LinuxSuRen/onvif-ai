@@ -105,36 +105,51 @@ func muLawToLinear(muLaw byte) int16 {
 	return sample
 }
 
-// linearToALaw converts a 16-bit linear PCM sample to G.711 A-law.
+// aLawSegEnd 是 A-law 各分段的右端点（13 位线性域）。
+var aLawSegEnd = [8]int16{0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF}
+
+// linearToALaw converts a 16-bit linear PCM sample to a standard G.711 A-law
+// byte (ITU-T G.711, equivalent to the classic Sun/ccitt reference codec).
+// The previous hand-rolled encoder produced non-standard bytes (wrong segment
+// math and inverted sign), which decoded to garbage on both the browser
+// playback path and on camera speakers receiving our backchannel audio.
 func linearToALaw(sample int16) byte {
-	const (
-		aLawClip = 32635
-	)
-
-	mask := sample >> 15
-	magnitude := int(sample)
-	if magnitude < 0 {
-		magnitude = -magnitude
-	}
-	if magnitude > aLawClip {
-		magnitude = aLawClip
+	pcm := sample >> 3 // 16-bit linear → 13-bit
+	var mask byte
+	if pcm >= 0 {
+		mask = 0xD5 // A-law 存反相符号位：正数置 1
+	} else {
+		mask = 0x55
+		pcm = -pcm - 1
 	}
 
-	var exponent byte
-	for expMask := 0x4000; (magnitude&expMask) == 0 && exponent < 15; expMask >>= 1 {
-		exponent++
+	seg := 8
+	for i, end := range aLawSegEnd {
+		if pcm <= end {
+			seg = i
+			break
+		}
+	}
+	if seg >= 8 {
+		return 0x7F ^ mask // 超出编码范围，返回最大值
 	}
 
-	mantissa := byte(magnitude>>((exponent)+3)) & 0x0F
-	alaw := byte(exponent)<<4 | mantissa
-	alaw ^= byte(mask & 0x80)
-	return alaw ^ 0x55
+	aval := byte(seg) << 4
+	if seg < 2 {
+		// 段 0/1 步长为 1（13 位域），两段共用 >>1 提取
+		aval |= byte(pcm>>1) & 0x0F
+	} else {
+		// 段 seg 覆盖 [2^(seg+4), 2^(seg+5))（13 位域），
+		// pcm>>seg ∈ [16, 32)，& 0xF 即减去段基得到段内步数
+		aval |= byte(pcm>>seg) & 0x0F
+	}
+	return aval ^ mask
 }
 
 // aLawToLinear converts a G.711 A-law byte to a 16-bit linear PCM sample.
 func aLawToLinear(aLaw byte) int16 {
 	aLaw ^= 0x55
-	t := int16(aLaw & 0x0F) << 4
+	t := int16(aLaw&0x0F) << 4
 	seg := (aLaw & 0x70) >> 4
 	switch seg {
 	case 0:

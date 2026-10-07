@@ -119,6 +119,9 @@ type cameraManager struct {
 
 	cameraAudioBuf    []byte
 	cameraAudioBufMax int
+	// cameraAudioRate 是当前音频源的实际采样率（SDP 协商结果），
+	// 供 STT 的 WAV 封装使用；0 表示尚未收到音频，按 G.711 常规值兜底。
+	cameraAudioRate int
 
 	history []llm.Message
 }
@@ -344,14 +347,15 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 		stream.OnVideoJPEG(func(jpeg []byte) {
 			cm.hub.BroadcastVideoJPEG(cam, jpeg)
 		})
-		stream.OnAudioPCM(func(pcm []byte) {
+		stream.OnAudioPCM(func(pcm []byte, sampleRate, channels int) {
 			// 音频按设备级处理：只取第一路，供浏览器播放与语音识别
 			if !cm.firstUnitIs(u) {
 				return
 			}
-			cm.hub.BroadcastAudioPCM(pcm)
+			cm.hub.BroadcastAudioPCM(pcm, sampleRate, channels)
 
 			cm.mu.Lock()
+			cm.cameraAudioRate = sampleRate
 			if cm.cameraAudioBufMax > 0 {
 				cm.cameraAudioBuf = append(cm.cameraAudioBuf, pcm...)
 				if len(cm.cameraAudioBuf) > cm.cameraAudioBufMax {
@@ -691,7 +695,12 @@ func (cm *cameraManager) processCameraAudio() {
 	buf := make([]byte, len(cm.cameraAudioBuf))
 	copy(buf, cm.cameraAudioBuf)
 	cm.cameraAudioBuf = nil
+	audioRate := cm.cameraAudioRate
 	cm.mu.Unlock()
+
+	if audioRate <= 0 {
+		audioRate = audio.G711SampleRate
+	}
 
 	if len(buf) == 0 {
 		log.Println("No camera audio buffered")
@@ -700,7 +709,7 @@ func (cm *cameraManager) processCameraAudio() {
 	}
 
 	ctx := context.Background()
-	wavData := audio.PCMToWAV(buf, audio.G711SampleRate)
+	wavData := audio.PCMToWAV(buf, audioRate)
 	text, err := cm.llmClient.Transcribe(ctx, wavData, "wav")
 	if err != nil {
 		log.Printf("Whisper STT failed: %v", err)

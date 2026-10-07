@@ -68,6 +68,37 @@ func TestAudioModeConstants(t *testing.T) {
 	}
 }
 
+func TestBroadcastAudioPCMPayload(t *testing.T) {
+	hub := NewHub()
+	hub.BroadcastAudioPCM([]byte{0x01, 0x02, 0x03, 0x04}, 8000, 1)
+
+	raw := <-hub.broadcast
+
+	var msg Message
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if msg.Type != MsgTypeAudioOut {
+		t.Fatalf("expected type audio_out, got %s", msg.Type)
+	}
+
+	var payload AudioOutPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload failed: %v", err)
+	}
+	if payload.Rate != 8000 || payload.Channels != 1 {
+		t.Fatalf("expected rate=8000 channels=1, got rate=%d channels=%d", payload.Rate, payload.Channels)
+	}
+
+	data, err := base64.StdEncoding.DecodeString(msg.Data)
+	if err != nil {
+		t.Fatalf("decode data failed: %v", err)
+	}
+	if len(data) != 4 {
+		t.Fatalf("expected 4 PCM bytes, got %d", len(data))
+	}
+}
+
 func TestStatusStates(t *testing.T) {
 	states := []StatusState{StatusIdle, StatusListening, StatusThinking, StatusSpeaking}
 	expected := []string{"idle", "listening", "thinking", "speaking"}

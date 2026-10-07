@@ -68,6 +68,16 @@ const (
 	AudioModeCameraMic  AudioMode = "camera_mic"
 )
 
+// AudioOutPayload describes the PCM chunk carried by an audio_out message.
+// The parameters come from the negotiated source track (e.g. SDP clock rate
+// of the camera's G.711 audio) so browsers can play the stream at the
+// correct rate without hard-coding anything. Every audio_out message
+// carries it, letting clients that join mid-stream self-configure.
+type AudioOutPayload struct {
+	Rate     int `json:"rate"`     // sample rate in Hz (e.g. 8000)
+	Channels int `json:"channels"` // channel count (G.711 sources are mono)
+}
+
 // NewMessage creates a new Message of the given type.
 func NewMessage(t MessageType) *Message {
 	return &Message{Type: t}

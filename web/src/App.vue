@@ -158,10 +158,22 @@ onUnmounted(() => {
 
 /* ---- 移动端适配：窄屏单栏堆叠，视频优先 ---- */
 @media (max-width: 960px) {
+  /* 外壳不再锁死一屏高度：内容（视频 + 侧栏）随页面自然滚动 */
+  .app-shell {
+    height: auto;
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
+
   .app-main {
     grid-template-columns: 1fr;
     padding: var(--space-3);
     gap: var(--space-3);
+  }
+
+  /* grid 项默认 min-width:auto 会被内容撑宽，显式允许收缩 */
+  .app-main__video {
+    min-width: 0;
   }
 
   .app-main__sidebar {
