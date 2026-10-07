@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	aac "github.com/arabian9ts/aac-go"
 	"github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
@@ -13,6 +14,8 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtplpcm"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpmjpeg"
+	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpmpeg4audio"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
 	"github.com/onvif-ai/internal/audio"
 	"github.com/pion/rtp"
 )
@@ -25,6 +28,15 @@ type Stream struct {
 	mjpegDec  *rtpmjpeg.Decoder
 	mjpegForm *format.MJPEG
 	g711Dec   *rtplpcm.Decoder
+
+	// AAC（RFC 3640 mpeg4-generic）音频轨的解码链：RTP 解包 → 裸 AU →
+	// ADTS 封装 → 纯 Go AAC-LC 解码 → 线性 PCM。解码失败仅降级音频
+	// （记一次日志并重建解码器自愈），不影响视频通路。
+	aacRTPDec    *rtpmpeg4audio.Decoder
+	aacDec       *aac.Decoder
+	aacFreqIndex int
+	aacErrOnce   bool
+	aacRTPOnce   bool
 
 	// 音频轨道的实际参数（来自 SDP 协商结果），随 OnAudioPCM 回调透出，
 	// 下游按此播放/处理，不写死采样率。
@@ -77,7 +89,7 @@ func (s *Stream) OnAudioPCM(handler func(pcm []byte, sampleRate, channels int)) 
 // HasAudio reports whether the connected source carries a (supported) audio
 // track. It is only meaningful after a successful Connect.
 func (s *Stream) HasAudio() bool {
-	return s.g711Dec != nil
+	return s.g711Dec != nil || s.aacDec != nil
 }
 
 func (s *Stream) Connect() error {
@@ -115,8 +127,47 @@ func (s *Stream) Connect() error {
 	var audioMedia *description.Media
 	var videoH264 *format.H264
 	var videoMJPEG *format.MJPEG
-	var audioFormat *format.G711
+	var audioG711 *format.G711
+	var audioAAC *format.MPEG4Audio
 	needsSetup := false
+
+	// 音频格式选择分两轮，保证优先级与 SDP 中 m=audio 的出现顺序无关：
+	// 第一轮只认 G.711（ONVIF 对讲事实标准、现有回传链路依赖）；
+	// 第二轮在没有任何 G.711 时才接受 AAC-LC（RFC 3640 mpeg4-generic）。
+	for _, media := range desc.Medias {
+		if media.IsBackChannel {
+			continue
+		}
+		for _, f := range media.Formats {
+			if g711, ok := f.(*format.G711); ok &&
+				media.Type == description.MediaTypeAudio && audioMedia == nil {
+				audioMedia = media
+				audioG711 = g711
+			}
+		}
+	}
+	if audioMedia == nil {
+		for _, media := range desc.Medias {
+			if media.IsBackChannel {
+				continue
+			}
+			for _, f := range media.Formats {
+				m4a, ok := f.(*format.MPEG4Audio)
+				if !ok || media.Type != description.MediaTypeAudio {
+					continue
+				}
+				// 仅接受 AAC-LC（解码器能力边界）；HE-AAC 等仍走不支持告警
+				if m4a.Config != nil && m4a.Config.Type == mpeg4audio.ObjectTypeAACLC {
+					audioMedia = media
+					audioAAC = m4a
+					break
+				}
+			}
+			if audioAAC != nil {
+				break
+			}
+		}
+	}
 
 	for _, media := range desc.Medias {
 		if media.IsBackChannel {
@@ -133,11 +184,6 @@ func (s *Stream) Connect() error {
 				if media.Type == description.MediaTypeVideo && videoMedia == nil {
 					videoMedia = media
 					videoMJPEG = ft
-				}
-			case *format.G711:
-				if media.Type == description.MediaTypeAudio && audioMedia == nil {
-					audioMedia = media
-					audioFormat = ft
 				}
 			}
 		}
@@ -175,24 +221,52 @@ func (s *Stream) Connect() error {
 		needsSetup = true
 	}
 
-	if audioMedia != nil && audioFormat != nil {
+	switch {
+	case audioG711 != nil:
 		if _, err := s.client.Setup(baseURL, audioMedia, 0, 0); err != nil {
 			s.Close()
 			return fmt.Errorf("setup audio: %w", err)
 		}
-		dec, err := audioFormat.CreateDecoder()
+		dec, err := audioG711.CreateDecoder()
 		if err != nil {
 			s.Close()
 			return fmt.Errorf("create G711 decoder: %w", err)
 		}
 		dec.Init()
 		s.g711Dec = dec
-		s.audioSampleRate = audioFormat.SampleRate
-		s.audioChannels = audioFormat.ChannelCount
+		s.audioSampleRate = audioG711.SampleRate
+		s.audioChannels = audioG711.ChannelCount
 		needsSetup = true
-	} else {
-		// 源带音频轨道但编码不受支持（如 AAC）时明确告警而非静默丢弃，
-		// 方便排查“画面正常但没有声音”的情况；无音频轨道则不打印。
+
+	case audioAAC != nil:
+		freqIdx := aacSamplingFreqIndex(audioAAC.Config.SampleRate)
+		if freqIdx < 0 {
+			log.Printf("[rtsp] AAC sample rate %d not in ADTS table, audio disabled", audioAAC.Config.SampleRate)
+		} else if d := aacNewDecoder(); d == nil {
+			log.Printf("[rtsp] AAC decoder init failed, audio disabled")
+		} else {
+			if _, err := s.client.Setup(baseURL, audioMedia, 0, 0); err != nil {
+				s.Close()
+				return fmt.Errorf("setup audio: %w", err)
+			}
+			dec, err := audioAAC.CreateDecoder()
+			if err != nil {
+				s.Close()
+				return fmt.Errorf("create AAC RTP decoder: %w", err)
+			}
+			dec.Init()
+			s.aacRTPDec = dec
+			s.aacDec = d
+			s.aacFreqIndex = freqIdx
+			s.audioSampleRate = audioAAC.Config.SampleRate
+			s.audioChannels = audioAAC.Config.ChannelCount
+			log.Printf("[rtsp] AAC audio track enabled: %d Hz, %d ch", s.audioSampleRate, s.audioChannels)
+			needsSetup = true
+		}
+
+	default:
+		// 源带音频轨道但编码不受支持（如 HE-AAC/MP3）时明确告警而非静默
+		// 丢弃，方便排查“画面正常但没有声音”的情况；无音频轨道则不打印。
 		for _, media := range desc.Medias {
 			if media.Type == description.MediaTypeAudio && !media.IsBackChannel && media != audioMedia {
 				kinds := make([]string, 0, len(media.Formats))
@@ -247,8 +321,8 @@ func (s *Stream) Connect() error {
 	}
 
 	if s.g711Dec != nil {
-		mulaw := audioFormat.MULaw
-		s.client.OnPacketRTP(audioMedia, audioFormat, func(pkt *rtp.Packet) {
+		mulaw := audioG711.MULaw
+		s.client.OnPacketRTP(audioMedia, audioG711, func(pkt *rtp.Packet) {
 			// rtplpcm 解码器只负责拆 RTP：payload 仍是 G.711 压缩字节，
 			// 必须按协商的压扩律展开成线性 PCM 才能交给播放/识别
 			g711, err := s.g711Dec.Decode(pkt)
@@ -261,6 +335,44 @@ func (s *Stream) Connect() error {
 			}
 			pcm := audio.DecodeG711ToPCM(g711, law)
 			s.audioPCMHandler(pcm, s.audioSampleRate, s.audioChannels)
+		})
+	}
+
+	if s.aacDec != nil {
+		s.client.OnPacketRTP(audioMedia, audioAAC, func(pkt *rtp.Packet) {
+			aus, err := s.aacRTPDec.Decode(pkt)
+			if err != nil {
+				// 分片/丢包等传输层错误：丢一拍等下一个完整 AU，
+				// 只记一次日志避免 40+ 帧/秒刷屏
+				if !s.aacRTPOnce {
+					s.aacRTPOnce = true
+					log.Printf("[rtsp] AAC RTP decode error (subsequent ones suppressed): %v", err)
+				}
+				return
+			}
+			for _, au := range aus {
+				frame, ferr := aacADTSFrame(au, s.aacFreqIndex, s.audioChannels)
+				if ferr != nil {
+					continue
+				}
+				pcm, derr := s.aacDec.Decode(frame)
+				if derr != nil {
+					// 比特流损坏会让流式解码器内部缓存持续出错：
+					// 记一次日志并重建解码器，尝试从后续帧自愈；
+					// 视频通路完全不受影响
+					if !s.aacErrOnce {
+						s.aacErrOnce = true
+						log.Printf("[rtsp] AAC decode error, decoder rebuilt (subsequent ones suppressed): %v", derr)
+					}
+					if d := aacNewDecoder(); d != nil {
+						s.aacDec = d
+					}
+					continue
+				}
+				if len(pcm) > 0 && s.audioPCMHandler != nil {
+					s.audioPCMHandler(pcm16ToBytes(pcm), s.audioSampleRate, s.audioChannels)
+				}
+			}
 		})
 	}
 

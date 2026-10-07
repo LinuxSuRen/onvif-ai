@@ -1,0 +1,11 @@
+testdata/accept/
+*.aac
+*.wav
+!wav/testdata/*.wav
+!testdata/realworld/*.aac
+!testdata/realworld/negative/*.aac
+!testdata/realworld/*.rms.json
+testdata/realworld/*.wav
+.claude/
+.codex/
+.memsearch/

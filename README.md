@@ -6,7 +6,7 @@
 
 - 🔍 **ONVIF 自动发现**（WS-Discovery 组播 + Hello 监听）
 - 📹 **实时视频流**（RTSP H.264 / 快照降级 1FPS）
-- 🔊 **实时音频**（RTSP 流内含 G.711 音频轨时自动在浏览器播放，采样率随源动态适配；无音频轨不受影响。AAC 等其他编码暂不支持，后端会记录告警）
+- 🔊 **实时音频**（RTSP 流内含 G.711 或 AAC-LC 音频轨时自动在浏览器播放，采样率随源动态适配；无音频轨不受影响。HE-AAC 等其他编码暂不支持，后端会记录告警）
 - 🎙️ **浏览器语音识别**（Chrome SpeechRecognition，无需 API Key）
 - 📷 **摄像头麦克风收音**（G.711 → Whisper STT）
 - 🤖 **大模型对话**（OpenAI 兼容接口，DeepSeek/SiliconFlow 等）
