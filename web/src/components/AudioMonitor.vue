@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
 import { useWebSocket } from '../composables/useWebSocket'
+import { usePaused } from '../composables/usePaused'
 import { useAudioPlayer } from '../composables/useAudioPlayer'
 
 /**
@@ -21,6 +22,7 @@ interface AudioInfo {
 }
 
 const { subscribe } = useWebSocket('/ws')
+const { paused } = usePaused()
 
 const audioInfo = ref<AudioInfo | null>(null)
 
@@ -89,7 +91,8 @@ subscribe(['device_state'], (msg) => {
 })
 
 subscribe(['audio_out'], (msg) => {
-  if (!msg.data || muted.value) return
+  // 暂停时同步静音：帧照收照弃（与视频画面冻结一致）
+  if (!msg.data || muted.value || paused.value) return
   const meta = msg.payload as { rate?: unknown; channels?: unknown } | undefined
   const rate = typeof meta?.rate === 'number' && meta.rate > 0 ? meta.rate : undefined
   const channels =
