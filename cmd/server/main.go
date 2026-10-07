@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -33,6 +34,9 @@ var (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Printf("onvif-ai %s (commit %s)", version, commit)
+
+	portFlag := flag.String("port", "", "HTTP 服务端口（优先级高于 PORT 环境变量）")
+	flag.Parse()
 
 	hub := ws.NewHub()
 	go hub.Run()
@@ -88,7 +92,10 @@ func main() {
 
 	router := h.RegisterRoutes()
 
-	port := getEnv("PORT", "8080")
+	port := *portFlag
+	if port == "" {
+		port = getEnv("PORT", "8080")
+	}
 	log.Printf("Server starting on :%s", port)
 	log.Println("Open http://localhost:5173 in browser, then click '搜索设备' to discover cameras")
 
@@ -122,6 +129,9 @@ type cameraManager struct {
 	// cameraAudioRate 是当前音频源的实际采样率（SDP 协商结果），
 	// 供 STT 的 WAV 封装使用；0 表示尚未收到音频，按 G.711 常规值兜底。
 	cameraAudioRate int
+	// audioState 是设备级音频轨状态（第一路画面），随 RTSP 协商与
+	// 解码降级/自愈更新，经 device_state 广播给前端。
+	audioState *server.AudioState
 
 	history []llm.Message
 }
