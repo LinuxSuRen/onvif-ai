@@ -88,6 +88,7 @@ html {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* 桌面端是“单屏控制台”布局：视口锁定不滚动，侧栏内部滚动。 */
 body {
   font-family: var(--font-body);
   font-size: 0.875rem;
@@ -101,6 +102,29 @@ body {
 #app {
   height: 100vh;
   width: 100vw;
+}
+
+/* ---- 移动端（≤960px，与 App.vue 的断点配对）：解除锁屏视口 ----
+   窄屏下单栏堆叠后内容远超一屏，body 的 overflow 会传播到视口，
+   若继续 overflow:hidden 页面无法滚动，视频下方的侧栏会被裁掉且
+   无法到达。改为允许纵向滚动、裁剪横溢（防止视频等元素把页面撑宽）。
+   100dvh 跟随移动端浏览器地址栏收放，无支持时回退 100vh。 */
+@media (max-width: 960px) {
+  body {
+    height: auto;
+    min-height: 100vh;
+    min-height: 100dvh;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
+  #app {
+    height: auto;
+    min-height: 100vh;
+    min-height: 100dvh;
+    /* 100vw 含滚动条宽度，改用 100% 避免横向溢出 */
+    width: 100%;
+  }
 }
 
 /* ---- Scrollbar ---- */
