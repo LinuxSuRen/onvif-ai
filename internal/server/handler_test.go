@@ -87,3 +87,43 @@ func TestCameraStateResolutionJSON(t *testing.T) {
 		t.Fatalf("resolution expected, got %s", b)
 	}
 }
+
+// TestDeviceStateTalkbackJSON 校验 device_state 中对讲通道字段的序列化契约：
+// nil 省略（未协商）、不可用时显式携带原因码、可用时仅 available。
+func TestDeviceStateTalkbackJSON(t *testing.T) {
+	// nil：字段省略
+	b, err := json.Marshal(DeviceState{Connected: true, Address: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"talkback"`) {
+		t.Fatalf("nil talkback must be omitted, got %s", b)
+	}
+
+	// 设备无回传轨：available=false + no_backchannel
+	b, err = json.Marshal(DeviceState{Talkback: &TalkbackState{Available: false, Reason: "no_backchannel"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"talkback":{"available":false,"reason":"no_backchannel"}`) {
+		t.Fatalf("explicit no-backchannel state expected, got %s", b)
+	}
+
+	// 可用：仅 available=true
+	b, err = json.Marshal(DeviceState{Talkback: &TalkbackState{Available: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"talkback":{"available":true}`) {
+		t.Fatalf("available state expected, got %s", b)
+	}
+
+	// 前端解析方向：JSON 还原回结构
+	var st DeviceState
+	if err := json.Unmarshal([]byte(`{"connected":true,"talkback":{"available":true}}`), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Talkback == nil || !st.Talkback.Available || st.Talkback.Reason != "" {
+		t.Fatalf("unexpected round-trip: %+v", st.Talkback)
+	}
+}

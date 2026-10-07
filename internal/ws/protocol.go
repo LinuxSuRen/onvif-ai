@@ -8,25 +8,29 @@ type MessageType string
 
 const (
 	// Client → Server
-	MsgTypeAudioStart   MessageType = "audio_start"   // Start mic capture
-	MsgTypeAudioData    MessageType = "audio_data"    // Audio chunk (base64 PCM)
-	MsgTypeAudioStop    MessageType = "audio_stop"    // Stop mic capture
-	MsgTypeSpeechText   MessageType = "speech_text"   // Recognized speech text from browser
-	MsgTypeCameraListen MessageType = "camera_listen" // Trigger STT on buffered camera audio
-	MsgTypeClearHistory MessageType = "clear_history" // Clear conversation history
-	MsgTypePTZMove      MessageType = "ptz_move"      // PTZ direction command
-	MsgTypeSwitchMode   MessageType = "switch_mode"   // Switch audio mode
-	MsgTypeClockSync    MessageType = "clock_sync"    // Clock offset probe (both directions)
+	MsgTypeAudioStart    MessageType = "audio_start"    // Start mic capture
+	MsgTypeAudioData     MessageType = "audio_data"     // Audio chunk (base64 PCM)
+	MsgTypeAudioStop     MessageType = "audio_stop"     // Stop mic capture
+	MsgTypeSpeechText    MessageType = "speech_text"    // Recognized speech text from browser
+	MsgTypeCameraListen  MessageType = "camera_listen"  // Trigger STT on buffered camera audio
+	MsgTypeClearHistory  MessageType = "clear_history"  // Clear conversation history
+	MsgTypePTZMove       MessageType = "ptz_move"       // PTZ direction command
+	MsgTypeSwitchMode    MessageType = "switch_mode"    // Switch audio mode
+	MsgTypeClockSync     MessageType = "clock_sync"     // Clock offset probe (both directions)
+	MsgTypeTalkbackStart MessageType = "talkback_start" // Start intercom session (browser mic → camera speaker)
+	MsgTypeAudioIn       MessageType = "audio_in"       // Intercom audio chunk (base64 PCM16 16k mono)
+	MsgTypeTalkbackStop  MessageType = "talkback_stop"  // Stop intercom session
 
 	// Server → Client
-	MsgTypeVideoNAL    MessageType = "video_nal"    // H.264 NAL unit (base64)
-	MsgTypeVideoJPEG   MessageType = "video_jpeg"   // JPEG snapshot frame (base64)
-	MsgTypeTranscript  MessageType = "transcript"   // LLM text response
-	MsgTypeStatus      MessageType = "status"       // System status
-	MsgTypeError       MessageType = "error"        // Error message
-	MsgTypeAudioOut    MessageType = "audio_out"    // PCM audio for browser playback (base64)
-	MsgTypeDeviceState MessageType = "device_state" // Device connection state update
-	MsgTypePTZCommand  MessageType = "ptz_command"  // PTZ command result (direction + text)
+	MsgTypeVideoNAL      MessageType = "video_nal"      // H.264 NAL unit (base64)
+	MsgTypeVideoJPEG     MessageType = "video_jpeg"     // JPEG snapshot frame (base64)
+	MsgTypeTranscript    MessageType = "transcript"     // LLM text response
+	MsgTypeStatus        MessageType = "status"         // System status
+	MsgTypeError         MessageType = "error"          // Error message
+	MsgTypeAudioOut      MessageType = "audio_out"      // PCM audio for browser playback (base64)
+	MsgTypeDeviceState   MessageType = "device_state"   // Device connection state update
+	MsgTypePTZCommand    MessageType = "ptz_command"    // PTZ command result (direction + text)
+	MsgTypeTalkbackState MessageType = "talkback_state" // Intercom session accept/reject result
 )
 
 // Message is the JSON envelope for all WebSocket messages.
@@ -76,6 +80,20 @@ const (
 type AudioOutPayload struct {
 	Rate     int `json:"rate"`     // sample rate in Hz (e.g. 8000)
 	Channels int `json:"channels"` // channel count (G.711 sources are mono)
+}
+
+// Talkback 会话拒绝码（稳定契约，前端据此映射文案）。
+const (
+	TalkbackRejectNoBackchannel = "no_backchannel"  // 设备无对讲回传通道
+	TalkbackRejectBusy          = "busy"            // TTS 语音播报占用中
+	TalkbackRejectInUse         = "talkback_in_use" // 其他对讲会话占用中
+)
+
+// TalkbackSessionPayload 是 talkback_state 消息的负载：服务器对
+// talkback_start 的受理结果，仅回复给发起的客户端。
+type TalkbackSessionPayload struct {
+	Active bool   `json:"active"`           // true=会话已受理
+	Reason string `json:"reason,omitempty"` // 拒绝码，见 TalkbackReject* 常量
 }
 
 // NewMessage creates a new Message of the given type.

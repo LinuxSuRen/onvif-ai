@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -125,6 +126,16 @@ type cameraManager struct {
 	// audioState 是设备级音频轨状态（第一路画面），随 RTSP 协商与
 	// 解码降级/自愈更新，经 device_state 广播给前端。
 	audioState *server.AudioState
+
+	// talkbackState 是对讲回传通道状态（随 backchannel 连接结果更新），
+	// talkbackReady 是其可用位的快照，受理对讲会话时无需再解引用。
+	talkbackState *server.TalkbackState
+	talkbackReady bool
+	// talkbackActive 表示浏览器对讲会话进行中；ttsAudioActive 表示
+	// TTS 回传占用 backchannel。二者互斥（先到先得），避免把两条
+	// 音频流交错写进同一条 RTSP 回传轨。
+	talkbackActive bool
+	ttsAudioActive bool
 
 	history []llm.Message
 }
@@ -423,17 +434,7 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 
 			// 首路画面顺带建立音频回传通道
 			if isFirst {
-				backchannel := rtsp.NewBackchannel(u.rtspURL)
-				cm.mu.Lock()
-				cm.backchannel = backchannel
-				cm.mu.Unlock()
-				go func() {
-					if err := backchannel.Connect(); err != nil {
-						log.Printf("Audio backchannel unavailable: %v", err)
-						return
-					}
-					log.Println("Audio backchannel connected")
-				}()
+				cm.startBackchannel(u)
 
 				// 设备级音频状态：协商结果即刻可见（无音频也明确告知），
 				// 解码降级时更新，后续 PCM 恢复到达则视为自愈
@@ -519,6 +520,126 @@ func (cm *cameraManager) resetAudioState(u *camUnit) {
 		return
 	}
 	cm.setAudioState(nil)
+}
+
+// startBackchannel 为首路画面建立对讲回传通道：先关掉旧连接（断流重连
+// 场景避免泄漏），状态置为“协商中”，连接结果异步更新并广播给前端。
+func (cm *cameraManager) startBackchannel(u *camUnit) {
+	cm.mu.Lock()
+	if cm.backchannel != nil {
+		cm.backchannel.Close()
+		cm.backchannel = nil
+	}
+	// 换新通道时旧对讲会话即刻失效，避免写到已关闭的连接上
+	cm.talkbackActive = false
+	bc := rtsp.NewBackchannel(u.rtspURL)
+	cm.backchannel = bc
+	cm.mu.Unlock()
+
+	cm.setTalkbackState(&server.TalkbackState{Available: false})
+
+	go func() {
+		if err := bc.Connect(); err != nil {
+			log.Printf("Audio backchannel unavailable: %v", err)
+			reason := "connect_failed"
+			if errors.Is(err, rtsp.ErrNoBackchannel) {
+				reason = "no_backchannel"
+			}
+			cm.setTalkbackState(&server.TalkbackState{Available: false, Reason: reason})
+			return
+		}
+		log.Println("Audio backchannel connected")
+		cm.setTalkbackState(&server.TalkbackState{Available: true})
+	}()
+}
+
+// setTalkbackState 更新对讲通道状态并广播（device_state 携带）。
+func (cm *cameraManager) setTalkbackState(st *server.TalkbackState) {
+	cm.mu.Lock()
+	cm.talkbackState = st
+	cm.talkbackReady = st != nil && st.Available
+	cm.mu.Unlock()
+	cm.handler.SetTalkback(st)
+}
+
+// beginTalkback 受理浏览器对讲会话（talkback_start）。
+// 先到先得：通道不可用、TTS 播报占用或已有对讲会话时拒绝并返回稳定拒绝码。
+func (cm *cameraManager) beginTalkback() (bool, string) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if !cm.talkbackReady {
+		return false, ws.TalkbackRejectNoBackchannel
+	}
+	if cm.ttsAudioActive {
+		return false, ws.TalkbackRejectBusy
+	}
+	if cm.talkbackActive {
+		return false, ws.TalkbackRejectInUse
+	}
+	cm.talkbackActive = true
+	return true, ""
+}
+
+// writeTalkbackPCM 把浏览器采集的 16kHz 单声道 PCM16 转发到回传通道。
+// 仅会话激活期间转发；写入失败（连接中断等）直接结束会话并告知前端。
+func (cm *cameraManager) writeTalkbackPCM(pcm []byte) {
+	cm.mu.Lock()
+	bc := cm.backchannel
+	active := cm.talkbackActive
+	cm.mu.Unlock()
+
+	if !active || bc == nil {
+		return // 会话已结束，丢弃迟到分片
+	}
+	if err := bc.WritePCM(pcm); err != nil {
+		log.Printf("Talkback write failed: %v", err)
+		cm.endTalkback()
+		cm.hub.BroadcastError("对讲已中断，请重新按住说话")
+	}
+}
+
+// endTalkback 结束对讲会话，释放回传通道给 TTS。
+func (cm *cameraManager) endTalkback() {
+	cm.mu.Lock()
+	cm.talkbackActive = false
+	cm.mu.Unlock()
+}
+
+// speakToBackchannel 用 TTS 语音经回传通道向摄像头端播报。
+// 对讲会话占用时跳过（先到先得，浏览器端仍会用 SpeechSynthesis 播放）；
+// 播报期间置 ttsAudioActive，新的对讲请求会收到“占用中”。
+func (cm *cameraManager) speakToBackchannel(ctx context.Context, ttsClient *tts.Client, text string) {
+	cm.mu.Lock()
+	if cm.talkbackActive {
+		cm.mu.Unlock()
+		log.Println("Talkback active, skip TTS backchannel audio")
+		return
+	}
+	cm.ttsAudioActive = true
+	bc := cm.backchannel
+	cm.mu.Unlock()
+	defer func() {
+		cm.mu.Lock()
+		cm.ttsAudioActive = false
+		cm.mu.Unlock()
+	}()
+
+	if bc == nil {
+		return
+	}
+
+	pcmAudio, err := ttsClient.Synthesize(ctx, text)
+	if err != nil {
+		log.Printf("TTS error (backchannel only, browser uses SpeechSynthesis): %v", err)
+		return
+	}
+	if len(pcmAudio) == 0 {
+		return
+	}
+	log.Printf("TTS audio for backchannel: %d bytes", len(pcmAudio))
+	if err := bc.WritePCM(pcmAudio); err != nil {
+		log.Printf("Backchannel write error: %v", err)
+	}
 }
 
 // unitLoopBusy 判断该路的循环是否仍在运行（防重入检查用）。
@@ -688,8 +809,7 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 		func(text string) {
 			hub.BroadcastStatus(ws.StatusThinking)
 			go func(prompt string) {
-				bc := cm.getBackchannel()
-				processLLMResponseWithHistory(cm.llmClient, cm.ttsClient, hub, bc, prompt, &cm.history)
+				processLLMResponseWithHistory(cm.llmClient, cm.ttsClient, hub, cm, prompt, &cm.history)
 				hub.BroadcastStatus(ws.StatusIdle)
 			}(text)
 		},
@@ -715,13 +835,13 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 			log.Printf("Audio mode: %s", mode)
 		},
 	)
+	// 对讲（浏览器麦克风 → 摄像头扬声器）会话回调
+	h.SetTalkbackCallbacks(
+		cm.beginTalkback,
+		cm.writeTalkbackPCM,
+		cm.endTalkback,
+	)
 	hub.BroadcastStatus(ws.StatusIdle)
-}
-
-func (cm *cameraManager) getBackchannel() *rtsp.Backchannel {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return cm.backchannel
 }
 
 func (cm *cameraManager) handlePTZMove(camera, direction string) {
@@ -812,8 +932,7 @@ func (cm *cameraManager) processCameraAudio() {
 		return
 	}
 
-	bc := cm.getBackchannel()
-	processLLMResponseWithHistory(cm.llmClient, cm.ttsClient, cm.hub, bc, text, &cm.history)
+	processLLMResponseWithHistory(cm.llmClient, cm.ttsClient, cm.hub, cm, text, &cm.history)
 }
 
 func (cm *cameraManager) disconnect() {
@@ -833,6 +952,9 @@ func (cm *cameraManager) disconnect() {
 	cm.cameraAudioBuf = nil
 	cm.cameraAudioRate = 0
 	cm.audioState = nil
+	cm.talkbackActive = false
+	cm.talkbackState = nil
+	cm.talkbackReady = false
 	if cm.backchannel != nil {
 		cm.backchannel.Close()
 		cm.backchannel = nil
@@ -842,15 +964,15 @@ func (cm *cameraManager) disconnect() {
 	life.stop()
 	cm.handler.SetCameras(nil)
 	cm.handler.SetAudio(nil)
+	cm.handler.SetTalkback(nil)
 	cm.handler.SetDeviceState(false, false, false, "未连接")
 	cm.hub.BroadcastStatus(ws.StatusIdle)
 }
 
-func processLLMResponse(llmClient *llm.Client, ttsClient *tts.Client, hub *ws.Hub, backchannel *rtsp.Backchannel, prompt string) {
-	processLLMResponseWithHistory(llmClient, ttsClient, hub, backchannel, prompt, nil)
-}
-
-func processLLMResponseWithHistory(llmClient *llm.Client, ttsClient *tts.Client, hub *ws.Hub, backchannel *rtsp.Backchannel, prompt string, history *[]llm.Message) {
+// processLLMResponseWithHistory 走完整语音问答链路：LLM 流式回复 →
+// 浏览器字幕 + SpeechSynthesis 播报 + 回传通道 TTS（对讲互斥，见
+// cameraManager.speakToBackchannel）。
+func processLLMResponseWithHistory(llmClient *llm.Client, ttsClient *tts.Client, hub *ws.Hub, cm *cameraManager, prompt string, history *[]llm.Message) {
 	ctx := context.Background()
 
 	log.Printf("LLM prompt: %s", prompt)
@@ -890,17 +1012,7 @@ func processLLMResponseWithHistory(llmClient *llm.Client, ttsClient *tts.Client,
 
 	hub.BroadcastStatus(ws.StatusSpeaking)
 
-	if backchannel != nil {
-		pcmAudio, err := ttsClient.Synthesize(ctx, fullText)
-		if err != nil {
-			log.Printf("TTS error (backchannel only, browser uses SpeechSynthesis): %v", err)
-		} else if len(pcmAudio) > 0 {
-			log.Printf("TTS audio for backchannel: %d bytes", len(pcmAudio))
-			if err := backchannel.WritePCM(pcmAudio); err != nil {
-				log.Printf("Backchannel write error: %v", err)
-			}
-		}
-	}
+	cm.speakToBackchannel(ctx, ttsClient, fullText)
 
 	hub.BroadcastTranscript("\n\n")
 }

@@ -30,6 +30,17 @@ type DeviceState struct {
 	// nil 表示尚未协商（未连接/还在建流）；非 nil 且 Available=false
 	// 表示已确认无音频轨；Available=true 时携带编码与参数。
 	Audio *AudioState `json:"audio,omitempty"`
+	// Talkback 是设备级对讲回传通道（RTSP backchannel）状态。
+	// nil 表示尚未协商；非 nil 且 Available=false 表示不可对讲，
+	// Reason 携带稳定原因码（no_backchannel / connect_failed），
+	// 前端据此禁用对讲按钮并展示原因。
+	Talkback *TalkbackState `json:"talkback,omitempty"`
+}
+
+// TalkbackState 描述对讲回传通道的可见状态（随 device_state 广播）。
+type TalkbackState struct {
+	Available bool   `json:"available"`
+	Reason    string `json:"reason,omitempty"` // no_backchannel / connect_failed
 }
 
 // AudioState 描述设备级音频轨的可见状态。
@@ -74,7 +85,15 @@ type Handler struct {
 	onPTZMove      func(camera, direction string)
 	onSwitchMode   func(string)
 	onLLMUpdate    func(baseURL, apiKey, model string)
-	mu             sync.RWMutex
+	// 对讲会话回调：onTalkbackStart 受理会话（返回是否接受与拒绝码），
+	// onTalkbackData 转发 PCM 音频，onTalkbackStop 结束会话
+	onTalkbackStart func() (bool, string)
+	onTalkbackData  func([]byte)
+	onTalkbackStop  func()
+	// talkbackOwner 持有当前对讲会话的客户端；其连接断开时自动释放，
+	// 避免会话悬挂导致 TTS 回传被永久阻塞
+	talkbackOwner *ws.Client
+	mu            sync.RWMutex
 }
 
 type LLMConfig struct {
@@ -118,6 +137,18 @@ func (h *Handler) SetOnConnect(fn func(address string)) {
 	h.onConnect = fn
 }
 
+// SetTalkbackCallbacks 注册对讲（浏览器麦克风 → 摄像头扬声器）会话回调。
+// onTalkbackStart 在收到 talkback_start 时调用，返回是否受理与稳定拒绝码；
+// onTalkbackData 在收到 audio_in 时调用（仅会话属主的消息会被转发）；
+// onTalkbackStop 在收到 talkback_stop 或属主连接断开时调用。
+func (h *Handler) SetTalkbackCallbacks(onStart func() (bool, string), onData func([]byte), onStop func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onTalkbackStart = onStart
+	h.onTalkbackData = onData
+	h.onTalkbackStop = onStop
+}
+
 // SetDeviceState updates the aggregate device fields; an empty addr keeps the
 // current address. Cameras 与 PTZ 汇总字段由 SetCameras 维护，此处保留。
 func (h *Handler) SetDeviceState(connected, streaming, snapshot bool, addr string) {
@@ -155,6 +186,17 @@ func (h *Handler) SetCameras(cams []CameraState) {
 func (h *Handler) SetAudio(st *AudioState) {
 	h.mu.Lock()
 	h.deviceState.Audio = st
+	state := h.deviceState
+	h.mu.Unlock()
+	h.hub.BroadcastDeviceState(state)
+}
+
+// SetTalkback 更新设备级对讲回传通道状态并重新广播 device_state。
+// nil 表示回到“未协商/未知”；新客户端连接时由 handleWebSocket 下发完整
+// 状态种子，前端对讲按钮据此切换可用态。
+func (h *Handler) SetTalkback(st *TalkbackState) {
+	h.mu.Lock()
+	h.deviceState.Talkback = st
 	state := h.deviceState
 	h.mu.Unlock()
 	h.hub.BroadcastDeviceState(state)
@@ -416,98 +458,179 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go client.WritePump()
-	go client.ReadPump(func(msg *ws.Message) {
-		switch msg.Type {
-		case ws.MsgTypeAudioStart:
+	go func() {
+		client.ReadPump(func(msg *ws.Message) {
+			h.handleClientMessage(client, msg)
+		})
+		// 连接断开：若该客户端持有对讲会话则立即释放，
+		// 否则会话悬挂导致 TTS 回传被“占用中”永久阻塞
+		if h.takeTalkbackOwner(client) {
 			h.mu.RLock()
-			if h.onAudioStart != nil {
-				h.onAudioStart()
-			}
+			fn := h.onTalkbackStop
 			h.mu.RUnlock()
-
-		case ws.MsgTypeAudioStop:
-			h.mu.RLock()
-			if h.onAudioStop != nil {
-				h.onAudioStop()
+			if fn != nil {
+				fn()
 			}
-			h.mu.RUnlock()
-
-		case ws.MsgTypeAudioData:
-			if msg.Data != "" {
-				audio, err := base64.StdEncoding.DecodeString(msg.Data)
-				if err == nil {
-					h.mu.RLock()
-					if h.onAudioData != nil {
-						h.onAudioData(audio)
-					}
-					h.mu.RUnlock()
-				}
-			}
-
-		case ws.MsgTypeSwitchMode:
-			var payload struct{ Mode string }
-			if msg.Payload != nil {
-				json.Unmarshal(msg.Payload, &payload)
-			}
-			h.mu.RLock()
-			if h.onSwitchMode != nil {
-				h.onSwitchMode(payload.Mode)
-			}
-			h.mu.RUnlock()
-
-		case ws.MsgTypeSpeechText:
-			if msg.Text != "" {
-				h.mu.RLock()
-				if h.onSpeechText != nil {
-					h.onSpeechText(msg.Text)
-				}
-				h.mu.RUnlock()
-			}
-
-		case ws.MsgTypeCameraListen:
-			h.mu.RLock()
-			if h.onCameraListen != nil {
-				h.onCameraListen()
-			}
-			h.mu.RUnlock()
-
-		case ws.MsgTypeClearHistory:
-			h.mu.RLock()
-			if h.onClearHistory != nil {
-				h.onClearHistory()
-			}
-			h.mu.RUnlock()
-
-		case ws.MsgTypePTZMove:
-			var payload struct {
-				Camera    string
-				Direction string
-			}
-			if msg.Payload != nil {
-				json.Unmarshal(msg.Payload, &payload)
-			}
-			if payload.Direction != "" {
-				h.mu.RLock()
-				if h.onPTZMove != nil {
-					h.onPTZMove(payload.Camera, payload.Direction)
-				}
-				h.mu.RUnlock()
-			}
-
-		case ws.MsgTypeClockSync:
-			// Echo the client timestamp together with the server clock so
-			// the browser can estimate the clock offset (RTT/2 correction)
-			// and compute end-to-end video latency from frame timestamps.
-			var payload struct {
-				T0 int64 `json:"t0"`
-			}
-			if msg.Payload != nil {
-				json.Unmarshal(msg.Payload, &payload)
-			}
-			client.Send(&ws.Message{
-				Type:    ws.MsgTypeClockSync,
-				Payload: mustMarshal(map[string]int64{"t0": payload.T0, "t1": time.Now().UnixMilli()}),
-			})
 		}
-	})
+	}()
+}
+
+// ownsTalkback 判断 client 是否当前对讲会话属主。
+func (h *Handler) ownsTalkback(client *ws.Client) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.talkbackOwner == client
+}
+
+// takeTalkbackOwner 若 client 是会话属主则清除属主并返回 true；
+// 非属主（无会话或他人会话）返回 false，不产生任何副作用。
+func (h *Handler) takeTalkbackOwner(client *ws.Client) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.talkbackOwner == client {
+		h.talkbackOwner = nil
+		return true
+	}
+	return false
+}
+
+func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
+	switch msg.Type {
+	case ws.MsgTypeAudioStart:
+		h.mu.RLock()
+		if h.onAudioStart != nil {
+			h.onAudioStart()
+		}
+		h.mu.RUnlock()
+
+	case ws.MsgTypeAudioStop:
+		h.mu.RLock()
+		if h.onAudioStop != nil {
+			h.onAudioStop()
+		}
+		h.mu.RUnlock()
+
+	case ws.MsgTypeAudioData:
+		if msg.Data != "" {
+			audio, err := base64.StdEncoding.DecodeString(msg.Data)
+			if err == nil {
+				h.mu.RLock()
+				if h.onAudioData != nil {
+					h.onAudioData(audio)
+				}
+				h.mu.RUnlock()
+			}
+		}
+
+	case ws.MsgTypeSwitchMode:
+		var payload struct{ Mode string }
+		if msg.Payload != nil {
+			json.Unmarshal(msg.Payload, &payload)
+		}
+		h.mu.RLock()
+		if h.onSwitchMode != nil {
+			h.onSwitchMode(payload.Mode)
+		}
+		h.mu.RUnlock()
+
+	case ws.MsgTypeSpeechText:
+		if msg.Text != "" {
+			h.mu.RLock()
+			if h.onSpeechText != nil {
+				h.onSpeechText(msg.Text)
+			}
+			h.mu.RUnlock()
+		}
+
+	case ws.MsgTypeCameraListen:
+		h.mu.RLock()
+		if h.onCameraListen != nil {
+			h.onCameraListen()
+		}
+		h.mu.RUnlock()
+
+	case ws.MsgTypeClearHistory:
+		h.mu.RLock()
+		if h.onClearHistory != nil {
+			h.onClearHistory()
+		}
+		h.mu.RUnlock()
+
+	case ws.MsgTypePTZMove:
+		var payload struct {
+			Camera    string
+			Direction string
+		}
+		if msg.Payload != nil {
+			json.Unmarshal(msg.Payload, &payload)
+		}
+		if payload.Direction != "" {
+			h.mu.RLock()
+			if h.onPTZMove != nil {
+				h.onPTZMove(payload.Camera, payload.Direction)
+			}
+			h.mu.RUnlock()
+		}
+
+	case ws.MsgTypeTalkbackStart:
+		h.mu.RLock()
+		fn := h.onTalkbackStart
+		h.mu.RUnlock()
+		if fn == nil {
+			return
+		}
+		ok, reason := fn()
+		if ok {
+			h.mu.Lock()
+			h.talkbackOwner = client
+			h.mu.Unlock()
+		}
+		// 受理结果只回给发起方，不打扰其他客户端
+		client.Send(&ws.Message{
+			Type:    ws.MsgTypeTalkbackState,
+			Payload: mustMarshal(ws.TalkbackSessionPayload{Active: ok, Reason: reason}),
+		})
+
+	case ws.MsgTypeAudioIn:
+		// 只转发会话属主的音频，避免旁路客户端混入他人会话
+		if !h.ownsTalkback(client) {
+			return
+		}
+		if msg.Data != "" {
+			pcm, err := base64.StdEncoding.DecodeString(msg.Data)
+			if err == nil && len(pcm) > 0 {
+				h.mu.RLock()
+				fn := h.onTalkbackData
+				h.mu.RUnlock()
+				if fn != nil {
+					fn(pcm)
+				}
+			}
+		}
+
+	case ws.MsgTypeTalkbackStop:
+		if h.takeTalkbackOwner(client) {
+			h.mu.RLock()
+			fn := h.onTalkbackStop
+			h.mu.RUnlock()
+			if fn != nil {
+				fn()
+			}
+		}
+
+	case ws.MsgTypeClockSync:
+		// Echo the client timestamp together with the server clock so
+		// the browser can estimate the clock offset (RTT/2 correction)
+		// and compute end-to-end video latency from frame timestamps.
+		var payload struct {
+			T0 int64 `json:"t0"`
+		}
+		if msg.Payload != nil {
+			json.Unmarshal(msg.Payload, &payload)
+		}
+		client.Send(&ws.Message{
+			Type:    ws.MsgTypeClockSync,
+			Payload: mustMarshal(map[string]int64{"t0": payload.T0, "t1": time.Now().UnixMilli()}),
+		})
+	}
 }
