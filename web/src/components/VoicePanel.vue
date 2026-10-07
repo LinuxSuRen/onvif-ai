@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed } from 'vue'
 import { useMicCapture } from '../composables/useMicCapture'
-import { useTalkbackCapture } from '../composables/useTalkback'
 import { useWebSocket } from '../composables/useWebSocket'
 
+/**
+ * AI 语音助手（可选功能，默认收起）：语音问答走 STT → LLM → TTS 链路。
+ * 定位收敛后主界面只保留设备搜索、画面与对讲，本面板折叠为次要入口。
+ */
 type TalkStatus = 'idle' | 'listening' | 'thinking' | 'speaking'
 type AudioMode = 'browser_mic' | 'camera_mic'
 
@@ -16,115 +19,10 @@ let fullResponseText = ''
 const availableVoices = ref<SpeechSynthesisVoice[]>([])
 const selectedVoice = ref('')
 
+// AI 为次要功能：默认收起，点击标题栏展开
+const expanded = ref(false)
+
 const { isConnected, send, subscribe } = useWebSocket('/ws')
-
-// ---- 对讲（浏览器麦克风 → 摄像头扬声器）----
-interface TalkbackInfo {
-  available: boolean
-  reason?: string
-}
-
-// 服务器返回的稳定原因码 → 用户可读文案；未知码走兜底
-const TALKBACK_REASONS: Record<string, string> = {
-  no_backchannel: '该设备不支持对讲',
-  busy: '语音播报占用中，请稍后再试',
-  talkback_in_use: '对讲通道占用中，请稍后再试',
-}
-
-function talkbackReasonText(reason?: string): string {
-  if (!reason) return '对讲不可用'
-  return TALKBACK_REASONS[reason] || `对讲不可用（${reason}）`
-}
-
-const talkbackInfo = ref<TalkbackInfo | null>(null)
-const talkbackPressed = ref(false)
-const talkbackActive = ref(false)
-const intercomError = ref('')
-
-const talkback = useTalkbackCapture({
-  onChunk: (base64Pcm) => send({ type: 'audio_in', data: base64Pcm }),
-})
-
-const intercomEnabled = computed(
-  () =>
-    isConnected.value &&
-    talkbackInfo.value?.available === true &&
-    !talkbackPressed.value &&
-    talkStatus.value !== 'speaking',
-)
-
-const intercomLabel = computed(() => {
-  if (talkbackPressed.value) return '对讲中 · 松开结束'
-  if (!isConnected.value) return '服务未连接'
-  const info = talkbackInfo.value
-  if (!info) return '对讲未就绪'
-  if (!info.available) {
-    if (info.reason === 'no_backchannel') return '设备不支持对讲'
-    if (info.reason === 'connect_failed') return '对讲通道连接失败'
-    return '对讲连接中'
-  }
-  if (talkStatus.value === 'speaking') return '播报占用中'
-  return '按住对讲'
-})
-
-async function startIntercom() {
-  if (!intercomEnabled.value) return
-  talkbackPressed.value = true
-  intercomError.value = ''
-  send({ type: 'talkback_start' })
-  // getUserMedia 在按钮按下（用户手势）调用栈内触发，满足权限交互要求
-  const err = await talkback.start()
-  if (err) {
-    talkbackPressed.value = false
-    send({ type: 'talkback_stop' }) // 麦克风失败同样要释放服务端会话
-    intercomError.value = err
-  }
-}
-
-function stopIntercom() {
-  if (!talkbackPressed.value) return
-  talkbackPressed.value = false
-  talkbackActive.value = false
-  talkback.stop() // 先停本地采集，再释放服务端会话
-  send({ type: 'talkback_stop' })
-}
-
-subscribe(['device_state'], (msg) => {
-  const tb = (msg.payload as { talkback?: unknown } | null | undefined)?.talkback as
-    | TalkbackInfo
-    | undefined
-  if (tb && typeof tb === 'object' && typeof tb.available === 'boolean') {
-    talkbackInfo.value = { ...tb }
-  } else {
-    talkbackInfo.value = null
-  }
-})
-
-subscribe(['talkback_state'], (msg) => {
-  const p = msg.payload as { active?: boolean; reason?: string } | undefined
-  if (p?.active) {
-    talkbackActive.value = true
-    return
-  }
-  talkbackActive.value = false
-  // 会话被拒（占用/不可用）：立即停止本地采集并提示
-  if (talkbackPressed.value) {
-    talkbackPressed.value = false
-    talkback.abort()
-    intercomError.value = talkbackReasonText(p?.reason)
-  }
-})
-
-watch(isConnected, (connected) => {
-  console.log('[VoicePanel] WebSocket connected:', connected)
-  if (!connected && talkbackPressed.value) {
-    // 断连后服务端会按属主断开自动释放会话，这里只需收尾本地采集
-    talkbackPressed.value = false
-    talkbackActive.value = false
-    talkback.abort()
-    intercomError.value = '连接已断开，对讲结束'
-  }
-})
 
 const handleSpeechResult = (text: string, isFinal: boolean) => {
   console.log('[VoicePanel] Speech result:', { text, isFinal })
@@ -255,14 +153,23 @@ subscribe(['transcript', 'status', 'error'], (msg) => {
 
 <template>
   <div class="voice-panel">
-    <div class="voice-panel__header">
-      <span class="voice-panel__title">语音对话</span>
-      <span class="voice-panel__connection" :class="{ 'voice-panel__connection--online': isConnected }">
-        {{ isConnected ? '已连接' : '未连接' }}
+    <!-- 标题栏即折叠开关：AI 为可选功能，默认收起不占主界面焦点 -->
+    <button
+      class="voice-panel__header"
+      type="button"
+      :aria-expanded="expanded"
+      @click="expanded = !expanded"
+    >
+      <span class="voice-panel__title">AI 语音助手</span>
+      <span class="voice-panel__header-meta">
+        <span class="voice-panel__connection" :class="{ 'voice-panel__connection--online': isConnected }">
+          {{ isConnected ? '已连接' : '未连接' }}
+        </span>
+        <span class="voice-panel__chevron">{{ expanded ? '▲' : '▼' }}</span>
       </span>
-    </div>
+    </button>
 
-    <div class="voice-panel__body">
+    <div v-if="expanded" class="voice-panel__body">
       <div class="voice-panel__mode-toggle">
         <button
           class="voice-panel__mode-option"
@@ -291,22 +198,6 @@ subscribe(['transcript', 'status', 'error'], (msg) => {
       >
         <span class="voice-panel__talk-label">{{ statusLabel }}</span>
       </button>
-
-      <!-- 对讲：按住说话，音频实时推到摄像头端扬声器 -->
-      <button
-        class="voice-panel__intercom-btn"
-        :class="{ 'voice-panel__intercom-btn--active': talkbackPressed }"
-        :disabled="!intercomEnabled"
-        @mousedown.prevent="startIntercom"
-        @mouseup.prevent="stopIntercom"
-        @mouseleave.prevent="stopIntercom"
-        @touchstart.prevent="startIntercom"
-        @touchend.prevent="stopIntercom"
-      >
-        {{ intercomLabel }}
-      </button>
-
-      <div v-if="intercomError" class="voice-panel__error">{{ intercomError }}</div>
 
       <div v-if="errorMsg" class="voice-panel__error">{{ errorMsg }}</div>
 
@@ -342,6 +233,22 @@ subscribe(['transcript', 'status', 'error'], (msg) => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  width: 100%;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.voice-panel__header-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.voice-panel__chevron {
+  font-size: 0.6rem;
+  color: #5a6470;
 }
 
 .voice-panel__title {
@@ -446,41 +353,6 @@ subscribe(['transcript', 'status', 'error'], (msg) => {
   text-align: center;
   padding: 8px;
   line-height: 1.3;
-}
-
-/* ---- 对讲按钮：全宽条形，与语音问答按钮区分 ---- */
-.voice-panel__intercom-btn {
-  width: 100%;
-  min-height: 44px; /* 触屏可按目标 */
-  padding: 8px 12px;
-  border-radius: 6px;
-  border: 1px solid #1e2530;
-  background: #0a0e14;
-  color: #7a8490;
-  font-size: 0.75rem;
-  letter-spacing: 0.03em;
-  cursor: pointer;
-  transition: all 0.2s;
-  user-select: none;
-  -webkit-user-select: none;
-  touch-action: none; /* 按住对讲时避免触发页面滚动 */
-}
-
-.voice-panel__intercom-btn:not(:disabled):hover {
-  border-color: #0091ff;
-  color: #9fb3c8;
-}
-
-.voice-panel__intercom-btn:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
-.voice-panel__intercom-btn--active {
-  border-color: #00e5a0;
-  color: #00e5a0;
-  background: rgba(0, 229, 160, 0.08);
-  box-shadow: 0 0 20px rgba(0, 229, 160, 0.2);
 }
 
 .voice-panel__talk-btn--listening .voice-panel__talk-label {

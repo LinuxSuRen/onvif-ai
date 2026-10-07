@@ -76,11 +76,11 @@ test.describe('对讲（talkback）', () => {
   test('按钮随回传通道状态切换可用态与原因文案', async ({ page }) => {
     await openApp(page)
 
-    const btn = page.locator('.voice-panel__intercom-btn')
+    const btn = page.locator('.intercom-panel__btn')
     await expect(btn).toBeVisible({ timeout: 10000 })
     // 尚未收到任何 device_state：未就绪且禁用
     await expect(btn).toBeDisabled()
-    await expect(btn).toHaveText('对讲未就绪')
+    await expect(btn).toHaveText('连接摄像头后可对讲')
 
     // 设备无回传轨：明确提示不支持并禁用
     await dispatchTalkbackAvailable(page, false, 'no_backchannel')
@@ -102,7 +102,7 @@ test.describe('对讲（talkback）', () => {
     const { browser, page } = await openAppWithFakeMic(baseURL)
     await dispatchTalkbackAvailable(page, true)
 
-    const btn = page.locator('.voice-panel__intercom-btn')
+    const btn = page.locator('.intercom-panel__btn')
     await expect(btn).toBeEnabled()
 
     await btn.dispatchEvent('mousedown')
@@ -115,7 +115,7 @@ test.describe('对讲（talkback）', () => {
     )
 
     await expect(btn).toHaveText('按住对讲')
-    await expect(page.locator('.voice-panel__error').first()).toContainText('语音播报占用中')
+    await expect(page.locator('.intercom-panel__error').first()).toContainText('语音播报占用中')
 
     // 采集已被中止：不应出现任何音频分片
     await page.waitForTimeout(800)
@@ -131,7 +131,7 @@ test.describe('对讲（talkback）', () => {
     const { browser, page } = await openAppWithFakeMic(baseURL)
     await dispatchTalkbackAvailable(page, true)
 
-    const btn = page.locator('.voice-panel__intercom-btn')
+    const btn = page.locator('.intercom-panel__btn')
     await expect(btn).toBeEnabled()
 
     await btn.dispatchEvent('mousedown')
