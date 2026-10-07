@@ -2,6 +2,7 @@ package rtsp
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtplpcm"
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtpmjpeg"
+	"github.com/onvif-ai/internal/audio"
 	"github.com/pion/rtp"
 )
 
@@ -24,6 +26,11 @@ type Stream struct {
 	mjpegForm *format.MJPEG
 	g711Dec   *rtplpcm.Decoder
 
+	// 音频轨道的实际参数（来自 SDP 协商结果），随 OnAudioPCM 回调透出，
+	// 下游按此播放/处理，不写死采样率。
+	audioSampleRate int
+	audioChannels   int
+
 	// SPS/PPS from the SDP. Many encoders put the parameter sets only in the
 	// SDP (sprop-parameter-sets) and never resend them in-band; downstream
 	// muxers (e.g. jmuxer in the browser) cannot initialize without them,
@@ -35,7 +42,7 @@ type Stream struct {
 
 	videoNALHandler  func([]byte)
 	videoJPEGHandler func([]byte)
-	audioPCMHandler  func([]byte)
+	audioPCMHandler  func(pcm []byte, sampleRate, channels int)
 }
 
 func NewStream(rtspURL string) *Stream {
@@ -58,8 +65,19 @@ func (s *Stream) IsMJPEG() bool {
 	return s.mjpegDec != nil
 }
 
-func (s *Stream) OnAudioPCM(handler func([]byte)) {
+// OnAudioPCM registers the handler for linear PCM decoded from the stream's
+// audio track. sampleRate/channels report the negotiated parameters of the
+// source so the receiver can play the chunk correctly. The handler is only
+// invoked when the source actually carries a supported audio track; streams
+// without audio are completely unaffected.
+func (s *Stream) OnAudioPCM(handler func(pcm []byte, sampleRate, channels int)) {
 	s.audioPCMHandler = handler
+}
+
+// HasAudio reports whether the connected source carries a (supported) audio
+// track. It is only meaningful after a successful Connect.
+func (s *Stream) HasAudio() bool {
+	return s.g711Dec != nil
 }
 
 func (s *Stream) Connect() error {
@@ -169,7 +187,21 @@ func (s *Stream) Connect() error {
 		}
 		dec.Init()
 		s.g711Dec = dec
+		s.audioSampleRate = audioFormat.SampleRate
+		s.audioChannels = audioFormat.ChannelCount
 		needsSetup = true
+	} else {
+		// 源带音频轨道但编码不受支持（如 AAC）时明确告警而非静默丢弃，
+		// 方便排查“画面正常但没有声音”的情况；无音频轨道则不打印。
+		for _, media := range desc.Medias {
+			if media.Type == description.MediaTypeAudio && !media.IsBackChannel && media != audioMedia {
+				kinds := make([]string, 0, len(media.Formats))
+				for _, f := range media.Formats {
+					kinds = append(kinds, fmt.Sprintf("%T", f))
+				}
+				log.Printf("[rtsp] audio track present but codec unsupported, ignoring: %s", strings.Join(kinds, ", "))
+			}
+		}
 	}
 
 	if needsSetup {
@@ -215,12 +247,20 @@ func (s *Stream) Connect() error {
 	}
 
 	if s.g711Dec != nil {
+		mulaw := audioFormat.MULaw
 		s.client.OnPacketRTP(audioMedia, audioFormat, func(pkt *rtp.Packet) {
-			pcm, err := s.g711Dec.Decode(pkt)
+			// rtplpcm 解码器只负责拆 RTP：payload 仍是 G.711 压缩字节，
+			// 必须按协商的压扩律展开成线性 PCM 才能交给播放/识别
+			g711, err := s.g711Dec.Decode(pkt)
 			if err != nil || s.audioPCMHandler == nil {
 				return
 			}
-			s.audioPCMHandler(pcm)
+			law := audio.G711ALaw
+			if mulaw {
+				law = audio.G711MuLaw
+			}
+			pcm := audio.DecodeG711ToPCM(g711, law)
+			s.audioPCMHandler(pcm, s.audioSampleRate, s.audioChannels)
 		})
 	}
 
