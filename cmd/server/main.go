@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -97,11 +99,17 @@ func main() {
 	if port == "" {
 		port = getEnv("PORT", "8080")
 	}
-	log.Printf("Server starting on :%s", port)
-	log.Printf("Open http://localhost:%s (前端已内嵌，无需单独启动)", port)
+	listener, err := listenWithDrift(port)
+	if err != nil {
+		log.Fatalf("Server failed: %v", err)
+	}
+	defer listener.Close()
+
+	log.Printf("Server starting on %s", listener.Addr())
+	log.Printf("Open http://localhost%s (前端已内嵌，无需单独启动)", listener.Addr())
 
 	go func() {
-		if err := http.ListenAndServe(":"+port, router); err != nil {
+		if err := http.Serve(listener, router); err != nil {
 			log.Fatalf("Server failed: %v", err)
 		}
 	}()
@@ -1029,6 +1037,30 @@ func getEnv(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+// listenWithDrift 绑定 HTTP 端口：端口被占用（EADDRINUSE）时默认向后漂移，
+// 最多尝试 20 个连续端口；其他错误（如权限不足）直接失败，不做漂移。
+func listenWithDrift(port string) (net.Listener, error) {
+	start, err := strconv.Atoi(port)
+	if err != nil {
+		return nil, fmt.Errorf("invalid port %q: %w", port, err)
+	}
+
+	const maxDrift = 20
+	for i := 0; i < maxDrift; i++ {
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", start+i))
+		if err == nil {
+			if i > 0 {
+				log.Printf("Port %d in use, drifted to %d", start, start+i)
+			}
+			return l, nil
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("ports %d-%d all in use", start, start+maxDrift-1)
 }
 
 var _ = audio.PCM16kSampleRate
