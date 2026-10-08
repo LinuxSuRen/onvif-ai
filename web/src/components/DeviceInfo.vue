@@ -34,11 +34,41 @@ const showLLMSettings = ref(false)
 const expandedAddress = ref<string | null>(null)
 const deviceInfoMap = reactive<Record<string, { loading: boolean; data?: DeviceInfo; error?: string }>>({})
 
+/* 设备凭证:按地址区分(localStorage 持久化),连接与设备信息查询共用;
+ * 无认证设备留空即可,不影响原有流程 */
+interface DeviceCred { username: string; password: string }
+const CREDS_KEY = 'onvif-ai-creds'
+const deviceCreds = reactive<Record<string, DeviceCred>>({})
+
+function loadAllCreds(): Record<string, DeviceCred> {
+  try { return JSON.parse(localStorage.getItem(CREDS_KEY) || '{}') } catch { return {} }
+}
+
+function credOf(addr: string): DeviceCred {
+  if (!deviceCreds[addr]) {
+    const saved = loadAllCreds()[addr]
+    deviceCreds[addr] = { username: saved?.username || '', password: saved?.password || '' }
+  }
+  return deviceCreds[addr]
+}
+
+function persistCred(addr: string) {
+  const all = loadAllCreds()
+  all[addr] = deviceCreds[addr]
+  localStorage.setItem(CREDS_KEY, JSON.stringify(all))
+}
+
 async function fetchDeviceInfo(addr: string) {
   if (deviceInfoMap[addr]?.data || deviceInfoMap[addr]?.loading) return
   deviceInfoMap[addr] = { loading: true }
   try {
-    const resp = await fetch(`/api/camera/device-info?address=${encodeURIComponent(addr)}`)
+    const cred = deviceCreds[addr]
+    const q = new URLSearchParams({ address: addr })
+    if (cred?.username) {
+      q.set('username', cred.username)
+      q.set('password', cred.password)
+    }
+    const resp = await fetch(`/api/camera/device-info?${q}`)
     if (resp.ok) {
       deviceInfoMap[addr] = { loading: false, data: await resp.json() }
     } else {
@@ -140,11 +170,13 @@ async function discoverDevices() {
 
 async function connectDevice(addr: string) {
   connecting.value = true
+  const cred = credOf(addr)
+  persistCred(addr)
   try {
     await fetch('/api/camera/connect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ address: addr }),
+      body: JSON.stringify({ address: addr, username: cred.username, password: cred.password }),
     })
   } catch {
     /* error handled by WebSocket status update */
@@ -301,6 +333,15 @@ async function saveLLMConfig() {
             <span class="device-info__detail-value" style="color: #ff3d57;">{{ deviceInfoMap[d.address]!.error }}</span>
           </div>
           <div class="device-info__detail-section">
+            <span class="device-info__detail-label">认证</span>
+            <div class="device-info__cred-fields">
+              <input v-model="credOf(d.address).username" placeholder="用户名(无认证留空)"
+                @change="persistCred(d.address)" @click.stop />
+              <input v-model="credOf(d.address).password" type="password" placeholder="密码"
+                @change="persistCred(d.address)" @click.stop />
+            </div>
+          </div>
+          <div class="device-info__detail-section">
             <span class="device-info__detail-label">地址</span>
             <span class="device-info__detail-value device-info__detail-value--mono">{{ d.address }}</span>
           </div>
@@ -415,6 +456,14 @@ async function saveLLMConfig() {
 
 .device-info__scope-tag { font-size: 0.58rem; padding: 1px 6px; background: rgba(0,145,255,.12); color: #0091ff; border-radius: 3px; white-space: nowrap; }
 .device-info__scope-tag--type { background: rgba(122,132,144,.12); color: #7a8490; }
+
+.device-info__cred-fields { display: flex; gap: 6px; flex: 1; min-width: 0; }
+.device-info__cred-fields input {
+  flex: 1; min-width: 0; padding: 4px 8px;
+  background: #131820; border: 1px solid #1e2530; border-radius: 4px;
+  color: #c8d0d8; font-size: 0.7rem;
+}
+.device-info__cred-fields input:focus { outline: none; border-color: #0091ff; }
 
 .device-info__connect-btn { font-size: 0.7rem; padding: 3px 10px; background: rgba(0,229,160,.12); border: 1px solid rgba(0,229,160,.25); border-radius: 4px; color: #00e5a0; cursor: pointer; white-space: nowrap; }
 .device-info__connect-btn:hover:not(:disabled) { background: rgba(0,229,160,.2); }

@@ -77,7 +77,7 @@ type Handler struct {
 	deviceState    DeviceState
 	llmConfig      *LLMConfig
 	snapshotFPS    int
-	onConnect      func(address string)
+	onConnect      func(address, username, password string)
 	onAudioData    func([]byte)
 	onAudioStart   func()
 	onAudioStop    func()
@@ -133,7 +133,7 @@ func (h *Handler) SetCallbacks(onData func([]byte), onStart func(), onStop func(
 	h.onSwitchMode = onMode
 }
 
-func (h *Handler) SetOnConnect(fn func(address string)) {
+func (h *Handler) SetOnConnect(fn func(address, username, password string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onConnect = fn
@@ -271,7 +271,9 @@ func (h *Handler) handleDiscover(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Address string `json:"address"`
+		Address  string `json:"address"`
+		Username string `json:"username"`
+		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -283,7 +285,7 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	h.mu.RUnlock()
 
 	if fn != nil {
-		fn(req.Address)
+		fn(req.Address, req.Username, req.Password)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -299,6 +301,8 @@ func (h *Handler) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 
 	client := onvif.NewClient(onvif.Config{
 		DeviceAddr: address,
+		Username:   r.URL.Query().Get("username"),
+		Password:   r.URL.Query().Get("password"),
 		Timeout:    5 * time.Second,
 	})
 
