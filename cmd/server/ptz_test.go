@@ -44,8 +44,9 @@ func findSOAP(t *testing.T, bodies *[]string, fragment string) string {
 	return ""
 }
 
-// TestHandlePTZMoveZoomAxis 校验变焦方向映射到 ContinuousMove 的 zoom 轴
-// （±0.5）且 Pan/Tilt 为零；方向键映射保持原状不受影响。
+// TestHandlePTZMoveZoomAxis 校验变焦方向映射到 ContinuousMove 的 zoom 轴：
+// 按住为 ±0.5/10s 兜底，轻点步进（step）为全速 ±1.0/0.8s 自停；
+// 方向键映射保持原状不受影响。
 func TestHandlePTZMoveZoomAxis(t *testing.T) {
 	srv, bodies := newMockOnvifServer(t)
 	cm := newTestCameraManager()
@@ -56,28 +57,32 @@ func TestHandlePTZMoveZoomAxis(t *testing.T) {
 
 	cases := []struct {
 		direction   string
+		step        bool
 		panTilt     string // PanTilt 元素期望值
 		zoom        string // Zoom 元素期望值
 		wantTimeout string
 	}{
-		{"zoom_in", `<tt:PanTilt x="0.000000" y="0.000000"`, `<tt:Zoom x="0.500000"`, "PT10.0S"},
-		{"zoom_out", `<tt:PanTilt x="0.000000" y="0.000000"`, `<tt:Zoom x="-0.500000"`, "PT10.0S"},
-		{"up", `<tt:PanTilt x="0.000000" y="1.000000"`, `<tt:Zoom x="0.000000"`, "PT2.0S"},
+		{"zoom_in", false, `<tt:PanTilt x="0.000000" y="0.000000"`, `<tt:Zoom x="0.500000"`, "PT10.0S"},
+		{"zoom_out", false, `<tt:PanTilt x="0.000000" y="0.000000"`, `<tt:Zoom x="-0.500000"`, "PT10.0S"},
+		// 轻点步进：全速 ±1.0 × 0.8s 一步，松开后补发、到期自停
+		{"zoom_in", true, `<tt:PanTilt x="0.000000" y="0.000000"`, `<tt:Zoom x="1.000000"`, "PT0.8S"},
+		{"zoom_out", true, `<tt:PanTilt x="0.000000" y="0.000000"`, `<tt:Zoom x="-1.000000"`, "PT0.8S"},
+		{"up", false, `<tt:PanTilt x="0.000000" y="1.000000"`, `<tt:Zoom x="0.000000"`, "PT2.0S"},
 	}
 	for _, tc := range cases {
-		cm.handlePTZMove("cam-back", tc.direction)
+		cm.handlePTZMove("cam-back", tc.direction, tc.step)
 		body := findSOAP(t, bodies, "ContinuousMove")
 		if !strings.Contains(body, tc.panTilt) {
-			t.Errorf("%s: PanTilt mismatch in %s", tc.direction, body)
+			t.Errorf("%s(step=%v): PanTilt mismatch in %s", tc.direction, tc.step, body)
 		}
 		if !strings.Contains(body, tc.zoom) {
-			t.Errorf("%s: Zoom axis mismatch (want %s) in %s", tc.direction, tc.zoom, body)
+			t.Errorf("%s(step=%v): Zoom axis mismatch (want %s) in %s", tc.direction, tc.step, tc.zoom, body)
 		}
 		if !strings.Contains(body, tc.wantTimeout) {
-			t.Errorf("%s: timeout mismatch (want %s) in %s", tc.direction, tc.wantTimeout, body)
+			t.Errorf("%s(step=%v): timeout mismatch (want %s) in %s", tc.direction, tc.step, tc.wantTimeout, body)
 		}
 		if !strings.Contains(body, "<tptz:ProfileToken>cam-back</tptz:ProfileToken>") {
-			t.Errorf("%s: wrong profile token in %s", tc.direction, body)
+			t.Errorf("%s(step=%v): wrong profile token in %s", tc.direction, tc.step, body)
 		}
 	}
 }

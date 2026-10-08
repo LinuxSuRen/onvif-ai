@@ -58,6 +58,11 @@ type CameraState struct {
 	Token        string `json:"token"`
 	Name         string `json:"name"`
 	PTZSupported bool   `json:"ptz_supported"`
+	// PTZPanTilt/PTZZoom 按 GetConfigurationOptions 的速度空间区分云台
+	// 与变焦能力；未查询到（老设备/查询失败）时均为 true，保持旧版
+	// 全显示行为。
+	PTZPanTilt   bool   `json:"ptz_pan_tilt"`
+	PTZZoom      bool   `json:"ptz_zoom"`
 	Streaming    bool   `json:"streaming"`
 	SnapshotMode bool   `json:"snapshot_mode"`
 	// MJPEG 表示该路为 JPEG 帧流（RTSP MJPEG），前端按连续图片渲染而非 H.264
@@ -82,7 +87,7 @@ type Handler struct {
 	onSpeechText   func(string)
 	onCameraListen func()
 	onClearHistory func()
-	onPTZMove      func(camera, direction string)
+	onPTZMove      func(camera, direction string, step bool)
 	onPTZStop      func(camera string)
 	onSwitchMode   func(string)
 	onLLMUpdate    func(baseURL, apiKey, model string)
@@ -119,7 +124,7 @@ func NewHandler(hub *ws.Hub, listener *discovery.Listener) *Handler {
 	}
 }
 
-func (h *Handler) SetCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onClear func(), onPTZ func(camera, direction string), onMode func(string)) {
+func (h *Handler) SetCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onClear func(), onPTZ func(camera, direction string, step bool), onMode func(string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onAudioData = onData
@@ -570,6 +575,8 @@ func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
 		var payload struct {
 			Camera    string
 			Direction string
+			// Step 表示轻点步进（变焦按钮短按松开后补发的完整一步）
+			Step bool
 		}
 		if msg.Payload != nil {
 			json.Unmarshal(msg.Payload, &payload)
@@ -577,7 +584,7 @@ func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
 		if payload.Direction != "" {
 			h.mu.RLock()
 			if h.onPTZMove != nil {
-				h.onPTZMove(payload.Camera, payload.Direction)
+				h.onPTZMove(payload.Camera, payload.Direction, payload.Step)
 			}
 			h.mu.RUnlock()
 		}

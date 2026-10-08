@@ -16,6 +16,9 @@ interface CamInfo {
   token: string
   name: string
   ptz: boolean
+  // 云台/变焦能力细分（旧后端未携带时回退 true 全显示）
+  ptzPanTilt: boolean
+  ptzZoom: boolean
   streaming: boolean
   snapshot: boolean
   mjpeg: boolean
@@ -118,6 +121,13 @@ function ptzStop() {
   send({ type: 'ptz_stop', payload: { camera: cam.token } })
 }
 
+// 轻点变焦补发完整步进：step=true 时后端用全速 ±1.0 × 0.8s 一步
+function ptzZoomStep(direction: string) {
+  const cam = activeCamera.value
+  if (!cam) return
+  send({ type: 'ptz_move', payload: { camera: cam.token, direction, step: true } })
+}
+
 // ---- 时钟同步：为各路延迟测量提供统一的时钟偏移 ----
 let bestSyncRtt = Number.POSITIVE_INFINITY
 const clockOffsetRef = ref<number | null>(null)
@@ -186,6 +196,9 @@ function applyDeviceState(state: any) {
     token: c.token,
     name: c.name || c.token,
     ptz: !!c.ptz_supported,
+    // 旧后端未携带能力字段（undefined）时按 true 全显示
+    ptzPanTilt: c.ptz_pan_tilt !== false,
+    ptzZoom: c.ptz_zoom !== false,
     streaming: !!c.streaming,
     snapshot: !!c.snapshot_mode,
     mjpeg: !!c.mjpeg,
@@ -199,6 +212,8 @@ function applyDeviceState(state: any) {
       token: state.address || 'default',
       name: '摄像头',
       ptz: !!state.ptz_supported,
+      ptzPanTilt: state.ptz_pan_tilt !== false,
+      ptzZoom: state.ptz_zoom !== false,
       streaming: !!state.streaming,
       snapshot: !!state.snapshot_mode,
       mjpeg: false,
@@ -308,6 +323,7 @@ onUnmounted(() => {
           :reset-key="resetKey"
           @ptz="ptzMove"
           @ptz-stop="ptzStop"
+          @ptz-step="ptzZoomStep"
         />
       </div>
 

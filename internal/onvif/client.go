@@ -343,19 +343,84 @@ func stripNSPrefix(xmlStr string) string {
 	return xmlStr
 }
 
-func (c *Client) PTZContinuousMove(ctx context.Context, profileToken string, pan, tilt, zoom float64, duration time.Duration) error {
-	if err := c.discoverServices(ctx); err != nil {
-		return err
-	}
-
+// ptzServiceURL 解析 PTZ 服务的 SOAP 端点（ContinuousMove/Stop/
+// GetConfigurationOptions 共用）。
+func (c *Client) ptzServiceURL() string {
 	ptzURL := c.ptzURL()
-	log.Printf("[PTZ] Sending ContinuousMove to %s (pan=%.1f, tilt=%.1f, zoom=%.1f, dur=%v)", ptzURL, pan, tilt, zoom, duration)
 	if c.mediaXAddr != "" {
 		base := c.deviceURL()
 		if idx := strings.Index(base, "/onvif/"); idx > 0 {
 			ptzURL = base[:idx] + "/onvif/ptz_service"
 		}
 	}
+	return ptzURL
+}
+
+// PTZSpaces 报告 PTZ 配置的连续移动速度空间能力（各轴空间是否存在）。
+type PTZSpaces struct {
+	PanTilt bool
+	Zoom    bool
+}
+
+// GetConfigurationOptions 查询 PTZ 配置的速度空间选项，据此区分云台
+// （Pan/Tilt）与变焦（Zoom）能力。supported=false 表示设备不支持该查询
+// 或响应不含 Spaces 节点（老设备），调用方应回退为全能力显示；
+// supported=true 时 Spaces 被如实采信（均为空表示二者皆不可用）。
+func (c *Client) GetConfigurationOptions(ctx context.Context, configToken string) (PTZSpaces, bool, error) {
+	if err := c.discoverServices(ctx); err != nil {
+		return PTZSpaces{}, false, err
+	}
+
+	body := c.soapEnvelope(fmt.Sprintf(`
+		<tptz:GetConfigurationOptions>
+			<tptz:ConfigurationToken>%s</tptz:ConfigurationToken>
+		</tptz:GetConfigurationOptions>
+	`, xmlEscape(configToken)))
+
+	resp, err := c.soapCall(ctx, c.deviceURL(), c.ptzServiceURL(), "GetConfigurationOptions", body)
+	if err != nil {
+		return PTZSpaces{}, false, err
+	}
+
+	// Spaces 用指针区分「上报了空能力」与「未上报」：老设备/异常响应
+	// 不含 Spaces 节点时回退全能力，上报空 Spaces 则视为无该能力
+	var result struct {
+		Options struct {
+			Spaces *struct {
+				PanTilt []struct {
+					XRange struct {
+						Min float64 `xml:"Min"`
+						Max float64 `xml:"Max"`
+					} `xml:"XRange"`
+				} `xml:"ContinuousPanTiltVelocitySpace"`
+				Zoom []struct {
+					XRange struct {
+						Min float64 `xml:"Min"`
+						Max float64 `xml:"Max"`
+					} `xml:"XRange"`
+				} `xml:"ContinuousZoomVelocitySpace"`
+			} `xml:"Spaces"`
+		} `xml:"GetConfigurationOptionsResponse>PTZConfigurationOptions"`
+	}
+	if err := c.parseSOAPResponse(resp, "GetConfigurationOptionsResponse", &result); err != nil {
+		return PTZSpaces{}, false, fmt.Errorf("parse configuration options: %w", err)
+	}
+	if result.Options.Spaces == nil {
+		return PTZSpaces{}, false, nil
+	}
+	return PTZSpaces{
+		PanTilt: len(result.Options.Spaces.PanTilt) > 0,
+		Zoom:    len(result.Options.Spaces.Zoom) > 0,
+	}, true, nil
+}
+
+func (c *Client) PTZContinuousMove(ctx context.Context, profileToken string, pan, tilt, zoom float64, duration time.Duration) error {
+	if err := c.discoverServices(ctx); err != nil {
+		return err
+	}
+
+	ptzURL := c.ptzServiceURL()
+	log.Printf("[PTZ] Sending ContinuousMove to %s (pan=%.1f, tilt=%.1f, zoom=%.1f, dur=%v)", ptzURL, pan, tilt, zoom, duration)
 
 	body := c.soapEnvelope(fmt.Sprintf(`
 		<tptz:ContinuousMove>
@@ -381,13 +446,7 @@ func (c *Client) PTZStop(ctx context.Context, profileToken string) error {
 		return err
 	}
 
-	ptzURL := c.ptzURL()
-	if c.mediaXAddr != "" {
-		base := c.deviceURL()
-		if idx := strings.Index(base, "/onvif/"); idx > 0 {
-			ptzURL = base[:idx] + "/onvif/ptz_service"
-		}
-	}
+	ptzURL := c.ptzServiceURL()
 
 	body := c.soapEnvelope(fmt.Sprintf(`
 		<tptz:Stop>
@@ -468,7 +527,7 @@ func (c *Client) ContinuousMove(ctx context.Context, profileToken, direction str
 
 func soapActionDomain(action string) string {
 	deviceActions := map[string]bool{"GetCapabilities": true, "GetServices": true, "GetDeviceInformation": true}
-	ptzActions := map[string]bool{"ContinuousMove": true, "Stop": true}
+	ptzActions := map[string]bool{"ContinuousMove": true, "Stop": true, "GetConfigurationOptions": true}
 	if deviceActions[action] {
 		return "device"
 	}

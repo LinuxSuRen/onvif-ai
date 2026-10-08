@@ -11,6 +11,10 @@ const props = defineProps<{
     token: string
     name: string
     ptz: boolean
+    // 按 GetConfigurationOptions 区分的云台/变焦能力（后端未查询到时
+    // 均为 true，保持旧版全显示）
+    ptzPanTilt: boolean
+    ptzZoom: boolean
     streaming: boolean
     snapshot: boolean
     mjpeg: boolean
@@ -28,6 +32,8 @@ const emit = defineEmits<{
   (e: 'ptz', direction: string): void
   // 变焦按钮松开：请求停止当前运动（Pan/Tilt/Zoom 一并停止）
   (e: 'ptz-stop'): void
+  // 轻点变焦（按压 <300ms）：松开后补发一次完整步进
+  (e: 'ptz-step', direction: string): void
 }>()
 
 const videoRef = ref<HTMLVideoElement | null>(null)
@@ -232,11 +238,19 @@ function ptzMove(direction: string) {
 
 // 变焦：按住发 ContinuousMove（zoom 轴 ±0.5 由后端映射），松开发 Stop。
 // 指针捕获保证手指移出按钮后 pointerup/pointercancel 仍派发到按钮，
-// 松开动作必达；zoomHeld 防御未按下时的迟到 release 事件。
-let zoomHeld = false
+// 松开动作必达。轻点（按压 < 300ms）在 Stop 后补发一次完整步进
+//（后端全速 ±1.0 × 0.8s），与方向键的「点按即明显一步」对齐；
+// 长按则只有连续变焦，不与步进叠加。
+const ZOOM_TAP_MS = 300
 
-function ptzZoomStart(direction: string, event: PointerEvent) {
+let zoomHeld = false
+let zoomDownAt = 0
+let zoomDir: 'zoom_in' | 'zoom_out' | null = null
+
+function ptzZoomStart(direction: 'zoom_in' | 'zoom_out', event: PointerEvent) {
   zoomHeld = true
+  zoomDir = direction
+  zoomDownAt = performance.now()
   try {
     ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
   } catch {
@@ -245,15 +259,31 @@ function ptzZoomStart(direction: string, event: PointerEvent) {
   emit('ptz', direction)
 }
 
-function ptzZoomEnd(event: PointerEvent) {
+function ptzZoomUp(event: PointerEvent) {
   if (!zoomHeld) return
+  const tap = performance.now() - zoomDownAt < ZOOM_TAP_MS
+  const dir = zoomDir
+  ptzZoomFinish(event)
+  // 先停掉按住期间的短促移动，轻点再补一步（顺序保证不叠加）
+  emit('ptz-stop')
+  if (tap && dir) emit('ptz-step', dir)
+}
+
+// 手势被系统取消（滚动抢占等）：只停止，不补步进
+function ptzZoomCancel(event: PointerEvent) {
+  if (!zoomHeld) return
+  ptzZoomFinish(event)
+  emit('ptz-stop')
+}
+
+function ptzZoomFinish(event: PointerEvent) {
   zoomHeld = false
+  zoomDir = null
   try {
     ;(event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId)
   } catch {
     /* 指针已释放/未捕获时忽略 */
   }
-  emit('ptz-stop')
 }
 
 defineExpose({ feedNal, feedJpeg })
@@ -289,30 +319,37 @@ defineExpose({ feedNal, feedJpeg })
       ⏱ {{ latencyMs }}ms
     </div>
 
-    <div v-if="active && cam.ptz && cam.streaming" class="cam-tile__ptz">
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--up" @pointerdown.prevent="ptzMove('up')">▲</button>
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--left" @pointerdown.prevent="ptzMove('left')">◀</button>
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--right" @pointerdown.prevent="ptzMove('right')">▶</button>
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--down" @pointerdown.prevent="ptzMove('down')">▼</button>
-      <!-- 变焦摇杆键：+/- 纵向堆叠。按住连续变焦、松开停止；无变焦能力
-           的设备由后端忽略，不影响方向键 -->
-      <div class="cam-tile__ptz-zoom">
+    <!-- PTZ 控制：按能力渲染 —— 云台空间（方向键）与变焦空间（+/−）
+         独立上报，仅 Zoom（手机）时隐藏方向键，仅 PanTilt 时隐藏变焦 -->
+    <div
+      v-if="active && cam.ptz && cam.streaming && (cam.ptzPanTilt || cam.ptzZoom)"
+      class="cam-tile__ptz"
+    >
+      <template v-if="cam.ptzPanTilt">
+        <button class="cam-tile__ptz-btn cam-tile__ptz-btn--up" @pointerdown.prevent="ptzMove('up')">▲</button>
+        <button class="cam-tile__ptz-btn cam-tile__ptz-btn--left" @pointerdown.prevent="ptzMove('left')">◀</button>
+        <button class="cam-tile__ptz-btn cam-tile__ptz-btn--right" @pointerdown.prevent="ptzMove('right')">▶</button>
+        <button class="cam-tile__ptz-btn cam-tile__ptz-btn--down" @pointerdown.prevent="ptzMove('down')">▼</button>
+      </template>
+      <!-- 变焦摇杆键：+/- 纵向堆叠。按住连续变焦、松开停止，轻点步进；
+           无变焦能力的设备由后端忽略，不影响方向键 -->
+      <div v-if="cam.ptzZoom" class="cam-tile__ptz-zoom">
         <button
           class="cam-tile__ptz-btn cam-tile__ptz-btn--zoom-in"
-          title="放大（按住连续变焦）"
+          title="放大（轻点步进，按住连续变焦）"
           aria-label="放大"
           @pointerdown.prevent="ptzZoomStart('zoom_in', $event)"
-          @pointerup="ptzZoomEnd($event)"
-          @pointercancel="ptzZoomEnd($event)"
+          @pointerup="ptzZoomUp($event)"
+          @pointercancel="ptzZoomCancel($event)"
           @contextmenu.prevent
         >+</button>
         <button
           class="cam-tile__ptz-btn cam-tile__ptz-btn--zoom-out"
-          title="缩小（按住连续变焦）"
+          title="缩小（轻点步进，按住连续变焦）"
           aria-label="缩小"
           @pointerdown.prevent="ptzZoomStart('zoom_out', $event)"
-          @pointerup="ptzZoomEnd($event)"
-          @pointercancel="ptzZoomEnd($event)"
+          @pointerup="ptzZoomUp($event)"
+          @pointercancel="ptzZoomCancel($event)"
           @contextmenu.prevent
         >−</button>
       </div>

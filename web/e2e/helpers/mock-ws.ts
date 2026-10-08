@@ -47,17 +47,29 @@ export async function openApp(page: Page): Promise<void> {
 	await page.waitForFunction(() => (window as any).__wsDispatch !== undefined)
 }
 
-/** 注入一路摄像头的 device_state；ptz 控制该路是否支持云台。 */
-export async function dispatchCamera(page: Page, ptz: boolean): Promise<void> {
+/** 注入一路摄像头的 device_state。
+ *  opts.ptz 控制该路是否支持云台；panTilt/zoom 为 undefined 时字段
+ *  省略（模拟旧后端，前端应回退全显示）。 */
+export async function dispatchCamera(
+	page: Page,
+	opts: { ptz?: boolean; panTilt?: boolean; zoom?: boolean } = {},
+): Promise<void> {
+	const { ptz = true, panTilt, zoom } = opts
 	await page.evaluate(
-		(ptz) =>
+		({ ptz, panTilt, zoom }) =>
 			(window as any).__wsDispatch({
 				type: 'device_state',
 				payload: {
-					cameras: [{ token: 'cam-back', name: '后摄', ptz_supported: ptz, streaming: true }],
+					cameras: [
+						Object.assign(
+							{ token: 'cam-back', name: '后摄', ptz_supported: ptz, streaming: true },
+							panTilt === undefined ? {} : { ptz_pan_tilt: panTilt },
+							zoom === undefined ? {} : { ptz_zoom: zoom },
+						),
+					],
 				},
 			}),
-		ptz,
+		{ ptz, panTilt, zoom },
 	)
 }
 
@@ -69,5 +81,19 @@ export async function sentMessages(page: Page, type: string, direction?: string)
 				(m: any) => m.type === type && (direction === undefined || m.payload?.direction === direction),
 			),
 		{ type, direction },
+	)
+}
+
+/** 取 PTZ 相关已发送消息的有序摘要（type/direction/step），验证时序用。 */
+export async function sentPtzSequence(page: Page): Promise<any[]> {
+	return page.evaluate(() =>
+		(window as any).__wsSent
+			.filter((m: any) => m.type === 'ptz_move' || m.type === 'ptz_stop')
+			.map((m: any) => ({
+				type: m.type,
+				direction: m.payload?.direction,
+				step: m.payload?.step === true,
+				camera: m.payload?.camera,
+			})),
 	)
 }

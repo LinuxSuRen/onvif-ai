@@ -88,6 +88,28 @@ func TestCameraStateResolutionJSON(t *testing.T) {
 	}
 }
 
+// TestCameraStatePTZCapsJSON 校验 device_state 中按能力区分的云台/变焦
+// 字段契约：显式序列化（false 也必须下发，前端据此隐藏对应控制）。
+func TestCameraStatePTZCapsJSON(t *testing.T) {
+	// 手机后摄：仅变焦，无云台 → 方向键隐藏
+	b, err := json.Marshal(DeviceState{Cameras: []CameraState{{Token: "t1", PTZSupported: true, PTZPanTilt: false, PTZZoom: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"ptz_pan_tilt":false`) || !strings.Contains(string(b), `"ptz_zoom":true`) {
+		t.Fatalf("ptz capability fields expected, got %s", b)
+	}
+
+	// 零值也必须显式携带（不可 omitempty）
+	b, err = json.Marshal(DeviceState{Cameras: []CameraState{{Token: "t1"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"ptz_pan_tilt":false`) || !strings.Contains(string(b), `"ptz_zoom":false`) {
+		t.Fatalf("explicit false caps expected, got %s", b)
+	}
+}
+
 // TestDeviceStateTalkbackJSON 校验 device_state 中对讲通道字段的序列化契约：
 // nil 省略（未协商）、不可用时显式携带原因码、可用时仅 available。
 func TestDeviceStateTalkbackJSON(t *testing.T) {

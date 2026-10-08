@@ -153,6 +153,9 @@ type camUnit struct {
 	token       string // profile token，即该路画面在 WS 消息里的 cam 标识
 	name        string
 	ptz         bool
+	ptzConfTkn  string // PTZConfiguration token，用于 GetConfigurationOptions
+	ptzPanTilt  bool   // 云台能力（默认 true：未查询到时保持旧版全显示）
+	ptzZoom     bool   // 变焦能力（同上）
 	rtspURL     string
 	snapshotURL string
 
@@ -245,6 +248,24 @@ func (cm *cameraManager) connect(address string) {
 	for _, p := range profiles {
 		u := &camUnit{token: p.Token, name: p.Name, ptz: p.HasPTZ()}
 
+		if u.ptz {
+			u.ptzConfTkn = p.PTZToken
+			// 默认全能力；GetConfigurationOptions 成功时按速度空间
+			// 精确区分（手机仅报 Zoom 空间 → 隐藏方向键只留变焦）
+			u.ptzPanTilt, u.ptzZoom = true, true
+			spaces, supported, optErr := onvifClient.GetConfigurationOptions(ctx, p.PTZToken)
+			switch {
+			case optErr != nil:
+				log.Printf("GetConfigurationOptions(%s) failed: %v, keep all PTZ controls", p.PTZToken, optErr)
+			case supported:
+				u.ptzPanTilt = spaces.PanTilt
+				u.ptzZoom = spaces.Zoom
+				log.Printf("PTZ spaces (%s): panTilt=%v zoom=%v", p.PTZToken, spaces.PanTilt, spaces.Zoom)
+			default:
+				log.Printf("GetConfigurationOptions(%s) unsupported, keep all PTZ controls", p.PTZToken)
+			}
+		}
+
 		if snapURL, snapErr := onvifClient.GetSnapshotURI(ctx, p.Token); snapErr != nil {
 			log.Printf("GetSnapshotUri(%s) failed: %v", p.Token, snapErr)
 		} else if snapURL != "" {
@@ -290,6 +311,8 @@ func (cm *cameraManager) syncCameraStates() {
 			Token:        u.token,
 			Name:         u.name,
 			PTZSupported: u.ptz,
+			PTZPanTilt:   u.ptzPanTilt,
+			PTZZoom:      u.ptzZoom,
 			Streaming:    u.streaming,
 			SnapshotMode: u.snapshotOn,
 			MJPEG:        u.mjpeg,
@@ -835,8 +858,8 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 			log.Println("Conversation history cleared")
 			hub.BroadcastStatus(ws.StatusIdle)
 		},
-		func(camera, direction string) {
-			cm.handlePTZMove(camera, direction)
+		func(camera, direction string, step bool) {
+			cm.handlePTZMove(camera, direction, step)
 		},
 		func(mode string) {
 			log.Printf("Audio mode: %s", mode)
@@ -865,12 +888,19 @@ func (cm *cameraManager) ptzTarget(camera string) *camUnit {
 	return nil
 }
 
-// ptzZoomHoldDuration 是变焦 ContinuousMove 的兜底超时：前端按住变焦
-// 按钮、松开时发 ptz_stop 立停；超时只在停止消息丢失时兜底，因此远大于
-// 方向键的 2s，保证按住期间持续变焦。
+// ptzZoomHoldDuration 是按住变焦的 ContinuousMove 兜底超时：前端按住
+// 变焦按钮、松开时发 ptz_stop 立停；超时只在停止消息丢失时兜底，因此
+// 远大于方向键的 2s，保证按住期间持续变焦。
 const ptzZoomHoldDuration = 10 * time.Second
 
-func (cm *cameraManager) handlePTZMove(camera, direction string) {
+// ptzZoomStep* 是轻点变焦一步的参数：全速走固定短时长（手机端全速约
+// 20%/s × 0.8s ≈ 16% 全范围行程，肉眼一步可见），到期自停无需 Stop。
+const (
+	ptzZoomStepDuration = 800 * time.Millisecond
+	ptzZoomStepSpeed    = 1.0
+)
+
+func (cm *cameraManager) handlePTZMove(camera, direction string, step bool) {
 	cm.mu.Lock()
 	client := cm.onvifClient
 	target := cm.ptzTarget(camera)
@@ -897,13 +927,19 @@ func (cm *cameraManager) handlePTZMove(camera, direction string) {
 		tilt = 1.0
 	case "down":
 		tilt = -1.0
-	case "zoom_in":
-		// 变焦速度取 ±0.5：全范围约 10s 走完，便于细调
-		zoom = 0.5
-		duration = ptzZoomHoldDuration
-	case "zoom_out":
-		zoom = -0.5
-		duration = ptzZoomHoldDuration
+	case "zoom_in", "zoom_out":
+		if step {
+			// 轻点步进：全速 ±1.0 走 0.8s 一步，时长到自停
+			zoom = ptzZoomStepSpeed
+			duration = ptzZoomStepDuration
+		} else {
+			// 按住连续变焦：±0.5 全范围约 10s 走完，便于细调
+			zoom = 0.5
+			duration = ptzZoomHoldDuration
+		}
+		if direction == "zoom_out" {
+			zoom = -zoom
+		}
 	default:
 		return
 	}
