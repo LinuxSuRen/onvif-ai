@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import VideoPlayer from './components/VideoPlayer.vue'
+import IntercomPanel from './components/IntercomPanel.vue'
 import VoicePanel from './components/VoicePanel.vue'
 import DeviceInfo from './components/DeviceInfo.vue'
 
@@ -32,7 +33,7 @@ onUnmounted(() => {
         </div>
         <div class="app-header__titles">
           <h1 class="app-header__title">ONVIF AI</h1>
-          <span class="app-header__subtitle">智能摄像头语音控制台</span>
+          <span class="app-header__subtitle">ONVIF 摄像头查看器</span>
         </div>
       </div>
       <div class="app-header__meta">
@@ -44,9 +45,11 @@ onUnmounted(() => {
       <section class="app-main__video">
         <VideoPlayer />
       </section>
+      <!-- 核心流程：搜索设备 → 查看画面 → 语音对讲；AI 助手折叠置底 -->
       <aside class="app-main__sidebar">
-        <VoicePanel />
+        <IntercomPanel />
         <DeviceInfo />
+        <VoicePanel />
       </aside>
     </main>
   </div>

@@ -40,8 +40,12 @@ type Stream struct {
 
 	// 音频轨道的实际参数（来自 SDP 协商结果），随 OnAudioPCM 回调透出，
 	// 下游按此播放/处理，不写死采样率。
+	audioCodec      string // 展示用编码名："G.711" / "AAC-LC"
 	audioSampleRate int
 	audioChannels   int
+
+	// audioDegradedHandler 在音频解码首次失败（进入降级）时回调一次
+	audioDegradedHandler func(reason string)
 
 	// SPS/PPS from the SDP. Many encoders put the parameter sets only in the
 	// SDP (sprop-parameter-sets) and never resend them in-band; downstream
@@ -49,6 +53,11 @@ type Stream struct {
 	// so we re-inject them ahead of every IDR frame.
 	sps []byte
 	pps []byte
+
+	// videoResHandler 在分辨率首次得知时回调一次（H.264 解析 SDP SPS，
+	// SDP 没带则嗅探带内首个 SPS NAL；MJPEG/快照解析首帧 JPEG SOF）。
+	videoResHandler func(width, height int)
+	resKnown        bool
 
 	closeOnce sync.Once
 
@@ -77,6 +86,24 @@ func (s *Stream) IsMJPEG() bool {
 	return s.mjpegDec != nil
 }
 
+// OnVideoResolution registers the handler for the stream's pixel resolution.
+// It fires exactly once per connection attempt, as soon as the resolution is
+// known: from the SDP's sprop-parameter-sets (H.264), from the first in-band
+// SPS NAL when the SDP carries none, or from the first JPEG frame's SOF
+// segment (MJPEG). Must be registered before Connect.
+func (s *Stream) OnVideoResolution(handler func(width, height int)) {
+	s.videoResHandler = handler
+}
+
+// reportResolution 记录并上报分辨率，每路连接只报一次。
+func (s *Stream) reportResolution(w, h int) {
+	if s.resKnown || w <= 0 || h <= 0 || s.videoResHandler == nil {
+		return
+	}
+	s.resKnown = true
+	s.videoResHandler(w, h)
+}
+
 // OnAudioPCM registers the handler for linear PCM decoded from the stream's
 // audio track. sampleRate/channels report the negotiated parameters of the
 // source so the receiver can play the chunk correctly. The handler is only
@@ -90,6 +117,32 @@ func (s *Stream) OnAudioPCM(handler func(pcm []byte, sampleRate, channels int)) 
 // track. It is only meaningful after a successful Connect.
 func (s *Stream) HasAudio() bool {
 	return s.g711Dec != nil || s.aacDec != nil
+}
+
+// AudioTrackInfo 描述协商成功的音频轨道（展示用）。
+type AudioTrackInfo struct {
+	Codec      string // "G.711" / "AAC-LC"
+	SampleRate int
+	Channels   int
+}
+
+// AudioTrack 返回 SDP 协商出的音频轨道信息；无（受支持的）音频轨时返回
+// nil。仅在 Connect 成功后有意义。
+func (s *Stream) AudioTrack() *AudioTrackInfo {
+	if !s.HasAudio() {
+		return nil
+	}
+	return &AudioTrackInfo{
+		Codec:      s.audioCodec,
+		SampleRate: s.audioSampleRate,
+		Channels:   s.audioChannels,
+	}
+}
+
+// OnAudioDegraded 注册音频解码降级回调：比特流损坏等导致解码失败时触发
+// 一次（后续错误不再重复上报），reason 为人类可读原因。
+func (s *Stream) OnAudioDegraded(handler func(reason string)) {
+	s.audioDegradedHandler = handler
 }
 
 func (s *Stream) Connect() error {
@@ -132,18 +185,27 @@ func (s *Stream) Connect() error {
 	needsSetup := false
 
 	// 音频格式选择分两轮，保证优先级与 SDP 中 m=audio 的出现顺序无关：
-	// 第一轮只认 G.711（ONVIF 对讲事实标准、现有回传链路依赖）；
-	// 第二轮在没有任何 G.711 时才接受 AAC-LC（RFC 3640 mpeg4-generic）。
+	// 第一轮优先 AAC-LC（宽频立体声，听感明显优于 8kHz 电话音质的 G.711；
+	// 同时提供两种音轨的源——如 ohos-ipcam-streamer——自动选优）；
+	// 第二轮在没有任何 AAC-LC 时接受 G.711（ONVIF 对讲事实标准，兜底）。
 	for _, media := range desc.Medias {
 		if media.IsBackChannel {
 			continue
 		}
 		for _, f := range media.Formats {
-			if g711, ok := f.(*format.G711); ok &&
-				media.Type == description.MediaTypeAudio && audioMedia == nil {
-				audioMedia = media
-				audioG711 = g711
+			m4a, ok := f.(*format.MPEG4Audio)
+			if !ok || media.Type != description.MediaTypeAudio {
+				continue
 			}
+			// 仅接受 AAC-LC（解码器能力边界）；HE-AAC 等仍走不支持告警
+			if m4a.Config != nil && m4a.Config.Type == mpeg4audio.ObjectTypeAACLC {
+				audioMedia = media
+				audioAAC = m4a
+				break
+			}
+		}
+		if audioAAC != nil {
+			break
 		}
 	}
 	if audioMedia == nil {
@@ -152,19 +214,11 @@ func (s *Stream) Connect() error {
 				continue
 			}
 			for _, f := range media.Formats {
-				m4a, ok := f.(*format.MPEG4Audio)
-				if !ok || media.Type != description.MediaTypeAudio {
-					continue
-				}
-				// 仅接受 AAC-LC（解码器能力边界）；HE-AAC 等仍走不支持告警
-				if m4a.Config != nil && m4a.Config.Type == mpeg4audio.ObjectTypeAACLC {
+				if g711, ok := f.(*format.G711); ok &&
+					media.Type == description.MediaTypeAudio && audioMedia == nil {
 					audioMedia = media
-					audioAAC = m4a
-					break
+					audioG711 = g711
 				}
-			}
-			if audioAAC != nil {
-				break
 			}
 		}
 	}
@@ -204,6 +258,11 @@ func (s *Stream) Connect() error {
 			s.h264Dec = dec
 			s.sps = videoH264.SPS
 			s.pps = videoH264.PPS
+			// SDP 携带 sprop-parameter-sets 时建流即可知分辨率；
+			// 没带则等带内首个 SPS NAL（见下方回调）
+			if w, h := resolutionFromSPS(s.sps); w > 0 {
+				s.reportResolution(w, h)
+			}
 		}
 		if videoMJPEG != nil {
 			dec, err := videoMJPEG.CreateDecoder()
@@ -234,6 +293,7 @@ func (s *Stream) Connect() error {
 		}
 		dec.Init()
 		s.g711Dec = dec
+		s.audioCodec = "G.711"
 		s.audioSampleRate = audioG711.SampleRate
 		s.audioChannels = audioG711.ChannelCount
 		needsSetup = true
@@ -258,6 +318,7 @@ func (s *Stream) Connect() error {
 			s.aacRTPDec = dec
 			s.aacDec = d
 			s.aacFreqIndex = freqIdx
+			s.audioCodec = "AAC-LC"
 			s.audioSampleRate = audioAAC.Config.SampleRate
 			s.audioChannels = audioAAC.Config.ChannelCount
 			log.Printf("[rtsp] AAC audio track enabled: %d Hz, %d ch", s.audioSampleRate, s.audioChannels)
@@ -292,6 +353,12 @@ func (s *Stream) Connect() error {
 				return
 			}
 			for _, nalu := range nalus {
+				if !s.resKnown && len(nalu) > 0 && nalu[0]&0x1F == 7 {
+					// SDP 未携带参数集时，从带内首个 SPS NAL 解析分辨率
+					if w, h := resolutionFromSPS(nalu); w > 0 {
+						s.reportResolution(w, h)
+					}
+				}
 				if isIDRNAL(nalu) {
 					// Parameter sets usually live only in the SDP; re-send
 					// them ahead of each keyframe so any client that just
@@ -314,6 +381,11 @@ func (s *Stream) Connect() error {
 			img, err := s.mjpegDec.Decode(pkt)
 			if err != nil || len(img) == 0 || s.videoJPEGHandler == nil {
 				return
+			}
+			if !s.resKnown {
+				if w, h := JPEGResolution(img); w > 0 {
+					s.reportResolution(w, h)
+				}
 			}
 			// RFC 2435 解出的每帧即完整 JPEG，直接复用快照的浏览器通道
 			s.videoJPEGHandler(img)
@@ -347,6 +419,9 @@ func (s *Stream) Connect() error {
 				if !s.aacRTPOnce {
 					s.aacRTPOnce = true
 					log.Printf("[rtsp] AAC RTP decode error (subsequent ones suppressed): %v", err)
+					if s.audioDegradedHandler != nil {
+						s.audioDegradedHandler("音频传输解码失败: " + err.Error())
+					}
 				}
 				return
 			}
@@ -363,6 +438,9 @@ func (s *Stream) Connect() error {
 					if !s.aacErrOnce {
 						s.aacErrOnce = true
 						log.Printf("[rtsp] AAC decode error, decoder rebuilt (subsequent ones suppressed): %v", derr)
+						if s.audioDegradedHandler != nil {
+							s.audioDegradedHandler("音频解码失败: " + derr.Error())
+						}
 					}
 					if d := aacNewDecoder(); d != nil {
 						s.aacDec = d

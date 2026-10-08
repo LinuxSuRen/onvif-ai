@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted, inject } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, inject } from 'vue'
 import JMuxer from 'jmuxer'
 
 /**
@@ -14,6 +14,8 @@ const props = defineProps<{
     streaming: boolean
     snapshot: boolean
     mjpeg: boolean
+    width: number
+    height: number
   }
   active: boolean
   showLabel: boolean
@@ -31,6 +33,11 @@ const imgRef = ref<HTMLImageElement | null>(null)
 const hasVideo = ref(false)
 const inSnapshot = ref(false)
 const latencyMs = ref(0)
+
+// 分辨率角标文案（来自后端 SPS/JPEG 解析，未知为空串不渲染）
+const resolution = computed(() =>
+  props.cam.width > 0 && props.cam.height > 0 ? `${props.cam.width}x${props.cam.height}` : '',
+)
 
 let jmuxer: JMuxer | null = null
 let transitEma: number | null = null
@@ -241,7 +248,11 @@ defineExpose({ feedNal, feedJpeg })
     />
 
     <div v-if="showLabel" class="cam-tile__label" :title="cam.name">{{ cam.name }}</div>
-    <div v-if="inSnapshot && !cam.mjpeg" class="cam-tile__badge">快照</div>
+    <!-- 左下角状态角标：快照降级提示 + 分辨率（未知时不显示） -->
+    <div v-if="(inSnapshot && !cam.mjpeg) || resolution" class="cam-tile__badges">
+      <span v-if="inSnapshot && !cam.mjpeg" class="cam-tile__badge">快照</span>
+      <span v-if="resolution" class="cam-tile__res" :title="`画面分辨率 ${resolution}`">{{ resolution }}</span>
+    </div>
     <div
       v-if="hasVideo && !inSnapshot && latencyMs > 0"
       class="cam-tile__latency"
@@ -311,17 +322,37 @@ defineExpose({ feedNal, feedJpeg })
   pointer-events: none;
 }
 
-.cam-tile__badge {
+/* 左下角角标行：快照提示与分辨率同排，互不遮挡 */
+.cam-tile__badges {
   position: absolute;
   bottom: 6px;
   left: 6px;
   z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: calc(100% - 12px);
+  pointer-events: none;
+}
+
+.cam-tile__badge {
   padding: 2px 8px;
   border-radius: 4px;
   background: rgba(255, 184, 0, 0.15);
   color: rgba(255, 184, 0, 0.95);
   font-size: 0.65rem;
-  pointer-events: none;
+  white-space: nowrap;
+}
+
+.cam-tile__res {
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.55);
+  color: rgba(255, 255, 255, 0.85);
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
 }
 
 .cam-tile__latency {

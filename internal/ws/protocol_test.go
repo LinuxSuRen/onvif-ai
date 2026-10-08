@@ -108,3 +108,62 @@ func TestStatusStates(t *testing.T) {
 		}
 	}
 }
+
+func TestTalkbackMessageTypes(t *testing.T) {
+	pairs := []struct {
+		t    MessageType
+		want string
+	}{
+		{MsgTypeTalkbackStart, "talkback_start"},
+		{MsgTypeAudioIn, "audio_in"},
+		{MsgTypeTalkbackStop, "talkback_stop"},
+		{MsgTypeTalkbackState, "talkback_state"},
+	}
+	for _, p := range pairs {
+		if string(p.t) != p.want {
+			t.Errorf("expected %s, got %s", p.want, p.t)
+		}
+	}
+}
+
+func TestTalkbackSessionPayloadJSON(t *testing.T) {
+	// 受理：仅 active 字段
+	b, err := json.Marshal(TalkbackSessionPayload{Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `{"active":true}` {
+		t.Fatalf("unexpected accept payload: %s", b)
+	}
+
+	// 拒绝：active=false + 稳定拒绝码
+	b, err = json.Marshal(TalkbackSessionPayload{Active: false, Reason: TalkbackRejectBusy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `{"active":false,"reason":"busy"}` {
+		t.Fatalf("unexpected reject payload: %s", b)
+	}
+
+	// 前端解析方向：还原能够区分拒绝码
+	var p TalkbackSessionPayload
+	if err := json.Unmarshal([]byte(`{"active":false,"reason":"no_backchannel"}`), &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Active || p.Reason != TalkbackRejectNoBackchannel {
+		t.Fatalf("unexpected round-trip: %+v", p)
+	}
+}
+
+func TestTalkbackRejectCodes(t *testing.T) {
+	codes := map[string]string{
+		TalkbackRejectNoBackchannel: "no_backchannel",
+		TalkbackRejectBusy:          "busy",
+		TalkbackRejectInUse:         "talkback_in_use",
+	}
+	for got, want := range codes {
+		if got != want {
+			t.Errorf("reject code mismatch: got %s want %s", got, want)
+		}
+	}
+}

@@ -1,17 +1,25 @@
-# ONVIF AI — 摄像头 AI 语音助手
+# ONVIF AI — 摄像头查看器
 
-基于 ONVIF 协议的 IP 摄像头 AI 实时语音问答系统。连接摄像头后，可通过浏览器或摄像头麦克风向 AI 提问，AI 回答通过摄像头喇叭或浏览器语音播报。
+基于 ONVIF 协议的 IP 摄像头查看与语音对讲工具：自动发现局域网摄像头，浏览器实时观看画面与收听现场音频，按住按钮即可通过麦克风向摄像头扬声器喊话对讲。另提供可选的 AI 语音助手（问答 + 播报），默认收起不影响核心使用。
 
-## 功能
+## 核心功能
 
-- 🔍 **ONVIF 自动发现**（WS-Discovery 组播 + Hello 监听）
-- 📹 **实时视频流**（RTSP H.264 / 快照降级 1FPS）
-- 🔊 **实时音频**（RTSP 流内含 G.711 或 AAC-LC 音频轨时自动在浏览器播放，采样率随源动态适配；无音频轨不受影响。HE-AAC 等其他编码暂不支持，后端会记录告警）
+- 🔍 **ONVIF 自动发现**（WS-Discovery 组播 + Hello 监听，一键搜索并连接）
+- 📹 **实时视频流**（RTSP H.264 / 快照降级 1FPS，多画面预览）
+- 🔊 **实时音频监听**（RTSP 流内含 G.711 或 AAC-LC 音频轨时自动在浏览器播放，采样率随源动态适配；无音频轨不受影响。HE-AAC 等其他编码暂不支持，后端会记录告警）
+- 📣 **语音对讲**（按住说话，浏览器麦克风音频经 RTSP backchannel 实时推到摄像头扬声器；设备 SDP 需提供 G.711 回传轨，不支持的设备会明确提示并禁用入口）
+- 📡 **WebSocket 实时通信**（视频帧、音频、状态全走 WS）
+
+## AI 语音助手（可选）
+
+AI 相关功能默认收起在侧栏「AI 语音助手」折叠面板中，按需展开：
+
 - 🎙️ **浏览器语音识别**（Chrome SpeechRecognition，无需 API Key）
 - 📷 **摄像头麦克风收音**（G.711 → Whisper STT）
 - 🤖 **大模型对话**（OpenAI 兼容接口，DeepSeek/SiliconFlow 等）
-- 🔊 **TTS 语音播报**（Edge TTS 免费 / 自定义接口）
-- 📡 **WebSocket 实时通信**（视频帧、音频、状态全走 WS）
+- 🔊 **TTS 语音播报**（Edge TTS 免费 / 自定义接口；经对讲回传通道下发，与语音对讲互斥——对讲优先，占用中会提示稍后）
+
+使用语音识别需要 Chrome 或 Edge 浏览器；需在「设备管理 → AI 模型配置」中填入 LLM API Key。
 
 ## 快速开始
 
@@ -19,14 +27,13 @@
 
 - Go 1.21+
 - Node.js 18+
-- Chrome 或 Edge 浏览器（语音识别需要）
 - ONVIF 摄像头（可选，Demo 模式不需要）
 
 ### 配置
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填入 LLM API Key
+# 仅使用查看与对讲无需配置；AI 语音助手才需要填 LLM API Key
 ```
 
 ### 启动
@@ -72,11 +79,11 @@ make release VERSION=0.0.1
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `ONVIF_ADDR` | `192.168.1.138:8089/onvif/device_service` | ONVIF 设备地址 |
-| `LLM_BASE_URL` | `https://api.openai.com` | LLM API 地址 |
-| `LLM_API_KEY` | — | API Key |
-| `LLM_MODEL` | `gpt-3.5-turbo` | 模型名称 |
-| `TTS_PROVIDER` | `edge-tts` | TTS 引擎 (`edge-tts` / `http`) |
-| `TTS_VOICE` | `zh-CN-XiaoxiaoNeural` | 语音名称 |
+| `LLM_BASE_URL` | `https://api.openai.com` | LLM API 地址（AI 助手） |
+| `LLM_API_KEY` | — | API Key（AI 助手） |
+| `LLM_MODEL` | `gpt-3.5-turbo` | 模型名称（AI 助手） |
+| `TTS_PROVIDER` | `edge-tts` | TTS 引擎 (`edge-tts` / `http`)（AI 助手） |
+| `TTS_VOICE` | `zh-CN-XiaoxiaoNeural` | 语音名称（AI 助手） |
 | `PORT` | `8080` | HTTP 端口 |
 
 命令行参数 `--port` 可指定端口，优先级高于 `PORT` 环境变量：
@@ -88,10 +95,10 @@ make release VERSION=0.0.1
 ## 架构
 
 ```
-浏览器 ←─WebSocket─→ Go 后端 ←─RTSP/ONVIF─→ IP 摄像头
-                         ↕
-                    LLM API (DeepSeek)
-                    TTS Engine (Edge)
+浏览器 ←─WebSocket（视频帧 / 音频 / 对讲 PCM）─→ Go 后端 ←─RTSP/ONVIF─→ IP 摄像头
+                                                     │
+                                                     ├─ 对讲：麦克风 PCM → RTSP backchannel（RTP）→ 摄像头扬声器
+                                                     └─ AI 助手（可选）：LLM API + TTS Engine
 ```
 
 ## 项目结构

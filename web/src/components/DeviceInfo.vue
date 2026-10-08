@@ -339,6 +339,12 @@ async function saveLLMConfig() {
     </div>
     <div v-else-if="!discovering && !discoverError" class="device-info__hint">点击「搜索设备」发现局域网 ONVIF 摄像头</div>
 
+    <!-- 快照降级时的观看设置（通用功能，不藏在 AI 配置里） -->
+    <div v-if="deviceState.snapshot_mode" class="device-info__llm-field">
+      <label>快照帧率 ({{ snapshotFps }} FPS)</label>
+      <input type="range" v-model.number="snapshotFps" min="1" max="10" @change="saveSettings" />
+    </div>
+
     <button class="device-info__settings-toggle" @click="showLLMSettings = !showLLMSettings">
       ⚙️ AI 模型配置 {{ showLLMSettings ? '▲' : '▼' }}
     </button>
@@ -359,11 +365,6 @@ async function saveLLMConfig() {
       <button class="device-info__llm-save" @click="saveLLMConfig" :disabled="llmSaving">
         {{ llmSaving ? '保存中...' : '保存' }}
       </button>
-
-      <div v-if="deviceState.snapshot_mode" class="device-info__llm-field">
-        <label>快照帧率 ({{ snapshotFps }} FPS)</label>
-        <input type="range" v-model.number="snapshotFps" min="1" max="10" @change="saveSettings" />
-      </div>
     </div>
   </div>
 </template>

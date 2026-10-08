@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed } from 'vue'
 import { useMicCapture } from '../composables/useMicCapture'
-import { useAudioPlayer } from '../composables/useAudioPlayer'
 import { useWebSocket } from '../composables/useWebSocket'
 
+/**
+ * AI 语音助手（可选功能，默认收起）：语音问答走 STT → LLM → TTS 链路。
+ * 定位收敛后主界面只保留设备搜索、画面与对讲，本面板折叠为次要入口。
+ */
 type TalkStatus = 'idle' | 'listening' | 'thinking' | 'speaking'
 type AudioMode = 'browser_mic' | 'camera_mic'
 
@@ -16,11 +19,10 @@ let fullResponseText = ''
 const availableVoices = ref<SpeechSynthesisVoice[]>([])
 const selectedVoice = ref('')
 
-const { isConnected, send, subscribe } = useWebSocket('/ws')
+// AI 为次要功能：默认收起，点击标题栏展开
+const expanded = ref(false)
 
-watch(isConnected, (connected) => {
-  console.log('[VoicePanel] WebSocket connected:', connected)
-})
+const { isConnected, send, subscribe } = useWebSocket('/ws')
 
 const handleSpeechResult = (text: string, isFinal: boolean) => {
   console.log('[VoicePanel] Speech result:', { text, isFinal })
@@ -47,7 +49,8 @@ const { start: micStart, stop: micStop } = useMicCapture({
   },
 })
 
-const { playChunk } = useAudioPlayer()
+// 摄像头实时音频的播放已移至 AudioMonitor（视频画面右下角），
+// 本面板只负责语音对话；浏览器侧 TTS 播报用 SpeechSynthesis。
 
 const statusLabel = computed(() => {
   const labels: Record<TalkStatus, string> = {
@@ -120,7 +123,7 @@ function stopTalk() {
   micStop()
 }
 
-subscribe(['transcript', 'status', 'audio_out', 'error'], (msg) => {
+subscribe(['transcript', 'status', 'error'], (msg) => {
   {
     if (msg.type === 'transcript' && msg.text) {
       if (msg.text === '\n\n') {
@@ -139,15 +142,6 @@ subscribe(['transcript', 'status', 'audio_out', 'error'], (msg) => {
         talkStatus.value = 'idle'
       }
     }
-    if (msg.type === 'audio_out' && msg.data) {
-      // 摄像头实时音频：采样率/声道由后端按流内音频轨道动态携带，
-      // 无音频轨道时不会有 audio_out，不受影响
-      const meta = msg.payload as { rate?: unknown; channels?: unknown } | undefined
-      const rate = typeof meta?.rate === 'number' && meta.rate > 0 ? meta.rate : undefined
-      const channels =
-        typeof meta?.channels === 'number' && meta.channels > 0 ? meta.channels : undefined
-      playChunk(msg.data, rate, channels)
-    }
     if (msg.type === 'error' && msg.text) {
       console.error('[VoicePanel] Error:', msg.text)
       errorMsg.value = msg.text
@@ -159,14 +153,23 @@ subscribe(['transcript', 'status', 'audio_out', 'error'], (msg) => {
 
 <template>
   <div class="voice-panel">
-    <div class="voice-panel__header">
-      <span class="voice-panel__title">语音对话</span>
-      <span class="voice-panel__connection" :class="{ 'voice-panel__connection--online': isConnected }">
-        {{ isConnected ? '已连接' : '未连接' }}
+    <!-- 标题栏即折叠开关：AI 为可选功能，默认收起不占主界面焦点 -->
+    <button
+      class="voice-panel__header"
+      type="button"
+      :aria-expanded="expanded"
+      @click="expanded = !expanded"
+    >
+      <span class="voice-panel__title">AI 语音助手</span>
+      <span class="voice-panel__header-meta">
+        <span class="voice-panel__connection" :class="{ 'voice-panel__connection--online': isConnected }">
+          {{ isConnected ? '已连接' : '未连接' }}
+        </span>
+        <span class="voice-panel__chevron">{{ expanded ? '▲' : '▼' }}</span>
       </span>
-    </div>
+    </button>
 
-    <div class="voice-panel__body">
+    <div v-if="expanded" class="voice-panel__body">
       <div class="voice-panel__mode-toggle">
         <button
           class="voice-panel__mode-option"
@@ -230,6 +233,22 @@ subscribe(['transcript', 'status', 'audio_out', 'error'], (msg) => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  width: 100%;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.voice-panel__header-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.voice-panel__chevron {
+  font-size: 0.6rem;
+  color: #5a6470;
 }
 
 .voice-panel__title {

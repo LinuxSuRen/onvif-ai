@@ -1,0 +1,52 @@
+package rtsp
+
+import "testing"
+
+// TestResolutionFromSPS 用固定 SPS 字节（1280x720，取自 mediacommon 官方
+// 测试夹具同源的真实编码器输出）验证解析。
+func TestResolutionFromSPS(t *testing.T) {
+	sps := []byte{
+		0x67, 0x64, 0x00, 0x1f, 0xac, 0xd9, 0x40, 0x50,
+		0x05, 0xbb, 0x01, 0x6c, 0x80, 0x00, 0x00, 0x03,
+		0x00, 0x80, 0x00, 0x00, 0x1e, 0x07, 0x8c, 0x18,
+		0xcb,
+	}
+	w, h := resolutionFromSPS(sps)
+	if w != 1280 || h != 720 {
+		t.Fatalf("expected 1280x720, got %dx%d", w, h)
+	}
+
+	// 非 SPS / 截断输入必须安静地返回 0
+	for _, bad := range [][]byte{nil, {0x67}, {0x68, 0x64, 0x00, 0x1f, 0xac}, {0x67, 0x64}} {
+		if w, h := resolutionFromSPS(bad); w != 0 || h != 0 {
+			t.Fatalf("expected 0x0 for %v, got %dx%d", bad, w, h)
+		}
+	}
+}
+
+// TestJPEGResolution 用手工构造的段结构验证 SOF 解析。
+func TestJPEGResolution(t *testing.T) {
+	// SOI + APP0(10 字节填充) + SOF0(精度 8、高 480、宽 640) + EOS
+	jpeg := []byte{
+		0xFF, 0xD8,
+		0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00,
+		0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x01, 0xE0, 0x02, 0x80, 0x03, 0x02,
+		0xFF, 0xD9,
+	}
+	w, h := JPEGResolution(jpeg)
+	if w != 640 || h != 480 {
+		t.Fatalf("expected 640x480, got %dx%d", w, h)
+	}
+
+	// 非 JPEG / 损坏输入返回 0
+	for _, bad := range [][]byte{
+		nil,
+		{0x00, 0x01, 0x02, 0x03},
+		{0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x08}, // 只有 SOS，无 SOF
+		{0xFF, 0xD8, 0xFF, 0xC0, 0x00},       // SOF 段截断
+	} {
+		if w, h := JPEGResolution(bad); w != 0 || h != 0 {
+			t.Fatalf("expected 0x0 for %v, got %dx%d", bad, w, h)
+		}
+	}
+}

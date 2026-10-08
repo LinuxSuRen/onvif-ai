@@ -1,8 +1,10 @@
 package rtsp
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/bluenviron/gortsplib/v5"
@@ -13,12 +15,19 @@ import (
 	"github.com/onvif-ai/internal/audio"
 )
 
+// ErrNoBackchannel 表示 DESCRIBE 结果里没有任何 G.711 回传轨
+// （设备不支持对讲）。上层用 errors.Is 分类后向前端回报稳定原因码。
+var ErrNoBackchannel = errors.New("no audio backchannel found")
+
 type Backchannel struct {
 	rawURL    string
 	client    *gortsplib.Client
 	media     *description.Media
 	encoder   *rtplpcm.Encoder
 	connected bool
+	// writeMu 串行化 WritePCM：TTS 回传与浏览器对讲共用同一通道，
+	// 并发写会在 RTP 编码器与底层连接上产生数据竞争。
+	writeMu sync.Mutex
 }
 
 func NewBackchannel(rtspURL string) *Backchannel {
@@ -56,7 +65,7 @@ func (b *Backchannel) Connect() error {
 	media, g711 := findG711BackChannelMedia(desc)
 	if media == nil {
 		b.client.Close()
-		return fmt.Errorf("no audio backchannel found")
+		return fmt.Errorf("find backchannel media: %w", ErrNoBackchannel)
 	}
 
 	b.media = media
@@ -84,7 +93,13 @@ func (b *Backchannel) Connect() error {
 	return nil
 }
 
+// WritePCM 接收 16kHz 单声道 16 位小端 PCM，内部重采样到 8kHz 并按
+// A-law 编码为 G.711 RTP 推送。调用方（TTS 回传、浏览器对讲）可能并发，
+// writeMu 保证一次完整写入不被交错。
 func (b *Backchannel) WritePCM(pcm16 []byte) error {
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+
 	if !b.connected {
 		return fmt.Errorf("backchannel not connected")
 	}

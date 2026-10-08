@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { ref, computed, watch, onUnmounted, provide } from 'vue'
 import { useWebSocket, type WsMessage } from '../composables/useWebSocket'
+import { usePaused } from '../composables/usePaused'
 import CameraTile from './CameraTile.vue'
+import AudioMonitor from './AudioMonitor.vue'
 
 /**
  * 视频区域：支持单设备多摄像头（多 media profile）。
@@ -17,6 +19,8 @@ interface CamInfo {
   streaming: boolean
   snapshot: boolean
   mjpeg: boolean
+  width: number
+  height: number
 }
 
 const connectionStatus = ref<'disconnected' | 'connecting' | 'connected'>('connecting')
@@ -28,19 +32,26 @@ const activeCam = ref('')
 const videoError = ref('')
 
 const { isConnected, isConnecting, send, subscribe } = useWebSocket('/ws')
+const { paused, togglePause } = usePaused()
 
 let lastErrorText = ''
 function handleMessage(msg: WsMessage) {
   if (msg.type === 'video_nal' && msg.data) {
+    // 照常刷新 lastFrameTime（避免误报“视频流中断”）；暂停时丢弃新帧，
+    // 画面冻结在最后一帧，恢复后由 tile 的追帧逻辑跳回直播沿
     lastFrameTime = Date.now()
-    const data = msg.data
-    routeToTile(msg.cam, (tile) => tile.feedNal(msg.ts, data))
+    if (!paused.value) {
+      const data = msg.data
+      routeToTile(msg.cam, (tile) => tile.feedNal(msg.ts, data))
+    }
     return
   }
   if (msg.type === 'video_jpeg' && msg.data) {
     lastFrameTime = Date.now()
-    const data = msg.data
-    routeToTile(msg.cam, (tile) => tile.feedJpeg(data))
+    if (!paused.value) {
+      const data = msg.data
+      routeToTile(msg.cam, (tile) => tile.feedJpeg(data))
+    }
     return
   }
   if (msg.type === 'device_state' && msg.payload) {
@@ -171,6 +182,8 @@ function applyDeviceState(state: any) {
     streaming: !!c.streaming,
     snapshot: !!c.snapshot_mode,
     mjpeg: !!c.mjpeg,
+    width: c.width > 0 ? c.width : 0,
+    height: c.height > 0 ? c.height : 0,
   }))
 
   // 兼容未携带 cameras 列表的旧后端：退化为单路隐式摄像头
@@ -182,6 +195,8 @@ function applyDeviceState(state: any) {
       streaming: !!state.streaming,
       snapshot: !!state.snapshot_mode,
       mjpeg: false,
+      width: 0,
+      height: 0,
     })
   }
 
@@ -220,12 +235,31 @@ onUnmounted(() => {
         <span class="video-player__label">实时视频流</span>
       </div>
       <span v-if="multiCam" class="video-player__cam-count">{{ cameras.length }} 路画面</span>
+      <button
+        class="video-player__pause-btn"
+        :class="{ 'video-player__pause-btn--paused': paused }"
+        :title="paused ? '恢复播放（回到当前实时画面）' : '暂停播放（画面冻结在当前帧）'"
+        :aria-label="paused ? '恢复播放' : '暂停播放'"
+        :aria-pressed="paused"
+        @click="togglePause"
+      >
+        <svg v-if="!paused" viewBox="0 0 24 24" fill="currentColor">
+          <rect x="6" y="5" width="4" height="14" rx="1" />
+          <rect x="14" y="5" width="4" height="14" rx="1" />
+        </svg>
+        <svg v-else viewBox="0 0 24 24" fill="currentColor">
+          <path d="M8 5.5v13l11-6.5-11-6.5z" />
+        </svg>
+      </button>
       <span class="video-player__status-label" :class="`video-player__status-label--${connectionStatus}`">
         {{ connectionStatus === 'connected' ? '在线' : connectionStatus === 'connecting' ? '连接中...' : '断开' }}
       </span>
     </div>
 
     <div class="video-player__viewport">
+      <!-- 暂停提示：画面冻结属用户主动行为，明确反馈避免误判为断流 -->
+      <div v-if="paused" class="video-player__paused-badge">⏸ 已暂停</div>
+
       <!-- 左上角：观看模式切换（多画面 / 单画面） -->
       <div v-if="multiCam" class="video-player__mode-switch" role="tablist">
         <button
@@ -281,6 +315,9 @@ onUnmounted(() => {
         >{{ camDisplayName(cam, i) }}</button>
       </div>
 
+      <!-- 右下角：设备级音频状态与播放控制（浮层，不占布局空间） -->
+      <AudioMonitor />
+
       <div v-if="!hasAnyStream" class="video-player__placeholder">
         <span class="video-player__placeholder-icon">📷</span>
         <span class="video-player__placeholder-text">暂无摄像头画面</span>
@@ -327,13 +364,62 @@ onUnmounted(() => {
 }
 
 .video-player__cam-count {
-  margin-left: auto;
   font-family: var(--font-mono);
   font-size: 0.6875rem;
   color: var(--color-text-secondary);
   padding: 2px var(--space-2);
   border-radius: var(--radius-sm);
   background: var(--color-bg-hover);
+}
+
+/* 暂停/播放切换：推到右侧状态区，与现有按钮风格一致 */
+.video-player__pause-btn {
+  margin-left: auto;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-hover);
+  color: var(--color-text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+
+.video-player__pause-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.video-player__pause-btn:hover {
+  color: var(--color-text-bright);
+  border-color: var(--color-border-default);
+}
+
+.video-player__pause-btn--paused {
+  background: rgba(0, 229, 160, 0.12);
+  border-color: rgba(0, 229, 160, 0.35);
+  color: var(--color-accent-green);
+}
+
+/* 暂停中的画面提示（viewport 顶部居中，不遮挡角标与控制） */
+.video-player__paused-badge {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  padding: 3px 12px;
+  border-radius: var(--radius-full);
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(2px);
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  pointer-events: none;
 }
 
 .video-player__indicator {
@@ -520,6 +606,11 @@ onUnmounted(() => {
   .video-player__cam-btn {
     padding: 8px 16px; /* 触摸目标高度 ≥40px */
     font-size: 0.8rem;
+  }
+
+  .video-player__pause-btn {
+    width: 40px;
+    height: 40px;
   }
 }
 

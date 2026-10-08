@@ -1,39 +1,49 @@
 import { test, expect } from '@playwright/test'
 
-test.describe('ONVIF AI Voice Q&A App', () => {
-	test('page loads with main components', async ({ page }) => {
+/**
+ * 默认界面按「ONVIF 摄像头查看器」定位组织：
+ * 核心流程 = 设备搜索 + 画面查看 + 语音对讲；AI 面板默认收起。
+ */
+test.describe('ONVIF 摄像头查看器', () => {
+	test('默认界面呈现核心功能：画面、设备管理、语音对讲', async ({ page }) => {
 		await page.goto('/')
 
 		await expect(page.locator('text=ONVIF AI')).toBeVisible({ timeout: 10000 })
+		await expect(page.locator('.video-player').first()).toBeVisible()
 
-		await expect(page.locator('text=设备信息')).toBeVisible()
-		await expect(page.locator('text=语音对话')).toBeVisible()
+		await expect(page.locator('text=设备管理')).toBeVisible()
+		await expect(page.locator('text=语音对讲')).toBeVisible()
+
+		// 对讲入口显著：常驻大按钮
+		await expect(page.locator('.intercom-panel__btn')).toBeVisible()
 	})
 
-	test('device info shows camera address', async ({ page }) => {
+	test('AI 面板默认收起，点击标题展开', async ({ page }) => {
 		await page.goto('/')
 
-		await expect(page.locator('text=192.168.1.138')).toBeVisible({ timeout: 10000 })
+		const header = page.locator('.voice-panel__header', { hasText: 'AI 语音助手' })
+		await expect(header).toBeVisible({ timeout: 10000 })
+
+		// 收起状态：AI 输入源切换与问答按钮不可见
+		await expect(page.locator('text=浏览器麦克风')).toHaveCount(0)
+		await expect(page.locator('.voice-panel__talk-btn')).toHaveCount(0)
+
+		await header.click()
+		await expect(page.locator('text=浏览器麦克风')).toBeVisible()
+		await expect(page.locator('.voice-panel__talk-btn')).toBeVisible()
 	})
 
-	test('video player shows connecting state', async ({ page }) => {
+	test('窄屏（移动端）布局不破坏：对讲与设备搜索可用', async ({ page }) => {
+		await page.setViewportSize({ width: 375, height: 812 })
 		await page.goto('/')
 
-		const videoArea = page.locator('text=等待视频流').or(page.locator('text=Connecting'))
-		await expect(videoArea.first()).toBeVisible({ timeout: 10000 })
-	})
+		await expect(page.locator('.intercom-panel__btn')).toBeVisible({ timeout: 10000 })
+		await expect(page.locator('text=搜索设备')).toBeVisible()
 
-	test('voice panel has talk button and mode switch', async ({ page }) => {
-		await page.goto('/')
-
-		const talkBtn = page.locator('button, [role="button"]').filter({ hasText: /按住.*说话|Talk/i })
-		await expect(talkBtn.first()).toBeVisible({ timeout: 10000 })
-	})
-
-	test('status shows idle initially', async ({ page }) => {
-		await page.goto('/')
-
-		const statusEl = page.locator('text=就绪').or(page.locator('text=idle')).or(page.locator('text=空闲'))
-		await expect(statusEl.first()).toBeVisible({ timeout: 10000 })
+		// 单栏堆叠下无横向溢出
+		const overflow = await page.evaluate(
+			() => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+		)
+		expect(overflow).toBeLessThanOrEqual(1)
 	})
 })
