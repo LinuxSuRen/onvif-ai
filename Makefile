@@ -13,7 +13,7 @@ run:
 	@if [ -f .env ]; then export $$(grep -v '^#' .env | grep -v '^$$' | xargs); fi; go run ./cmd/server
 
 build:
-	CGO_ENABLED=1 go build -o bin/server ./cmd/server
+	CGO_ENABLED=1 go build -o bin/onvif-ai ./cmd/server
 
 test:
 	go test ./... -v -count=1
@@ -36,13 +36,13 @@ web-build:
 
 # === Development ===
 dev:
-	@echo "Run in two terminals:"
-	@echo "  Terminal 1: make run"
-	@echo "  Terminal 2: make web-dev"
+	@echo "前端已嵌入后端（go:embed），make run 即可完整体验；"
+	@echo "前端开发热更新另开终端: make web-dev"
 
 deps:
 	go mod tidy
 	cd web && npm install
+	cd web && npm run build
 
 # === Docker ===
 docker-build:

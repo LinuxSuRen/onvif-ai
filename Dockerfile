@@ -19,20 +19,21 @@ COPY third_party/ ./third_party/
 RUN go mod download
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
+# go:embed 需要前端构建产物（embed.go + dist）参与编译
+COPY web/ ./web/
 RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
-    -o /out/server ./cmd/server
+    -o /out/onvif-ai ./cmd/server
 
 # ---- 运行时 ----
 # alpine 而非 scratch：需要 ca-certificates（LLM/TTS 走 HTTPS）与常用调试工具
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 onvif
 WORKDIR /app
-COPY --from=build /out/server ./server
-COPY --from=web /src/web/dist ./web/dist
+COPY --from=build /out/onvif-ai ./onvif-ai
 COPY .env.example ./
 USER onvif
 ENV PORT=8080
 EXPOSE 8080
 # WS-Discovery 依赖 UDP 3702 组播，建议 --network host（Linux）
-ENTRYPOINT ["./server"]
+ENTRYPOINT ["./onvif-ai"]

@@ -98,7 +98,7 @@ func main() {
 		port = getEnv("PORT", "8080")
 	}
 	log.Printf("Server starting on :%s", port)
-	log.Println("Open http://localhost:5173 in browser, then click '搜索设备' to discover cameras")
+	log.Printf("Open http://localhost:%s (前端已内嵌，无需单独启动)", port)
 
 	go func() {
 		if err := http.ListenAndServe(":"+port, router); err != nil {

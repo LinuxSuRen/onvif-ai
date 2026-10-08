@@ -68,17 +68,15 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           go build -trimpath \
             -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${GITHUB_SHA}" \
-            -o "dist/server${{ matrix.ext }}" ./cmd/server
+            -o "dist/onvif-ai${{ matrix.ext }}" ./cmd/server
 
       - name: Package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           NAME="onvif-ai_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}"
           STAGE="dist/${NAME}"
-          mkdir -p "${STAGE}/web"
-          mv "dist/server${{ matrix.ext }}" "${STAGE}/"
-          # 保持与运行时一致的前端目录：server 按相对路径 web/dist 提供静态资源
-          cp -r web/dist "${STAGE}/web/dist"
+          # 二进制与项目同名（onvif-ai / onvif-ai.exe）；前端已嵌入二进制，无需单独打包
+          mv "dist/onvif-ai${{ matrix.ext }}" "${STAGE}/"
           cp .env.example README.md "${STAGE}/"
           cd dist
           if [ "${{ matrix.archive }}" = "zip" ]; then

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io/fs"
 	"log"
 	"net/http"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/onvif-ai/internal/onvif"
 	"github.com/onvif-ai/internal/onvif/discovery"
 	"github.com/onvif-ai/internal/ws"
+	"github.com/onvif-ai/web"
 )
 
 type DeviceState struct {
@@ -225,7 +227,12 @@ func (h *Handler) RegisterRoutes() http.Handler {
 	r.Get("/api/settings", h.handleGetSettings)
 	r.Post("/api/settings", h.handleSetSettings)
 
-	fileServer := http.FileServer(http.Dir("web/dist"))
+	// 前端静态资源嵌入二进制（web/embed.go），无外置目录依赖
+	distFS, err := fs.Sub(web.Dist, "dist")
+	if err != nil {
+		log.Fatalf("embedded web dist broken: %v", err)
+	}
+	fileServer := http.FileServer(http.FS(distFS))
 	r.Handle("/*", fileServer)
 
 	return r

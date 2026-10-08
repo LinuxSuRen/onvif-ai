@@ -39,11 +39,13 @@ cp .env.example .env
 ### 启动
 
 ```bash
-make run    # 后端 :8080
-make web-dev # 前端 :5173 (新终端)
+make deps     # 安装依赖并构建前端（go:embed 嵌入二进制）
+make run      # 后端 :8080，前端已内嵌
 ```
 
-打开 `http://localhost:5173`
+打开 `http://localhost:8080`
+
+> 前端开发（热更新）时另开终端执行 `make web-dev`（:5173），生产形态以嵌入版为准。
 
 ### 移动端
 
@@ -51,7 +53,7 @@ make web-dev # 前端 :5173 (新终端)
 
 - PTZ 云台按钮使用 Pointer Events，触屏可按住操作
 - iOS 需系统 17.1+（iPhone 的 MSE 支持）；更早版本仅可观看快照降级画面
-- 建议通过局域网访问开发机：`http://<开发机IP>:5173`
+- 通过局域网访问：`http://<运行机器IP>:8080`
 
 ### Docker
 
