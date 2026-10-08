@@ -83,6 +83,7 @@ type Handler struct {
 	onCameraListen func()
 	onClearHistory func()
 	onPTZMove      func(camera, direction string)
+	onPTZStop      func(camera string)
 	onSwitchMode   func(string)
 	onLLMUpdate    func(baseURL, apiKey, model string)
 	// 对讲会话回调：onTalkbackStart 受理会话（返回是否接受与拒绝码），
@@ -135,6 +136,15 @@ func (h *Handler) SetOnConnect(fn func(address string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onConnect = fn
+}
+
+// SetPTZStopCallback 注册云台停止回调（收到 ptz_stop 时调用）。
+// 单独一个 setter 而非并入 SetCallbacks：SetCallbacks 已有多个同型的
+// func(string) 位置参数，再加会极易在调用处接错顺序。
+func (h *Handler) SetPTZStopCallback(fn func(camera string)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onPTZStop = fn
 }
 
 // SetTalkbackCallbacks 注册对讲（浏览器麦克风 → 摄像头扬声器）会话回调。
@@ -571,6 +581,19 @@ func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
 			}
 			h.mu.RUnlock()
 		}
+
+	case ws.MsgTypePTZStop:
+		var payload struct {
+			Camera string
+		}
+		if msg.Payload != nil {
+			json.Unmarshal(msg.Payload, &payload)
+		}
+		h.mu.RLock()
+		if h.onPTZStop != nil {
+			h.onPTZStop(payload.Camera)
+		}
+		h.mu.RUnlock()
 
 	case ws.MsgTypeTalkbackStart:
 		h.mu.RLock()

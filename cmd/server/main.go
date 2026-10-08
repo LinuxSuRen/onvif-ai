@@ -842,6 +842,7 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 			log.Printf("Audio mode: %s", mode)
 		},
 	)
+	h.SetPTZStopCallback(cm.handlePTZStop)
 	// 对讲（浏览器麦克风 → 摄像头扬声器）会话回调
 	h.SetTalkbackCallbacks(
 		cm.beginTalkback,
@@ -851,19 +852,28 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 	hub.BroadcastStatus(ws.StatusIdle)
 }
 
+// ptzTarget 解析 PTZ 命令的目标摄像头：未指定时回退到第一路。
+func (cm *cameraManager) ptzTarget(camera string) *camUnit {
+	for _, u := range cm.units {
+		if camera != "" && u.token == camera {
+			return u
+		}
+	}
+	if len(cm.units) > 0 {
+		return cm.units[0] // 未指定时回退到第一路
+	}
+	return nil
+}
+
+// ptzZoomHoldDuration 是变焦 ContinuousMove 的兜底超时：前端按住变焦
+// 按钮、松开时发 ptz_stop 立停；超时只在停止消息丢失时兜底，因此远大于
+// 方向键的 2s，保证按住期间持续变焦。
+const ptzZoomHoldDuration = 10 * time.Second
+
 func (cm *cameraManager) handlePTZMove(camera, direction string) {
 	cm.mu.Lock()
 	client := cm.onvifClient
-	var target *camUnit
-	for _, u := range cm.units {
-		if camera != "" && u.token == camera {
-			target = u
-			break
-		}
-	}
-	if target == nil && len(cm.units) > 0 {
-		target = cm.units[0] // 未指定时回退到第一路
-	}
+	target := cm.ptzTarget(camera)
 	cm.mu.Unlock()
 
 	if client == nil || target == nil {
@@ -877,6 +887,7 @@ func (cm *cameraManager) handlePTZMove(camera, direction string) {
 	}
 
 	var pan, tilt, zoom float64
+	duration := 2 * time.Second
 	switch direction {
 	case "left":
 		pan = -1.0
@@ -887,9 +898,12 @@ func (cm *cameraManager) handlePTZMove(camera, direction string) {
 	case "down":
 		tilt = -1.0
 	case "zoom_in":
-		zoom = 1.0
+		// 变焦速度取 ±0.5：全范围约 10s 走完，便于细调
+		zoom = 0.5
+		duration = ptzZoomHoldDuration
 	case "zoom_out":
-		zoom = -1.0
+		zoom = -0.5
+		duration = ptzZoomHoldDuration
 	default:
 		return
 	}
@@ -897,13 +911,38 @@ func (cm *cameraManager) handlePTZMove(camera, direction string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := client.PTZContinuousMove(ctx, target.token, pan, tilt, zoom, 2*time.Second); err != nil {
+	if err := client.PTZContinuousMove(ctx, target.token, pan, tilt, zoom, duration); err != nil {
 		log.Printf("PTZ move %s(%s) failed: %v", direction, target.token, err)
 		cm.hub.BroadcastError("云台转动失败: " + err.Error())
 		return
 	}
 
 	log.Printf("PTZ: moved %s (%s)", direction, target.token)
+}
+
+// handlePTZStop 停止指定路的云台运动（变焦按钮松开时触发），
+// Pan/Tilt/Zoom 一并停止。
+func (cm *cameraManager) handlePTZStop(camera string) {
+	cm.mu.Lock()
+	client := cm.onvifClient
+	target := cm.ptzTarget(camera)
+	cm.mu.Unlock()
+
+	if client == nil || target == nil || !target.ptz {
+		// 停止是按住释放的收尾动作，无需向用户报错打扰
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.PTZStop(ctx, target.token); err != nil {
+		log.Printf("PTZ stop (%s) failed: %v", target.token, err)
+		cm.hub.BroadcastError("云台停止失败: " + err.Error())
+		return
+	}
+
+	log.Printf("PTZ: stopped (%s)", target.token)
 }
 
 func (cm *cameraManager) processCameraAudio() {

@@ -111,6 +111,13 @@ function ptzMove(direction: string) {
   send({ type: 'ptz_move', payload: { camera: cam.token, direction } })
 }
 
+// 变焦按钮松开：停止当前路的一切 PTZ 运动（Pan/Tilt/Zoom）
+function ptzStop() {
+  const cam = activeCamera.value
+  if (!cam) return
+  send({ type: 'ptz_stop', payload: { camera: cam.token } })
+}
+
 // ---- 时钟同步：为各路延迟测量提供统一的时钟偏移 ----
 let bestSyncRtt = Number.POSITIVE_INFINITY
 const clockOffsetRef = ref<number | null>(null)
@@ -300,6 +307,7 @@ onUnmounted(() => {
           :clock-offset="clockOffsetRef"
           :reset-key="resetKey"
           @ptz="ptzMove"
+          @ptz-stop="ptzStop"
         />
       </div>
 

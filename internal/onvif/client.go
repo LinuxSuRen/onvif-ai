@@ -349,7 +349,7 @@ func (c *Client) PTZContinuousMove(ctx context.Context, profileToken string, pan
 	}
 
 	ptzURL := c.ptzURL()
-	log.Printf("[PTZ] Sending ContinuousMove to %s (pan=%.1f, tilt=%.1f, dur=%v)", ptzURL, pan, tilt, duration)
+	log.Printf("[PTZ] Sending ContinuousMove to %s (pan=%.1f, tilt=%.1f, zoom=%.1f, dur=%v)", ptzURL, pan, tilt, zoom, duration)
 	if c.mediaXAddr != "" {
 		base := c.deviceURL()
 		if idx := strings.Index(base, "/onvif/"); idx > 0 {

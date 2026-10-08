@@ -26,6 +26,8 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'ptz', direction: string): void
+  // 变焦按钮松开：请求停止当前运动（Pan/Tilt/Zoom 一并停止）
+  (e: 'ptz-stop'): void
 }>()
 
 const videoRef = ref<HTMLVideoElement | null>(null)
@@ -228,6 +230,32 @@ function ptzMove(direction: string) {
   emit('ptz', direction)
 }
 
+// 变焦：按住发 ContinuousMove（zoom 轴 ±0.5 由后端映射），松开发 Stop。
+// 指针捕获保证手指移出按钮后 pointerup/pointercancel 仍派发到按钮，
+// 松开动作必达；zoomHeld 防御未按下时的迟到 release 事件。
+let zoomHeld = false
+
+function ptzZoomStart(direction: string, event: PointerEvent) {
+  zoomHeld = true
+  try {
+    ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+  } catch {
+    /* 不支持捕获时 pointerup 仍在按钮上派发 */
+  }
+  emit('ptz', direction)
+}
+
+function ptzZoomEnd(event: PointerEvent) {
+  if (!zoomHeld) return
+  zoomHeld = false
+  try {
+    ;(event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId)
+  } catch {
+    /* 指针已释放/未捕获时忽略 */
+  }
+  emit('ptz-stop')
+}
+
 defineExpose({ feedNal, feedJpeg })
 </script>
 
@@ -266,6 +294,28 @@ defineExpose({ feedNal, feedJpeg })
       <button class="cam-tile__ptz-btn cam-tile__ptz-btn--left" @pointerdown.prevent="ptzMove('left')">◀</button>
       <button class="cam-tile__ptz-btn cam-tile__ptz-btn--right" @pointerdown.prevent="ptzMove('right')">▶</button>
       <button class="cam-tile__ptz-btn cam-tile__ptz-btn--down" @pointerdown.prevent="ptzMove('down')">▼</button>
+      <!-- 变焦摇杆键：+/- 纵向堆叠。按住连续变焦、松开停止；无变焦能力
+           的设备由后端忽略，不影响方向键 -->
+      <div class="cam-tile__ptz-zoom">
+        <button
+          class="cam-tile__ptz-btn cam-tile__ptz-btn--zoom-in"
+          title="放大（按住连续变焦）"
+          aria-label="放大"
+          @pointerdown.prevent="ptzZoomStart('zoom_in', $event)"
+          @pointerup="ptzZoomEnd($event)"
+          @pointercancel="ptzZoomEnd($event)"
+          @contextmenu.prevent
+        >+</button>
+        <button
+          class="cam-tile__ptz-btn cam-tile__ptz-btn--zoom-out"
+          title="缩小（按住连续变焦）"
+          aria-label="缩小"
+          @pointerdown.prevent="ptzZoomStart('zoom_out', $event)"
+          @pointerup="ptzZoomEnd($event)"
+          @pointercancel="ptzZoomEnd($event)"
+          @contextmenu.prevent
+        >−</button>
+      </div>
     </div>
 
     <div v-if="!hasVideo" class="cam-tile__placeholder">暂无画面</div>
@@ -410,6 +460,30 @@ defineExpose({ feedNal, feedJpeg })
 .cam-tile__ptz-btn--down { bottom: 4px; left: 50%; transform: translateX(-50%); }
 .cam-tile__ptz-btn--left { left: 4px; top: 50%; transform: translateY(-50%); }
 .cam-tile__ptz-btn--right { right: 4px; top: 50%; transform: translateY(-50%); }
+
+/* 变焦 +/- 纵向堆叠成一列：右下角内移一档（right:52 错开 ▶ 键的纵向
+   通道），并抬高到底部悬浮条（音频芯片 / 摄像头切换条，高约 54px）
+   之上，避免被其遮挡 */
+.cam-tile__ptz-zoom {
+  position: absolute;
+  right: 52px;
+  bottom: 58px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* touch-action 禁止滚动/长按手势抢占指针，保证 pointercancel 不被
+   浏览器触发、松开事件必达 */
+.cam-tile__ptz-btn--zoom-in,
+.cam-tile__ptz-btn--zoom-out {
+  position: static;
+  touch-action: none;
+  user-select: none;
+  font-size: 1.15rem;
+  font-weight: 600;
+  line-height: 1;
+}
 
 .cam-tile__placeholder {
   position: absolute;
