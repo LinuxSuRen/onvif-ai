@@ -14,6 +14,8 @@ ARG VERSION=dev
 ARG COMMIT=unknown
 WORKDIR /src
 COPY go.mod go.sum ./
+# go.mod 以 replace 指向 ./third_party/aac-go，mod download 前必须先就位
+COPY third_party/ ./third_party/
 RUN go mod download
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
