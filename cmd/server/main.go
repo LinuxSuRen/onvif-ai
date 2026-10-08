@@ -130,6 +130,9 @@ type cameraManager struct {
 	// cameraAudioRate 是当前音频源的实际采样率（SDP 协商结果），
 	// 供 STT 的 WAV 封装使用；0 表示尚未收到音频，按 G.711 常规值兜底。
 	cameraAudioRate int
+	// audioState 是设备级音频轨状态（第一路画面），随 RTSP 协商与
+	// 解码降级/自愈更新，经 device_state 广播给前端。
+	audioState *server.AudioState
 
 	// talkbackState 是对讲回传通道状态（随 backchannel 连接结果更新），
 	// talkbackReady 是其可用位的快照，受理对讲会话时无需再解引用。
