@@ -99,7 +99,6 @@ func main() {
 	if port == "" {
 		port = getEnv("PORT", "8080")
 	}
-
 	listener, err := listenWithDrift(port)
 	if err != nil {
 		log.Fatalf("Server failed: %v", err)
@@ -107,7 +106,7 @@ func main() {
 	defer listener.Close()
 
 	log.Printf("Server starting on %s", listener.Addr())
-	log.Println("Open http://localhost:5173 in browser, then click '搜索设备' to discover cameras")
+	log.Printf("Open http://localhost%s (前端已内嵌，无需单独启动)", listener.Addr())
 
 	go func() {
 		if err := http.Serve(listener, router); err != nil {

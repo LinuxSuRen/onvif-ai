@@ -8,7 +8,9 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
+# dist 构建产物整体忽略，仅保留占位 index.html（go:embed 的兜底，未构建前端也能编译）
+dist/*
+!dist/index.html
 dist-ssr
 *.local
 
