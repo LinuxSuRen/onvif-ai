@@ -73,6 +73,16 @@ export async function dispatchCamera(
 	)
 }
 
+/** 注入 ptz_status 回执（模拟后端 GetStatus 应答）。 */
+export async function replyZoomStatus(
+	page: Page,
+	status: { camera: string; position?: number; ratio?: number },
+): Promise<void> {
+	await page.evaluate((status) => {
+		(window as any).__wsDispatch({ type: 'ptz_status', payload: status })
+	}, status)
+}
+
 /** 取指定类型 + 方向的已发送消息列表。 */
 export async function sentMessages(page: Page, type: string, direction?: string): Promise<any[]> {
 	return page.evaluate(

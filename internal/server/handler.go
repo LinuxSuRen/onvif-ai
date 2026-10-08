@@ -73,6 +73,16 @@ type CameraState struct {
 	Height int `json:"height,omitempty"`
 }
 
+// PTZStatusResult 是 ptz_status 回复的负载：当前变焦状态，仅回复给
+// 发起查询的客户端。Position 是 GetStatus 的归一化变焦位置 [0,1]，
+// 未知为 nil；Ratio 是换算后的真实放大倍率（设备上报自定义倍率空间
+// 时 = min + pos×(max−min)），无该空间时为 nil（前端回退显示百分比）。
+type PTZStatusResult struct {
+	Camera   string   `json:"camera"`
+	Position *float64 `json:"position,omitempty"`
+	Ratio    *float64 `json:"ratio,omitempty"`
+}
+
 type Handler struct {
 	hub            *ws.Hub
 	listener       *discovery.Listener
@@ -89,6 +99,7 @@ type Handler struct {
 	onClearHistory func()
 	onPTZMove      func(camera, direction string, step bool)
 	onPTZStop      func(camera string)
+	onPTZStatus    func(camera string) *PTZStatusResult
 	onSwitchMode   func(string)
 	onLLMUpdate    func(baseURL, apiKey, model string)
 	// 对讲会话回调：onTalkbackStart 受理会话（返回是否接受与拒绝码），
@@ -150,6 +161,14 @@ func (h *Handler) SetPTZStopCallback(fn func(camera string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onPTZStop = fn
+}
+
+// SetPTZStatusCallback 注册变焦状态查询回调（收到 ptz_status 时调用），
+// 返回值作为 ptz_status 回复发给发起查询的客户端。
+func (h *Handler) SetPTZStatusCallback(fn func(camera string) *PTZStatusResult) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onPTZStatus = fn
 }
 
 // SetTalkbackCallbacks 注册对讲（浏览器麦克风 → 摄像头扬声器）会话回调。
@@ -601,6 +620,27 @@ func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
 			h.onPTZStop(payload.Camera)
 		}
 		h.mu.RUnlock()
+
+	case ws.MsgTypePTZStatus:
+		// 查询当前变焦状态，结果只回给发起方（与其他客户端无关）
+		var payload struct {
+			Camera string
+		}
+		if msg.Payload != nil {
+			json.Unmarshal(msg.Payload, &payload)
+		}
+		h.mu.RLock()
+		fn := h.onPTZStatus
+		h.mu.RUnlock()
+		if fn == nil {
+			return
+		}
+		if result := fn(payload.Camera); result != nil {
+			client.Send(&ws.Message{
+				Type:    ws.MsgTypePTZStatus,
+				Payload: mustMarshal(result),
+			})
+		}
 
 	case ws.MsgTypeTalkbackStart:
 		h.mu.RLock()

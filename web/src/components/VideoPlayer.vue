@@ -61,6 +61,20 @@ function handleMessage(msg: WsMessage) {
     applyDeviceState(msg.payload)
     return
   }
+  if (msg.type === 'ptz_status' && msg.payload) {
+    // 变焦状态回执（仅回复给查询方）：按 camera token 路由到对应画面
+    const p = msg.payload as { camera?: string; position?: number; ratio?: number }
+    if (p.camera) {
+      zoomStatuses.value = {
+        ...zoomStatuses.value,
+        [p.camera]: {
+          position: typeof p.position === 'number' ? p.position : null,
+          ratio: typeof p.ratio === 'number' ? p.ratio : null,
+        },
+      }
+    }
+    return
+  }
   if (msg.type === 'clock_sync' && msg.payload) {
     handleClockSyncReply(msg.payload)
     return
@@ -73,7 +87,10 @@ function handleMessage(msg: WsMessage) {
     videoError.value = msg.text
   }
 }
-subscribe(['video_nal', 'video_jpeg', 'device_state', 'clock_sync', 'error'], handleMessage)
+subscribe(['video_nal', 'video_jpeg', 'device_state', 'ptz_status', 'clock_sync', 'error'], handleMessage)
+
+// 各路当前变焦状态（token → 归一位置/换算倍率），tile 据此显示倍率
+const zoomStatuses = ref<Record<string, { position: number | null; ratio: number | null }>>({})
 
 // tile 自注册表：v-for 的函数 ref 在模式切换时挂载/卸载回调顺序不确定，
 // 由 CameraTile 在自身生命周期内注册/注销，避免 Map 被旧实例误删。
@@ -126,6 +143,13 @@ function ptzZoomStep(direction: string) {
   const cam = activeCamera.value
   if (!cam) return
   send({ type: 'ptz_move', payload: { camera: cam.token, direction, step: true } })
+}
+
+// 查询当前路的变焦状态（GetStatus），回执驱动倍率显示
+function queryZoomStatus() {
+  const cam = activeCamera.value
+  if (!cam) return
+  send({ type: 'ptz_status', payload: { camera: cam.token } })
 }
 
 // ---- 时钟同步：为各路延迟测量提供统一的时钟偏移 ----
@@ -321,9 +345,11 @@ onUnmounted(() => {
           :show-label="false"
           :clock-offset="clockOffsetRef"
           :reset-key="resetKey"
+          :zoom-status="zoomStatuses[cam.token] ?? null"
           @ptz="ptzMove"
           @ptz-stop="ptzStop"
           @ptz-step="ptzZoomStep"
+          @ptz-query-status="queryZoomStatus"
         />
       </div>
 

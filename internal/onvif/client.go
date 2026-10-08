@@ -356,10 +356,20 @@ func (c *Client) ptzServiceURL() string {
 	return ptzURL
 }
 
+// zoomRatioSpaceURI 是手机端自定义的绝对变焦位置空间：XRange 的
+// Min/Max 直接给出真实放大倍率范围（如 0.55–100x），归一位置 [0,1]
+// 线性映射到该区间；标准 PositionGenericSpace（[0,1]）仍另行保留。
+const zoomRatioSpaceURI = "http://www.linuxsuren.org/onvif/zoom/ratio"
+
 // PTZSpaces 报告 PTZ 配置的连续移动速度空间能力（各轴空间是否存在）。
 type PTZSpaces struct {
 	PanTilt bool
 	Zoom    bool
+	// HasRatio 表示设备上报了自定义倍率空间（zoomRatioSpaceURI），
+	// RatioMin/RatioMax 为真实倍率范围，仅 HasRatio 时有效。
+	HasRatio  bool
+	RatioMin  float64
+	RatioMax  float64
 }
 
 // GetConfigurationOptions 查询 PTZ 配置的速度空间选项，据此区分云台
@@ -399,6 +409,15 @@ func (c *Client) GetConfigurationOptions(ctx context.Context, configToken string
 						Max float64 `xml:"Max"`
 					} `xml:"XRange"`
 				} `xml:"ContinuousZoomVelocitySpace"`
+				// AbsoluteZoomPositionSpace 可能多条并存：标准
+				// PositionGenericSpace 与自定义倍率空间按 URI 区分
+				AbsoluteZoom []struct {
+					XRange struct {
+						Min float64 `xml:"Min"`
+						Max float64 `xml:"Max"`
+					} `xml:"XRange"`
+					URI string `xml:"URI"`
+				} `xml:"AbsoluteZoomPositionSpace"`
 			} `xml:"Spaces"`
 		} `xml:"GetConfigurationOptionsResponse>PTZConfigurationOptions"`
 	}
@@ -408,10 +427,54 @@ func (c *Client) GetConfigurationOptions(ctx context.Context, configToken string
 	if result.Options.Spaces == nil {
 		return PTZSpaces{}, false, nil
 	}
-	return PTZSpaces{
+	spaces := PTZSpaces{
 		PanTilt: len(result.Options.Spaces.PanTilt) > 0,
 		Zoom:    len(result.Options.Spaces.Zoom) > 0,
-	}, true, nil
+	}
+	for _, sp := range result.Options.Spaces.AbsoluteZoom {
+		if sp.URI == zoomRatioSpaceURI {
+			spaces.HasRatio = true
+			spaces.RatioMin = sp.XRange.Min
+			spaces.RatioMax = sp.XRange.Max
+			break
+		}
+	}
+	return spaces, true, nil
+}
+
+// PTZGetStatus 查询当前 PTZ 状态，返回归一化的变焦位置 [0,1]。
+// ok=false 表示设备未上报位置（无变焦或未知）。
+func (c *Client) PTZGetStatus(ctx context.Context, profileToken string) (float64, bool, error) {
+	if err := c.discoverServices(ctx); err != nil {
+		return 0, false, err
+	}
+
+	body := c.soapEnvelope(fmt.Sprintf(`
+		<tptz:GetStatus>
+			<tptz:ProfileToken>%s</tptz:ProfileToken>
+		</tptz:GetStatus>
+	`, xmlEscape(profileToken)))
+
+	resp, err := c.soapCall(ctx, c.deviceURL(), c.ptzServiceURL(), "GetStatus", body)
+	if err != nil {
+		return 0, false, err
+	}
+
+	// Zoom 用指针区分「位置 0」与「未上报位置」
+	var result struct {
+		Position struct {
+			Zoom *struct {
+				X float64 `xml:"x,attr"`
+			} `xml:"Zoom"`
+		} `xml:"GetStatusResponse>PTZStatus>Position"`
+	}
+	if err := c.parseSOAPResponse(resp, "GetStatusResponse", &result); err != nil {
+		return 0, false, fmt.Errorf("parse ptz status: %w", err)
+	}
+	if result.Position.Zoom == nil {
+		return 0, false, nil
+	}
+	return result.Position.Zoom.X, true, nil
 }
 
 func (c *Client) PTZContinuousMove(ctx context.Context, profileToken string, pan, tilt, zoom float64, duration time.Duration) error {
@@ -527,7 +590,7 @@ func (c *Client) ContinuousMove(ctx context.Context, profileToken, direction str
 
 func soapActionDomain(action string) string {
 	deviceActions := map[string]bool{"GetCapabilities": true, "GetServices": true, "GetDeviceInformation": true}
-	ptzActions := map[string]bool{"ContinuousMove": true, "Stop": true, "GetConfigurationOptions": true}
+	ptzActions := map[string]bool{"ContinuousMove": true, "Stop": true, "GetConfigurationOptions": true, "GetStatus": true}
 	if deviceActions[action] {
 		return "device"
 	}

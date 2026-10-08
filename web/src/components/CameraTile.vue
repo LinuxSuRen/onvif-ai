@@ -26,6 +26,10 @@ const props = defineProps<{
   clockOffset: number | null
   // 变化时重建解码管线（WS 重连后由父组件递增）
   resetKey: number
+  // 当前变焦状态（父组件按 token 路由）：ratio 为真实倍率（无自定义
+  // 倍率空间的设备为 null，回退显示 position 百分比），均未知为 null；
+  // 多画面预览（非 active）不渲染 PTZ，可不传
+  zoomStatus?: { position: number | null; ratio: number | null } | null
 }>()
 
 const emit = defineEmits<{
@@ -34,6 +38,8 @@ const emit = defineEmits<{
   (e: 'ptz-stop'): void
   // 轻点变焦（按压 <300ms）：松开后补发一次完整步进
   (e: 'ptz-step', direction: string): void
+  // 请求查询当前变焦状态（GetStatus → 刷新倍率显示）
+  (e: 'ptz-query-status'): void
 }>()
 
 const videoRef = ref<HTMLVideoElement | null>(null)
@@ -251,6 +257,9 @@ function ptzZoomStart(direction: 'zoom_in' | 'zoom_out', event: PointerEvent) {
   zoomHeld = true
   zoomDir = direction
   zoomDownAt = performance.now()
+  clearZoomTimers()
+  // 按住期间 500ms 节流刷新倍率显示（松开即停）
+  zoomTickTimer = setInterval(() => emit('ptz-query-status'), ZOOM_REFRESH_MS)
   try {
     ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
   } catch {
@@ -266,7 +275,14 @@ function ptzZoomUp(event: PointerEvent) {
   ptzZoomFinish(event)
   // 先停掉按住期间的短促移动，轻点再补一步（顺序保证不叠加）
   emit('ptz-stop')
-  if (tap && dir) emit('ptz-step', dir)
+  if (tap && dir) {
+    emit('ptz-step', dir)
+    // 步进（0.8s）完成后再查一次，读到步进后的位置
+    zoomStepQueryTimer = setTimeout(() => emit('ptz-query-status'), ZOOM_STEP_QUERY_DELAY_MS)
+  } else {
+    // 长按松开：立即查一次收尾
+    emit('ptz-query-status')
+  }
 }
 
 // 手势被系统取消（滚动抢占等）：只停止，不补步进
@@ -274,17 +290,65 @@ function ptzZoomCancel(event: PointerEvent) {
   if (!zoomHeld) return
   ptzZoomFinish(event)
   emit('ptz-stop')
+  emit('ptz-query-status')
 }
 
 function ptzZoomFinish(event: PointerEvent) {
   zoomHeld = false
   zoomDir = null
+  if (zoomTickTimer) {
+    clearInterval(zoomTickTimer)
+    zoomTickTimer = null
+  }
   try {
     ;(event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId)
   } catch {
     /* 指针已释放/未捕获时忽略 */
   }
 }
+
+function clearZoomTimers() {
+  if (zoomTickTimer) {
+    clearInterval(zoomTickTimer)
+    zoomTickTimer = null
+  }
+  if (zoomStepQueryTimer) {
+    clearTimeout(zoomStepQueryTimer)
+    zoomStepQueryTimer = null
+  }
+}
+
+// 倍率显示刷新节奏：按住期间 500ms 节流；轻点步进 0.8s 完成后补查
+const ZOOM_REFRESH_MS = 500
+const ZOOM_STEP_QUERY_DELAY_MS = 900
+
+let zoomTickTimer: ReturnType<typeof setInterval> | null = null
+let zoomStepQueryTimer: ReturnType<typeof setTimeout> | null = null
+
+// 变焦控制可见（单画面 + 有变焦能力 + 在线）即查一次初始倍率
+watch(
+  () => props.active && props.cam.ptz && props.cam.ptzZoom && props.cam.streaming,
+  (visible) => {
+    if (visible) emit('ptz-query-status')
+  },
+  { immediate: true },
+)
+
+onUnmounted(() => clearZoomTimers())
+
+// 倍率文案：有自定义倍率空间时显示真实倍率（<10x 一位小数，≥10x 取
+// 整），否则回退归一位置百分比；均未知则不渲染
+const zoomRatioText = computed(() => {
+  const s = props.zoomStatus
+  if (!s) return ''
+  if (typeof s.ratio === 'number' && s.ratio > 0) {
+    return s.ratio >= 10 ? `${Math.round(s.ratio)}x` : `${s.ratio.toFixed(1)}x`
+  }
+  if (typeof s.position === 'number' && s.position >= 0) {
+    return `${Math.round(s.position * 100)}%`
+  }
+  return ''
+})
 
 defineExpose({ feedNal, feedJpeg })
 </script>
@@ -331,9 +395,10 @@ defineExpose({ feedNal, feedJpeg })
         <button class="cam-tile__ptz-btn cam-tile__ptz-btn--right" @pointerdown.prevent="ptzMove('right')">▶</button>
         <button class="cam-tile__ptz-btn cam-tile__ptz-btn--down" @pointerdown.prevent="ptzMove('down')">▼</button>
       </template>
-      <!-- 变焦摇杆键：+/- 纵向堆叠。按住连续变焦、松开停止，轻点步进；
-           无变焦能力的设备由后端忽略，不影响方向键 -->
+      <!-- 变焦摇杆键：+/- 纵向堆叠，上方常驻当前倍率。按住连续变焦、
+           松开停止，轻点步进；无变焦能力的设备由后端忽略 -->
       <div v-if="cam.ptzZoom" class="cam-tile__ptz-zoom">
+        <span v-if="zoomRatioText" class="cam-tile__zoom-ratio" title="当前变焦倍率">{{ zoomRatioText }}</span>
         <button
           class="cam-tile__ptz-btn cam-tile__ptz-btn--zoom-in"
           title="放大（轻点步进，按住连续变焦）"
@@ -520,6 +585,23 @@ defineExpose({ feedNal, feedJpeg })
   font-size: 1.15rem;
   font-weight: 600;
   line-height: 1;
+}
+
+/* 当前倍率：变焦列顶部的等宽小角标，与 PTZ 按钮同风格；未知时不渲染 */
+.cam-tile__zoom-ratio {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 2px 0;
+  border: 1px solid rgba(0, 229, 160, 0.3);
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.5);
+  color: rgba(0, 229, 160, 0.9);
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.04em;
+  text-align: center;
+  white-space: nowrap;
+  user-select: none;
 }
 
 .cam-tile__placeholder {

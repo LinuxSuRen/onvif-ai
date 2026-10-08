@@ -153,9 +153,12 @@ type camUnit struct {
 	token       string // profile token，即该路画面在 WS 消息里的 cam 标识
 	name        string
 	ptz         bool
-	ptzConfTkn  string // PTZConfiguration token，用于 GetConfigurationOptions
-	ptzPanTilt  bool   // 云台能力（默认 true：未查询到时保持旧版全显示）
-	ptzZoom     bool   // 变焦能力（同上）
+	ptzConfTkn  string  // PTZConfiguration token，用于 GetConfigurationOptions
+	ptzPanTilt  bool    // 云台能力（默认 true：未查询到时保持旧版全显示）
+	ptzZoom     bool    // 变焦能力（同上）
+	hasZoomRng  bool    // 设备是否上报自定义倍率空间（zoom/ratio URI）
+	zoomRngMin  float64 // 真实倍率范围下限（如 0.55）
+	zoomRngMax  float64 // 真实倍率范围上限（如 100）
 	rtspURL     string
 	snapshotURL string
 
@@ -260,7 +263,15 @@ func (cm *cameraManager) connect(address string) {
 			case supported:
 				u.ptzPanTilt = spaces.PanTilt
 				u.ptzZoom = spaces.Zoom
-				log.Printf("PTZ spaces (%s): panTilt=%v zoom=%v", p.PTZToken, spaces.PanTilt, spaces.Zoom)
+				if spaces.HasRatio {
+					u.hasZoomRng = true
+					u.zoomRngMin = spaces.RatioMin
+					u.zoomRngMax = spaces.RatioMax
+					log.Printf("PTZ spaces (%s): panTilt=%v zoom=%v ratioRange=[%g,%g]",
+						p.PTZToken, spaces.PanTilt, spaces.Zoom, spaces.RatioMin, spaces.RatioMax)
+				} else {
+					log.Printf("PTZ spaces (%s): panTilt=%v zoom=%v", p.PTZToken, spaces.PanTilt, spaces.Zoom)
+				}
 			default:
 				log.Printf("GetConfigurationOptions(%s) unsupported, keep all PTZ controls", p.PTZToken)
 			}
@@ -866,6 +877,7 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 		},
 	)
 	h.SetPTZStopCallback(cm.handlePTZStop)
+	h.SetPTZStatusCallback(cm.handlePTZStatus)
 	// 对讲（浏览器麦克风 → 摄像头扬声器）会话回调
 	h.SetTalkbackCallbacks(
 		cm.beginTalkback,
@@ -979,6 +991,44 @@ func (cm *cameraManager) handlePTZStop(camera string) {
 	}
 
 	log.Printf("PTZ: stopped (%s)", target.token)
+}
+
+// handlePTZStatus 查询指定路的当前变焦状态：GetStatus 取归一位置 [0,1]，
+// 设备上报自定义倍率空间时换算为真实倍率（min + pos×(max−min)），
+// 否则 Ratio 为 nil（前端回退显示百分比）。失败/未知时对应字段为 nil。
+func (cm *cameraManager) handlePTZStatus(camera string) *server.PTZStatusResult {
+	cm.mu.Lock()
+	client := cm.onvifClient
+	target := cm.ptzTarget(camera)
+	hasRng := target != nil && target.hasZoomRng
+	rngMin, rngMax := 0.0, 0.0
+	if hasRng {
+		rngMin, rngMax = target.zoomRngMin, target.zoomRngMax
+	}
+	cm.mu.Unlock()
+
+	if client == nil || target == nil || !target.ptz || !target.ptzZoom {
+		return &server.PTZStatusResult{Camera: camera}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pos, ok, err := client.PTZGetStatus(ctx, target.token)
+	if err != nil {
+		log.Printf("PTZ status (%s) failed: %v", target.token, err)
+		return &server.PTZStatusResult{Camera: target.token}
+	}
+	if !ok {
+		return &server.PTZStatusResult{Camera: target.token}
+	}
+
+	result := &server.PTZStatusResult{Camera: target.token, Position: &pos}
+	if hasRng {
+		ratio := rngMin + pos*(rngMax-rngMin)
+		result.Ratio = &ratio
+	}
+	return result
 }
 
 func (cm *cameraManager) processCameraAudio() {

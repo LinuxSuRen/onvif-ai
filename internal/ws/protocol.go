@@ -16,6 +16,7 @@ const (
 	MsgTypeClearHistory  MessageType = "clear_history"  // Clear conversation history
 	MsgTypePTZMove       MessageType = "ptz_move"       // PTZ direction command
 	MsgTypePTZStop       MessageType = "ptz_stop"       // PTZ stop (e.g. zoom button released)
+	MsgTypePTZStatus     MessageType = "ptz_status"     // PTZ zoom status query (client) / reply (server), both directions
 	MsgTypeSwitchMode    MessageType = "switch_mode"    // Switch audio mode
 	MsgTypeClockSync     MessageType = "clock_sync"     // Clock offset probe (both directions)
 	MsgTypeTalkbackStart MessageType = "talkback_start" // Start intercom session (browser mic → camera speaker)

@@ -12,9 +12,9 @@ import (
 	"github.com/onvif-ai/internal/onvif"
 )
 
-// newMockOnvifServer 起一个记录 SOAP 请求体的假 ONVIF 服务：
-// 任意动作都回复空 Body 的合法 SOAP 信封（GetServices 返回空服务列表，
-// 客户端会把 PTZ 地址回退到同一测试服务）。
+// newMockOnvifServer 起一个记录 SOAP 请求体的假 ONVIF 服务：GetServices
+// 返回空服务列表（客户端把 PTZ 地址回退到同一测试服务）；GetStatus 返回
+// 归一变焦位置 0.5；其余动作回复空 Body 的合法 SOAP 信封。
 func newMockOnvifServer(t *testing.T) (*httptest.Server, *[]string) {
 	t.Helper()
 	var mu sync.Mutex
@@ -24,9 +24,16 @@ func newMockOnvifServer(t *testing.T) (*httptest.Server, *[]string) {
 		mu.Lock()
 		bodies = append(bodies, string(buf))
 		mu.Unlock()
+		inner := ""
+		if strings.Contains(string(buf), "GetStatus") {
+			inner = `<tptz:GetStatusResponse><tptz:PTZStatus>` +
+				`<tt:Position><tt:Zoom x="0.500000" space="http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace"/></tt:Position>` +
+				`<tt:MoveStatus><tt:PanTilt>IDLE</tt:PanTilt><tt:Zoom>IDLE</tt:Zoom></tt:MoveStatus>` +
+				`</tptz:PTZStatus></tptz:GetStatusResponse>`
+		}
 		w.Header().Set("Content-Type", "application/soap+xml; charset=utf-8")
 		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body></s:Body></s:Envelope>`))
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body>` + inner + `</s:Body></s:Envelope>`))
 	}))
 	t.Cleanup(srv.Close)
 	return srv, &bodies
@@ -110,4 +117,52 @@ func TestHandlePTZStop(t *testing.T) {
 func TestHandlePTZStopWithoutCamera(t *testing.T) {
 	cm := newTestCameraManager()
 	cm.handlePTZStop("none") // 不应 panic
+}
+
+// TestHandlePTZStatus 校验变焦状态查询：GetStatus 归一位置 0.5，带
+// 自定义倍率范围 [0.55,100] 时换算 ratio=0.55+0.5×99.45；无倍率范围
+// 时 Ratio 为 nil（前端回退百分比）。
+func TestHandlePTZStatus(t *testing.T) {
+	srv, bodies := newMockOnvifServer(t)
+	cm := newTestCameraManager()
+	cm.mu.Lock()
+	cm.onvifClient = onvif.NewClient(onvif.Config{DeviceAddr: srv.URL, Timeout: 5 * time.Second})
+	cm.units = []*camUnit{{
+		token: "cam-back", name: "后摄", ptz: true, ptzZoom: true,
+		hasZoomRng: true, zoomRngMin: 0.55, zoomRngMax: 100,
+	}}
+	cm.mu.Unlock()
+
+	result := cm.handlePTZStatus("cam-back")
+	findSOAP(t, bodies, "GetStatus")
+	if result == nil || result.Camera != "cam-back" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if result.Position == nil || *result.Position != 0.5 {
+		t.Fatalf("expected position 0.5, got %+v", result)
+	}
+	if result.Ratio == nil {
+		t.Fatalf("expected ratio, got %+v", result)
+	}
+	if want := 0.55 + 0.5*(100-0.55); *result.Ratio < want-1e-9 || *result.Ratio > want+1e-9 {
+		t.Fatalf("expected ratio %v, got %v", want, *result.Ratio)
+	}
+
+	// 无自定义倍率范围：仅归一位置，Ratio 为 nil
+	cm.mu.Lock()
+	cm.units[0].hasZoomRng = false
+	cm.mu.Unlock()
+
+	result = cm.handlePTZStatus("cam-back")
+	if result.Position == nil || *result.Position != 0.5 || result.Ratio != nil {
+		t.Fatalf("expected position-only result, got %+v", result)
+	}
+
+	// 未连接（无客户端/无摄像头）：仅回 camera，不携带位置。
+	// 注：token 未命中时按现有回退语义落到第一路，故用全新 manager。
+	fresh := newTestCameraManager()
+	result = fresh.handlePTZStatus("cam-back")
+	if result == nil || result.Camera != "cam-back" || result.Position != nil || result.Ratio != nil {
+		t.Fatalf("expected bare result, got %+v", result)
+	}
 }

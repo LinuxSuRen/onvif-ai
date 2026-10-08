@@ -110,6 +110,35 @@ func TestCameraStatePTZCapsJSON(t *testing.T) {
 	}
 }
 
+// TestPTZStatusResultJSON 校验 ptz_status 回执负载契约：倍率/位置未知
+// 时省略，已知时携带数值。
+func TestPTZStatusResultJSON(t *testing.T) {
+	pos, ratio := 0.5, 50.225
+	b, err := json.Marshal(PTZStatusResult{Camera: "t1", Position: &pos, Ratio: &ratio})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"camera":"t1"`) || !strings.Contains(string(b), `"position":0.5`) || !strings.Contains(string(b), `"ratio":50.225`) {
+		t.Fatalf("full status expected, got %s", b)
+	}
+
+	b, err = json.Marshal(PTZStatusResult{Camera: "t1", Position: &pos})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"position":0.5`) || strings.Contains(string(b), `"ratio"`) {
+		t.Fatalf("position-only status expected, got %s", b)
+	}
+
+	b, err = json.Marshal(PTZStatusResult{Camera: "t1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"position"`) || strings.Contains(string(b), `"ratio"`) {
+		t.Fatalf("bare status expected, got %s", b)
+	}
+}
+
 // TestDeviceStateTalkbackJSON 校验 device_state 中对讲通道字段的序列化契约：
 // nil 省略（未协商）、不可用时显式携带原因码、可用时仅 available。
 func TestDeviceStateTalkbackJSON(t *testing.T) {
