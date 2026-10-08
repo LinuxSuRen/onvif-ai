@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"net"
+	"strconv"
 	"testing"
 
 	"github.com/onvif-ai/internal/rtsp"
@@ -108,5 +110,53 @@ func TestWriteTalkbackPCMFailureEndsSession(t *testing.T) {
 	cm.mu.Unlock()
 	if active {
 		t.Fatal("session must end after write failure")
+	}
+}
+
+// TestListenWithDrift 端口被占用时应向后漂移，绑定到更大的相邻端口
+func TestListenWithDrift(t *testing.T) {
+	// 占位监听必须用与服务相同的通配地址，127.0.0.1 与 [::] 在部分平台不冲突
+	occ, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occ.Close()
+	port := occ.Addr().(*net.TCPAddr).Port
+
+	l, err := listenWithDrift(strconv.Itoa(port))
+	if err != nil {
+		t.Fatalf("listenWithDrift: %v", err)
+	}
+	defer l.Close()
+
+	if got := l.Addr().(*net.TCPAddr).Port; got <= port {
+		t.Fatalf("expected drift to a port > %d, got %d", port, got)
+	}
+}
+
+// TestListenWithDriftFreePort 空闲端口应原样绑定，无漂移
+func TestListenWithDriftFreePort(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	probe.Close()
+
+	l, err := listenWithDrift(strconv.Itoa(port))
+	if err != nil {
+		t.Fatalf("listenWithDrift: %v", err)
+	}
+	defer l.Close()
+
+	if got := l.Addr().(*net.TCPAddr).Port; got != port {
+		t.Fatalf("expected exact bind on %d, got %d", port, got)
+	}
+}
+
+// TestListenWithDriftInvalidPort 非数字端口应直接报错
+func TestListenWithDriftInvalidPort(t *testing.T) {
+	if _, err := listenWithDrift("abc"); err == nil {
+		t.Fatal("expected error for non-numeric port")
 	}
 }
