@@ -1056,11 +1056,27 @@ func listenWithDrift(port string) (net.Listener, error) {
 			}
 			return l, nil
 		}
-		if !errors.Is(err, syscall.EADDRINUSE) {
+		if !isAddrInUse(err) {
 			return nil, err
 		}
 	}
 	return nil, fmt.Errorf("ports %d-%d all in use", start, start+maxDrift-1)
+}
+
+// wsaEADDRINUSE 是 Windows 上 bind 冲突的 errno（syscall.WSAEADDRINUSE）。
+// 该常量仅存在于 Windows 的 syscall 包，为保持跨平台编译此处用数值。
+const wsaEADDRINUSE = 10048
+
+// isAddrInUse 判断监听失败是否为端口占用。
+// Windows 上 syscall.EADDRINUSE 是与 WSAEADDRINUSE 不同的占位值，
+// bind 冲突实际返回 WSAEADDRINUSE，因此两类错误都要识别，
+// 否则端口漂移在 Windows 上永远不生效。
+func isAddrInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	var errno syscall.Errno
+	return errors.As(err, &errno) && uintptr(errno) == wsaEADDRINUSE
 }
 
 var _ = audio.PCM16kSampleRate
