@@ -9,6 +9,7 @@
 - 📹 **实时视频流**（RTSP H.264 / 快照降级 1FPS，多画面预览）
 - 🔊 **实时音频监听**（RTSP 流内含 G.711 或 AAC-LC 音频轨时自动在浏览器播放，采样率随源动态适配；无音频轨不受影响。HE-AAC 等其他编码暂不支持，后端会记录告警）
 - 📣 **语音对讲**（按住说话，浏览器麦克风音频经 RTSP backchannel 实时推到摄像头扬声器；设备 SDP 需提供 G.711 回传轨，不支持的设备会明确提示并禁用入口）
+- 📡 **流转发**（把摄像头的 RTSP 流原样转推到流媒体服务器如 mediamtx，服务器离线自动重试，支持认证与 rtsps 加密，可选定期自动发现新设备并转发）
 - 📡 **WebSocket 实时通信**（视频帧、音频、状态全走 WS）
 
 ## AI 语音助手（可选）
@@ -21,6 +22,19 @@ AI 相关功能默认收起在侧栏「AI 语音助手」折叠面板中，按�
 - 🔊 **TTS 语音播报**（Edge TTS 免费 / 自定义接口；经对讲回传通道下发，与语音对讲互斥——对讲优先，占用中会提示稍后）
 
 使用语音识别需要 Chrome 或 Edge 浏览器；需在「设备管理 → AI 模型配置」中填入 LLM API Key。
+
+## 流转发到流媒体服务器（可选）
+
+把已有摄像头的 RTSP 流转发（转推）到指定流媒体服务器（如 [mediamtx](https://github.com/bluenviron/mediamtx)），供第三方播放器或其他平台订阅：
+
+- **转发范围**：已连接摄像头的每路画面（media profile）各转发一路；开启「自动发现设备」后，还会定期探测局域网 ONVIF 设备，新发现的设备匿名解析流地址并自动转发（要求认证的设备会记日志跳过）
+- **路径设计**：每路画面发布为 `onvif-ai/<设备地址>/<画面名>`，路径稳定可读，可直接在流媒体服务器侧按路径订阅
+- **可靠性**：源设备重启或流媒体服务器离线时按指数退避自动重试（5s 起步、30s 封顶），恢复后自动继续推送
+- **认证与加密**：流媒体服务器开启认证时填写用户名/密码（注入推流地址 userinfo）；需要加密时勾选 rtsps
+
+配置入口在页面侧栏「设备管理 → 转发设置」，面板内可实时查看每路转发的状态（路径、转发中/重试中、最近错误）。也可通过 API 操作：`GET/PUT /api/forward/config`（读取时密码脱敏）与 `GET /api/forward/status`。
+
+> 环境变量只是启动默认值，页面上保存的配置为内存态、立即生效，进程重启后回落到环境变量。
 
 ## 快速开始
 
@@ -87,6 +101,12 @@ make release VERSION=0.0.1
 | `LLM_MODEL` | `gpt-3.5-turbo` | 模型名称（AI 助手） |
 | `TTS_PROVIDER` | `edge-tts` | TTS 引擎 (`edge-tts` / `http`)（AI 助手） |
 | `TTS_VOICE` | `zh-CN-XiaoxiaoNeural` | 语音名称（AI 助手） |
+| `MEDIAMTX_URL` | — | 流媒体服务器地址，如 `rtsp://192.168.1.10:8554`（转发） |
+| `MEDIAMTX_USERNAME` | — | 流媒体服务器用户名（转发） |
+| `MEDIAMTX_PASSWORD` | — | 流媒体服务器密码（转发） |
+| `MEDIAMTX_TLS` | `false` | `true` 时用 rtsps 加密推流（转发） |
+| `FORWARD_AUTODISCOVER` | `false` | `true` 时定期自动发现 ONVIF 设备并转发 |
+| `FORWARD_DISCOVER_INTERVAL` | `30` | 自动发现周期（秒，或 `45s` 形式） |
 | `PORT` | `8080` | HTTP 端口 |
 
 命令行参数 `--port` 可指定端口，优先级高于 `PORT` 环境变量：
@@ -103,6 +123,7 @@ make release VERSION=0.0.1
 浏览器 ←─WebSocket（视频帧 / 音频 / 对讲 PCM）─→ Go 后端 ←─RTSP/ONVIF─→ IP 摄像头
                                                      │
                                                      ├─ 对讲：麦克风 PCM → RTSP backchannel（RTP）→ 摄像头扬声器
+                                                     ├─ 转发（可选）：摄像头 RTSP 拉流 → 原样转推 → 流媒体服务器（mediamtx）
                                                      └─ AI 助手（可选）：LLM API + TTS Engine
 ```
 
@@ -112,6 +133,7 @@ make release VERSION=0.0.1
 cmd/server/main.go     # 入口
 internal/
   audio/               # G.711 编解码、PCM 工具
+  forward/             # RTSP 流转发到流媒体服务器（重试/自动发现）
   llm/                 # LLM 客户端 (Chat + Whisper STT)
   tts/                 # TTS 客户端 (Edge TTS)
   onvif/               # ONVIF SOAP 客户端 + WS-Discovery

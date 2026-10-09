@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, reactive } from "vue"
+import { ref, onMounted, onUnmounted, computed, reactive } from 'vue'
 import { useWebSocket } from '../composables/useWebSocket'
 
 interface DiscoveredDevice {
@@ -262,6 +262,114 @@ async function saveLLMConfig() {
     llmSaving.value = false
   }
 }
+
+/* 转发设置：把摄像头 RTSP 流转发到流媒体服务器（如 mediamtx）。
+ * 密码回显为脱敏值，保存时原样回传即视为「未修改」（后端保留旧值） */
+interface ForwardConfig {
+  enabled: boolean
+  target_url: string
+  username: string
+  password: string
+  use_tls: boolean
+  auto_discover: boolean
+  discover_interval: number
+}
+
+interface ForwardItem {
+  source: string
+  path: string
+  state: string
+  last_error?: string
+}
+
+const showForwardSettings = ref(false)
+const fwdEnabled = ref(false)
+const fwdTargetURL = ref('')
+const fwdUsername = ref('')
+const fwdPassword = ref('')
+const fwdUseTLS = ref(false)
+const fwdAutoDiscover = ref(false)
+const fwdSaving = ref(false)
+const fwdStatuses = ref<ForwardItem[]>([])
+let fwdStatusTimer: ReturnType<typeof setInterval> | undefined
+
+async function fetchForwardConfig() {
+  try {
+    const resp = await fetch('/api/forward/config')
+    if (resp.ok) {
+      const cfg: ForwardConfig = await resp.json()
+      fwdEnabled.value = cfg.enabled
+      fwdTargetURL.value = cfg.target_url || ''
+      fwdUsername.value = cfg.username || ''
+      fwdPassword.value = cfg.password || ''
+      fwdUseTLS.value = cfg.use_tls
+      fwdAutoDiscover.value = cfg.auto_discover
+    }
+  } catch { /* ignore */ }
+}
+
+async function saveForwardConfig() {
+  fwdSaving.value = true
+  try {
+    const resp = await fetch('/api/forward/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: fwdEnabled.value,
+        target_url: fwdTargetURL.value,
+        username: fwdUsername.value,
+        password: fwdPassword.value,
+        use_tls: fwdUseTLS.value,
+        auto_discover: fwdAutoDiscover.value,
+      }),
+    })
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: 'unknown' }))
+      alert(err.error || '保存失败')
+    } else {
+      fetchForwardStatus()
+    }
+  } catch {
+    alert('网络错误，保存失败')
+  } finally {
+    fwdSaving.value = false
+  }
+}
+
+async function fetchForwardStatus() {
+  try {
+    const resp = await fetch('/api/forward/status')
+    if (resp.ok) {
+      const data = await resp.json()
+      fwdStatuses.value = data.forwards || []
+    }
+  } catch { /* ignore */ }
+}
+
+/* 面板打开时轮询各路转发状态，关闭即停（低频展示，无需实时推送） */
+function toggleForwardSettings() {
+  showForwardSettings.value = !showForwardSettings.value
+  if (showForwardSettings.value) {
+    fetchForwardConfig()
+    fetchForwardStatus()
+    fwdStatusTimer = setInterval(fetchForwardStatus, 3000)
+  } else if (fwdStatusTimer !== undefined) {
+    clearInterval(fwdStatusTimer)
+    fwdStatusTimer = undefined
+  }
+}
+
+function forwardStateText(s: ForwardItem): string {
+  switch (s.state) {
+    case 'running': return '转发中'
+    case 'retrying': return '重试中'
+    default: return '已停止'
+  }
+}
+
+onUnmounted(() => {
+  if (fwdStatusTimer !== undefined) clearInterval(fwdStatusTimer)
+})
 </script>
 
 <template>
@@ -407,6 +515,52 @@ async function saveLLMConfig() {
         {{ llmSaving ? '保存中...' : '保存' }}
       </button>
     </div>
+
+    <button class="device-info__settings-toggle" @click="toggleForwardSettings">
+      📡 转发设置 {{ showForwardSettings ? '▲' : '▼' }}
+    </button>
+
+    <div v-if="showForwardSettings" class="device-info__llm-panel">
+      <label class="device-info__fwd-check">
+        <input type="checkbox" v-model="fwdEnabled" />
+        <span>启用转发（把摄像头流推送到流媒体服务器）</span>
+      </label>
+      <div class="device-info__llm-field">
+        <label>流媒体服务器地址</label>
+        <input v-model="fwdTargetURL" placeholder="rtsp://192.168.1.10:8554" />
+      </div>
+      <div class="device-info__llm-field">
+        <label>用户名</label>
+        <input v-model="fwdUsername" placeholder="无认证留空" />
+      </div>
+      <div class="device-info__llm-field">
+        <label>密码</label>
+        <input v-model="fwdPassword" type="password" placeholder="无认证留空" />
+      </div>
+      <label class="device-info__fwd-check">
+        <input type="checkbox" v-model="fwdUseTLS" />
+        <span>加密连接（rtsps）</span>
+      </label>
+      <label class="device-info__fwd-check">
+        <input type="checkbox" v-model="fwdAutoDiscover" />
+        <span>自动发现设备并转发</span>
+      </label>
+      <div v-if="fwdEnabled" class="device-info__fwd-hint">
+        每路画面将发布为流媒体服务器上的 onvif-ai/设备地址/画面名 路径；服务器离线时会自动重试，恢复后继续推送。
+      </div>
+      <div v-if="fwdStatuses.length > 0" class="device-info__fwd-status">
+        <div v-for="s in fwdStatuses" :key="s.path" class="device-info__fwd-status-row">
+          <span class="device-info__fwd-status-path">{{ s.path }}</span>
+          <span class="device-info__fwd-status-state" :class="`device-info__fwd-status-state--${s.state}`">
+            {{ forwardStateText(s) }}
+          </span>
+          <span v-if="s.last_error" class="device-info__fwd-status-error" :title="s.last_error">{{ s.last_error }}</span>
+        </div>
+      </div>
+      <button class="device-info__llm-save" @click="saveForwardConfig" :disabled="fwdSaving">
+        {{ fwdSaving ? '保存中...' : '保存' }}
+      </button>
+    </div>
   </div>
 </template>
 
@@ -500,4 +654,38 @@ async function saveLLMConfig() {
   align-self: flex-end;
 }
 .device-info__llm-save:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* 转发设置面板：复用 AI 面板的字段样式，追加开关行与状态列表 */
+.device-info__fwd-check {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 0.72rem; color: #c8d0d8; cursor: pointer;
+}
+.device-info__fwd-check input { accent-color: #0091ff; }
+
+.device-info__fwd-hint {
+  font-size: 0.62rem; color: #5a6470; line-height: 1.5;
+}
+
+.device-info__fwd-status {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 6px; background: rgba(255,255,255,.02);
+  border: 1px solid rgba(255,255,255,.05); border-radius: 4px;
+}
+.device-info__fwd-status-row {
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+}
+.device-info__fwd-status-path {
+  font-family: monospace; font-size: 0.62rem; color: #9098a4;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.device-info__fwd-status-state {
+  font-size: 0.6rem; padding: 1px 6px; border-radius: 3px; flex-shrink: 0;
+}
+.device-info__fwd-status-state--running { background: rgba(0,229,160,.12); color: #00e5a0; }
+.device-info__fwd-status-state--retrying { background: rgba(255,184,0,.12); color: #ffb800; }
+.device-info__fwd-status-state--error { background: rgba(255,61,87,.12); color: #ff3d57; }
+.device-info__fwd-status-error {
+  font-size: 0.6rem; color: #ff3d57; opacity: .8;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+}
 </style>
