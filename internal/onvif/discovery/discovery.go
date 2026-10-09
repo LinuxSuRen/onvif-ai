@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -110,66 +111,65 @@ func (l *Listener) listenLoop() {
 }
 
 func (l *Listener) parseAndStore(data []byte) {
-	body := string(data)
-
-	hasHello := strings.Contains(body, "Hello")
-	hasProbeMatch := strings.Contains(body, "ProbeMatch")
-	if !hasHello && !hasProbeMatch {
-		return
+	for _, d := range parseDevices(string(data)) {
+		l.addDevice(d)
 	}
+}
 
-	startTag := "<d:ProbeMatches>"
-	endTag := "</d:ProbeMatches>"
-	if hasHello {
-		startTag = "<d:Hello>"
-		endTag = "</d:Hello>"
+// 相机对 WS-Discovery 命名空间前缀的选择并不统一（d:、wsdd:、无前缀都常见），
+// 解析必须与具体前缀解耦：块提取用「可选前缀」正则，反序列化前统一剥离前缀。
+var (
+	nsPrefixPattern   = regexp.MustCompile(`(?i)(</?)[A-Za-z_][\w.\-]*:`)
+	probeMatchesBlock = regexp.MustCompile(`(?is)<(?:[A-Za-z_][\w.\-]*:)?ProbeMatches\b[^>]*>.*?</(?:[A-Za-z_][\w.\-]*:)?ProbeMatches\s*>`)
+	helloBlock        = regexp.MustCompile(`(?is)<(?:[A-Za-z_][\w.\-]*:)?Hello\b[^>]*>.*?</(?:[A-Za-z_][\w.\-]*:)?Hello\s*>`)
+)
+
+// stripNSPrefix 去掉元素名上的任意命名空间前缀（<wsdd:ProbeMatch> → <ProbeMatch>）。
+func stripNSPrefix(s string) string {
+	return nsPrefixPattern.ReplaceAllString(s, "$1")
+}
+
+// helloMessage 对应 WS-Discovery Hello 消息，携带字段与 ProbeMatch 相同。
+type helloMessage struct {
+	XMLName         xml.Name `xml:"Hello"`
+	Types           string   `xml:"Types"`
+	Scopes          string   `xml:"Scopes"`
+	XAddrs          string   `xml:"XAddrs"`
+	MetadataVersion int      `xml:"MetadataVersion"`
+}
+
+func devicesFrom(types, scopes, xaddrs string, metadataVersion int) (devices []Device) {
+	fields := strings.Fields(xaddrs)
+	for _, addr := range fields {
+		devices = append(devices, Device{
+			Address:         addr,
+			Types:           strings.Fields(types),
+			Scopes:          strings.Fields(scopes),
+			XAddrs:          fields,
+			MetadataVersion: metadataVersion,
+		})
 	}
+	return
+}
 
-	start := strings.Index(body, startTag)
-	end := strings.Index(body, endTag)
-	if start < 0 || end < 0 {
-		return
-	}
-
-	xmlBody := body[start : end+len(endTag)]
-	xmlBody = strings.ReplaceAll(xmlBody, "d:", "")
-	xmlBody = strings.ReplaceAll(xmlBody, "dn:", "")
-	xmlBody = strings.ReplaceAll(xmlBody, "a:", "")
-
-	var matches probeMatchesResponse
-	if hasHello {
-		matches = probeMatchesResponse{}
-		xml.Unmarshal([]byte("<root>"+xmlBody+"</root>"), &matches)
-	}
-
-	for _, pm := range matches.ProbeMatches {
-		xaddrs := strings.Fields(pm.XAddrs)
-		for _, addr := range xaddrs {
-			l.addDevice(Device{
-				Address:         addr,
-				Types:           strings.Fields(pm.Types),
-				Scopes:          strings.Fields(pm.Scopes),
-				XAddrs:          xaddrs,
-				MetadataVersion: pm.MetadataVersion,
-			})
-		}
-	}
-
-	if hasHello {
-		pm := probeMatch{}
-		if err := xml.Unmarshal([]byte("<root>"+xmlBody+"</root>"), &pm); err == nil {
-			xaddrs := strings.Fields(pm.XAddrs)
-			for _, addr := range xaddrs {
-				l.addDevice(Device{
-					Address:         addr,
-					Types:           strings.Fields(pm.Types),
-					Scopes:          strings.Fields(pm.Scopes),
-					XAddrs:          xaddrs,
-					MetadataVersion: pm.MetadataVersion,
-				})
+// parseDevices 从一条 SOAP 报文中提取设备，兼容任意命名空间前缀，
+// 支持 ProbeMatches 与 Hello 两种消息。
+func parseDevices(body string) (devices []Device) {
+	if block := probeMatchesBlock.FindString(body); block != "" {
+		var resp probeMatchesResponse
+		if err := xml.Unmarshal([]byte(stripNSPrefix(block)), &resp); err == nil {
+			for _, pm := range resp.ProbeMatches {
+				devices = append(devices, devicesFrom(pm.Types, pm.Scopes, pm.XAddrs, pm.MetadataVersion)...)
 			}
 		}
 	}
+	if block := helloBlock.FindString(body); block != "" {
+		var hello helloMessage
+		if err := xml.Unmarshal([]byte(stripNSPrefix(block)), &hello); err == nil {
+			devices = append(devices, devicesFrom(hello.Types, hello.Scopes, hello.XAddrs, hello.MetadataVersion)...)
+		}
+	}
+	return
 }
 
 func (l *Listener) addDevice(d Device) {
@@ -235,40 +235,12 @@ func Probe(ifaceName string) ([]Device, error) {
 			break
 		}
 
-		body := string(buf[:n])
-		startTag := "<d:ProbeMatches>"
-		endTag := "</d:ProbeMatches>"
-		start := strings.Index(body, startTag)
-		end := strings.Index(body, endTag)
-		if start < 0 || end < 0 {
-			continue
-		}
-
-		xmlBody := body[start : end+len(endTag)]
-		xmlBody = strings.ReplaceAll(xmlBody, "d:", "")
-		xmlBody = strings.ReplaceAll(xmlBody, "dn:", "")
-
-		var resp probeMatchesResponse
-		if err := xml.Unmarshal([]byte(xmlBody), &resp); err != nil {
-			continue
-		}
-
-		for _, pm := range resp.ProbeMatches {
-			xaddrs := strings.Fields(pm.XAddrs)
-			for _, addr := range xaddrs {
-				key := addr
-				mu.Lock()
-				if _, exists := devices[key]; !exists {
-					devices[key] = Device{
-						Address:         addr,
-						Types:           strings.Fields(pm.Types),
-						Scopes:          strings.Fields(pm.Scopes),
-						XAddrs:          xaddrs,
-						MetadataVersion: pm.MetadataVersion,
-					}
-				}
-				mu.Unlock()
+		for _, d := range parseDevices(string(buf[:n])) {
+			mu.Lock()
+			if _, exists := devices[d.Address]; !exists {
+				devices[d.Address] = d
 			}
+			mu.Unlock()
 		}
 	}
 
