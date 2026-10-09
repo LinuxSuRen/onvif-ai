@@ -20,6 +20,7 @@ const (
 	MsgTypeTalkbackStart MessageType = "talkback_start" // Start intercom session (browser mic → camera speaker)
 	MsgTypeAudioIn       MessageType = "audio_in"       // Intercom audio chunk (base64 PCM16 16k mono)
 	MsgTypeTalkbackStop  MessageType = "talkback_stop"  // Stop intercom session
+	MsgTypeViewControl   MessageType = "view_control"   // Open/close video push for this connection (start/stop)
 
 	// Server → Client
 	MsgTypeVideoNAL      MessageType = "video_nal"      // H.264 NAL unit (base64)
@@ -88,6 +89,19 @@ const (
 	TalkbackRejectBusy          = "busy"            // TTS 语音播报占用中
 	TalkbackRejectInUse         = "talkback_in_use" // 其他对讲会话占用中
 )
+
+// view_control 动作（稳定契约，前端原样发送）。
+const (
+	ViewActionStart = "start" // 该连接开始接收视频帧
+	ViewActionStop  = "stop"  // 该连接停止接收视频帧
+)
+
+// ViewControlPayload 是 view_control 消息的负载。视频帧带宽高，
+// 页面打开不等于用户想看画面，因此服务端默认不向新连接推送视频，
+// 由用户点击画面前景占位符后显式请求（issue #26）。
+type ViewControlPayload struct {
+	Action string `json:"action"` // start / stop，见 ViewAction* 常量
+}
 
 // TalkbackSessionPayload 是 talkback_state 消息的负载：服务器对
 // talkback_start 的受理结果，仅回复给发起的客户端。

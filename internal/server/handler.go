@@ -629,6 +629,20 @@ func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
 			}
 		}
 
+	case ws.MsgTypeViewControl:
+		// 视频帧带宽高，未显式请求的连接默认不推送（issue #26）；
+		// 开关挂在连接上，断线重连后由前端重新发送 start
+		var payload ws.ViewControlPayload
+		if msg.Payload != nil {
+			json.Unmarshal(msg.Payload, &payload)
+		}
+		switch payload.Action {
+		case ws.ViewActionStart:
+			h.hub.SetVideoView(client, true)
+		case ws.ViewActionStop:
+			h.hub.SetVideoView(client, false)
+		}
+
 	case ws.MsgTypeClockSync:
 		// Echo the client timestamp together with the server clock so
 		// the browser can estimate the clock offset (RTT/2 correction)
