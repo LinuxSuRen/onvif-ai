@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, reactive } from "vue"
+import { ref, onMounted, computed, reactive, nextTick } from "vue"
 import { useWebSocket } from '../composables/useWebSocket'
 
 interface DiscoveredDevice {
@@ -56,6 +56,20 @@ function persistCred(addr: string) {
   const all = loadAllCreds()
   all[addr] = deviceCreds[addr]
   localStorage.setItem(CREDS_KEY, JSON.stringify(all))
+}
+
+/* 认证失败提示：后端经 connect_error 下发稳定 code，文案由前端映射；
+ * 收到后自动展开对应设备详情并聚焦用户名输入，引导补填凭证后重连 */
+const AUTH_HINT_TEXTS: Record<string, string> = {
+  auth_required: '设备要求认证，请填写用户名和密码后重新连接',
+  auth_failed: '用户名或密码不正确，请修改后重新连接',
+}
+const authHints = reactive<Record<string, string>>({})
+const credUserInputs = new Map<string, HTMLInputElement>()
+
+function setCredUserRef(addr: string, el: unknown) {
+  if (el instanceof HTMLInputElement) credUserInputs.set(addr, el)
+  else credUserInputs.delete(addr)
 }
 
 async function fetchDeviceInfo(addr: string) {
@@ -149,6 +163,18 @@ subscribe(['device_state'], (msg) => {
       deviceState.value = state
     }
   }
+})
+
+/* 连接认证失败：展开目标设备详情、给出提示并聚焦凭证输入 */
+subscribe(['connect_error'], (msg) => {
+  const payload = msg.payload as { address?: string; code?: string } | undefined
+  const addr = payload?.address || ''
+  const code = payload?.code || ''
+  if (!addr || !AUTH_HINT_TEXTS[code]) return
+  if (!devices.value.some(d => d.address === addr)) return
+  authHints[addr] = code
+  expandedAddress.value = addr
+  nextTick(() => credUserInputs.get(addr)?.focus())
 })
 
 async function discoverDevices() {
@@ -334,11 +360,14 @@ async function saveLLMConfig() {
           </div>
           <div class="device-info__detail-section">
             <span class="device-info__detail-label">认证</span>
-            <div class="device-info__cred-fields">
-              <input v-model="credOf(d.address).username" placeholder="用户名(无认证留空)"
-                @change="persistCred(d.address)" @click.stop />
-              <input v-model="credOf(d.address).password" type="password" placeholder="密码"
-                @change="persistCred(d.address)" @click.stop />
+            <div class="device-info__cred">
+              <div v-if="authHints[d.address]" class="device-info__cred-hint">{{ AUTH_HINT_TEXTS[authHints[d.address]] }}</div>
+              <div class="device-info__cred-fields">
+                <input :ref="el => setCredUserRef(d.address, el)" v-model="credOf(d.address).username" placeholder="用户名(无认证留空)"
+                  @change="persistCred(d.address)" @input="delete authHints[d.address]" @click.stop />
+                <input v-model="credOf(d.address).password" type="password" placeholder="密码"
+                  @change="persistCred(d.address)" @input="delete authHints[d.address]" @click.stop />
+              </div>
             </div>
           </div>
           <div class="device-info__detail-section">
@@ -457,6 +486,8 @@ async function saveLLMConfig() {
 .device-info__scope-tag { font-size: 0.58rem; padding: 1px 6px; background: rgba(0,145,255,.12); color: #0091ff; border-radius: 3px; white-space: nowrap; }
 .device-info__scope-tag--type { background: rgba(122,132,144,.12); color: #7a8490; }
 
+.device-info__cred { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
+.device-info__cred-hint { color: #ffb800; font-size: 0.66rem; line-height: 1.3; }
 .device-info__cred-fields { display: flex; gap: 6px; flex: 1; min-width: 0; }
 .device-info__cred-fields input {
   flex: 1; min-width: 0; padding: 4px 8px;

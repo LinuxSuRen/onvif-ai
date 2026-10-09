@@ -31,6 +31,7 @@ const (
 	MsgTypeDeviceState   MessageType = "device_state"   // Device connection state update
 	MsgTypePTZCommand    MessageType = "ptz_command"    // PTZ command result (direction + text)
 	MsgTypeTalkbackState MessageType = "talkback_state" // Intercom session accept/reject result
+	MsgTypeConnectError  MessageType = "connect_error"  // Structured connect failure (stable code)
 )
 
 // Message is the JSON envelope for all WebSocket messages.
@@ -94,6 +95,19 @@ const (
 type TalkbackSessionPayload struct {
 	Active bool   `json:"active"`           // true=会话已受理
 	Reason string `json:"reason,omitempty"` // 拒绝码，见 TalkbackReject* 常量
+}
+
+// ConnectError 连接失败码（稳定契约，前端据此映射文案与交互）。
+const (
+	ConnectErrAuthRequired = "auth_required" // 设备要求认证但未提供凭证
+	ConnectErrAuthFailed   = "auth_failed"   // 凭证被设备拒绝
+)
+
+// ConnectErrorPayload 是 connect_error 消息的负载：定位失败设备并
+// 携带稳定失败码，具体展示由前端决定。
+type ConnectErrorPayload struct {
+	Address string `json:"address"` // 连接的目标设备地址
+	Code    string `json:"code"`    // 失败码，见 ConnectErr* 常量
 }
 
 // NewMessage creates a new Message of the given type.

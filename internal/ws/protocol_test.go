@@ -109,6 +109,41 @@ func TestStatusStates(t *testing.T) {
 	}
 }
 
+func TestBroadcastConnectErrorPayload(t *testing.T) {
+	hub := NewHub()
+	hub.BroadcastConnectError("http://192.168.1.64:80/onvif/device_service", ConnectErrAuthRequired)
+
+	raw := <-hub.broadcast
+
+	var msg Message
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if msg.Type != MsgTypeConnectError {
+		t.Fatalf("expected type connect_error, got %s", msg.Type)
+	}
+
+	var payload ConnectErrorPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload failed: %v", err)
+	}
+	if payload.Address != "http://192.168.1.64:80/onvif/device_service" || payload.Code != "auth_required" {
+		t.Fatalf("unexpected payload: %+v", payload)
+	}
+}
+
+func TestConnectErrorCodes(t *testing.T) {
+	codes := map[string]string{
+		ConnectErrAuthRequired: "auth_required",
+		ConnectErrAuthFailed:   "auth_failed",
+	}
+	for got, want := range codes {
+		if got != want {
+			t.Errorf("connect error code mismatch: got %s want %s", got, want)
+		}
+	}
+}
+
 func TestTalkbackMessageTypes(t *testing.T) {
 	pairs := []struct {
 		t    MessageType

@@ -282,6 +282,19 @@ func (c *Client) soapCall(ctx context.Context, deviceAddr, serviceURL, action, b
 	return c.doSoapCall(ctx, serviceURL, action, body)
 }
 
+/* AuthError 表示设备返回 401:CredentialsProvided 区分「未提供凭证」与
+ * 「凭证被拒」,上层据此决定交互(重试对认证错误无意义,应引导用户填写凭证) */
+type AuthError struct {
+	CredentialsProvided bool
+}
+
+func (e *AuthError) Error() string {
+	if e.CredentialsProvided {
+		return "设备认证失败(401):请检查用户名和密码"
+	}
+	return "设备要求认证(401):请在设备连接时填写用户名和密码"
+}
+
 /* doSoapCall 发送 SOAP 请求并校验应答(不带任何认证注入) */
 func (c *Client) doSoapCall(ctx context.Context, serviceURL, action, body string) ([]byte, error) {
 	soapAction := fmt.Sprintf("http://www.onvif.org/ver10/%s/wsdl/%s", soapActionDomain(action), action)
@@ -305,10 +318,7 @@ func (c *Client) doSoapCall(ctx context.Context, serviceURL, action, body string
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		if c.config.Username == "" {
-			return nil, fmt.Errorf("设备要求认证(401):请在设备连接时填写用户名和密码")
-		}
-		return nil, fmt.Errorf("设备认证失败(401):请检查用户名和密码")
+		return nil, &AuthError{CredentialsProvided: c.config.Username != ""}
 	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("SOAP call %s returned %d: %s", action, resp.StatusCode, string(respBody[:min(len(respBody), 500)]))
