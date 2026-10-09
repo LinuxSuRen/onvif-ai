@@ -69,7 +69,8 @@ func (f *Forwarder) Snapshot() Status {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return Status{
-		Source:    f.sourceURL,
+		// 源地址可能内嵌凭证，对外展示一律脱敏（RedactUserinfo）
+		Source:    RedactUserinfo(f.sourceURL),
 		Path:      f.path,
 		State:     f.state,
 		LastError: f.lastErr,
@@ -177,7 +178,7 @@ func (f *Forwarder) cycle(ctx context.Context) error {
 	f.backoff = retryInitialBackoff // 一轮完整建起即认为恢复，复位退避
 	f.mu.Unlock()
 	f.setState(StateRunning, "")
-	log.Printf("[forward] %s 转发中: %s → %s", f.path, f.sourceURL, f.targetURL)
+	log.Printf("[forward] %s 转发中: %s → %s", f.path, RedactUserinfo(f.sourceURL), RedactUserinfo(f.targetURL))
 
 	done := make(chan error, 2)
 	go func() { done <- src.Wait() }()

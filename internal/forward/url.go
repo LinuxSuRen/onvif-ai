@@ -70,6 +70,22 @@ func BuildTargetURL(cfg Config, path string) (string, error) {
 	return u.String(), nil
 }
 
+// RedactUserinfo 去掉 URL 中的凭证部分后返回，供对外展示（状态 API、
+// 日志）使用：源地址与推流地址都可能内嵌 user:pass，不应原样外泄，
+// 与 handler 侧密码脱敏（maskKey）保持同一策略。
+func RedactUserinfo(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" || !strings.Contains(s, "://") {
+		return s
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.User == nil {
+		return s
+	}
+	u.User = nil
+	return u.String()
+}
+
 // normalizeDeviceAddr 把设备地址归一化为 scheme://host:port 形式，
 // 作为 Manager 里的设备唯一键：连接入口与 WS-Discovery 返回的 XAddr
 // 路径部分可能不同（/onvif/device_service 等），只比较服务端点。

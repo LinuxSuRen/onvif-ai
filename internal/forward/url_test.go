@@ -130,3 +130,20 @@ func TestDeviceHostFromAddr(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+// TestRedactUserinfo 校验对外展示的 URL 不携带凭证：源地址与推流地址
+// 都可能内嵌 user:pass，状态 API 与日志不允许原样外泄。
+func TestRedactUserinfo(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"rtsp://admin:secretpw@192.168.1.21:554/Streaming/Channels/101", "rtsp://192.168.1.21:554/Streaming/Channels/101"},
+		{"rtsp://admin@192.168.1.21:554/cam", "rtsp://192.168.1.21:554/cam"},
+		{"rtsps://mediamtx:8554/onvif-ai/192.168.1.21/cam1", "rtsps://mediamtx:8554/onvif-ai/192.168.1.21/cam1"}, // 无凭证原样返回
+		{"", ""},
+		{"192.168.1.21:554", "192.168.1.21:554"}, // 无 scheme 不动
+	}
+	for _, tc := range cases {
+		if got := RedactUserinfo(tc.in); got != tc.want {
+			t.Fatalf("RedactUserinfo(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
