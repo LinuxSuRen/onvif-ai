@@ -3,6 +3,7 @@ package rtsp
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -491,18 +492,17 @@ type rtspURLInfo struct {
 	Host   string
 }
 
+// parseRTSPURL 解析出拨号所需的 Scheme 与 Host(host:port)。
+// URL 可能携带认证 userinfo(rtsp://user:pass@host/path,注入自设备凭证),
+// 必须经 net/url 解析——手工切分会把 user:pass@ 误当主机名拨号。
 func parseRTSPURL(rawURL string) (rtspURLInfo, error) {
-	s := rawURL
-	scheme := "rtsp"
-	if after, found := strings.CutPrefix(s, "rtsp://"); found {
-		s = after
-	} else if after, found := strings.CutPrefix(s, "rtsps://"); found {
-		s = after
-		scheme = "rtsps"
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return rtspURLInfo{}, fmt.Errorf("invalid RTSP URL: %s", rawURL)
 	}
-	host := s
-	if idx := strings.IndexByte(s, '/'); idx >= 0 {
-		host = s[:idx]
+	scheme := u.Scheme
+	if scheme == "" {
+		scheme = "rtsp"
 	}
-	return rtspURLInfo{Scheme: scheme, Host: host}, nil
+	return rtspURLInfo{Scheme: scheme, Host: u.Host}, nil
 }
