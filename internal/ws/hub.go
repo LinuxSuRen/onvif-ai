@@ -183,6 +183,17 @@ func (h *Hub) BroadcastDeviceState(state interface{}) {
 	h.BroadcastMessage(msg)
 }
 
+// BroadcastConnectError 广播结构化连接失败：code 为稳定失败码，
+// 前端据此触发交互（如认证错误时引导填写凭证），展示文案由前端映射。
+func (h *Hub) BroadcastConnectError(address, code string) {
+	payload, _ := json.Marshal(ConnectErrorPayload{Address: address, Code: code})
+	msg := &Message{
+		Type:    MsgTypeConnectError,
+		Payload: payload,
+	}
+	h.BroadcastMessage(msg)
+}
+
 func (h *Hub) ClientCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

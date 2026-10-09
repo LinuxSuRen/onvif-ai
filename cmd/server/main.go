@@ -242,6 +242,16 @@ func (cm *cameraManager) connect(address, username, password string) {
 		log.Printf("GetProfiles failed: %v", err)
 		cm.handler.SetDeviceState(true, false, false, address)
 		cm.hub.BroadcastError("连接摄像头失败: " + err.Error())
+		/* 认证类失败另发结构化通知：前端据此展开对应设备详情并
+		 * 聚焦凭证输入，引导用户补填/改正用户名密码后重连 */
+		var authErr *onvif.AuthError
+		if errors.As(err, &authErr) {
+			code := ws.ConnectErrAuthRequired
+			if authErr.CredentialsProvided {
+				code = ws.ConnectErrAuthFailed
+			}
+			cm.hub.BroadcastConnectError(address, code)
+		}
 		return
 	}
 
@@ -689,7 +699,9 @@ func (cm *cameraManager) ownsUnit(u *camUnit) bool {
 
 // getProfilesWithRetry keeps polling the ONVIF endpoint: WiFi cameras are
 // often briefly unreachable right after a reboot/drop, and the RTSP-level
-// retry loop can only kick in once profiles are known.
+// retry loop can only kick in once profiles are known. Authentication
+// failures are not transient — retrying them only delays the structured
+// connect_error that guides the user to the credential form.
 func (cm *cameraManager) getProfilesWithRetry(client *onvif.Client, ctx context.Context, life *streamLife, address string) ([]onvif.Profile, error) {
 	const maxAttempts = 12
 	const retryWait = 5 * time.Second
@@ -704,6 +716,10 @@ func (cm *cameraManager) getProfilesWithRetry(client *onvif.Client, ctx context.
 		}
 		lastErr = err
 		log.Printf("GetProfiles attempt %d/%d failed: %v", attempt, maxAttempts, err)
+		var authErr *onvif.AuthError
+		if errors.As(err, &authErr) {
+			return nil, err
+		}
 		if attempt == maxAttempts {
 			return nil, err
 		}
