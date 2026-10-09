@@ -2,6 +2,7 @@ package onvif
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/xml"
@@ -9,7 +10,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/onvif-ai/internal/onvif/xsd"
@@ -21,6 +24,11 @@ type Client struct {
 	mediaXAddr string
 	ptzXAddr   string
 	discovered bool
+
+	/* 设备时钟偏移(digest Created 的 Created 时间须与设备钟对齐,
+	 * 超窗即被拒;首次带认证调用前用免认证的 GetSystemDateAndTime 对时) */
+	clockOnce   sync.Once
+	clockOffset time.Duration
 }
 
 func NewClient(cfg Config) *Client {
@@ -57,7 +65,7 @@ func (c *Client) GetCapabilities(ctx context.Context) (*Capabilities, error) {
 		</tds:GetCapabilities>
 	`)
 
-	resp, err := c.soapCall(ctx, c.deviceURL(), deviceServiceURL, "GetCapabilities", body)
+	resp, err := c.soapCall(ctx, c.deviceURL(), c.deviceURL(), "GetCapabilities", body)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +234,7 @@ func (c *Client) GetSnapshotURI(ctx context.Context, profileToken string) (strin
 func (c *Client) GetDeviceInformation(ctx context.Context) (*DeviceInformation, error) {
 	body := c.soapEnvelope(`<tds:GetDeviceInformation></tds:GetDeviceInformation>`)
 
-	resp, err := c.soapCall(ctx, c.deviceURL(), deviceServiceURL, "GetDeviceInformation", body)
+	resp, err := c.soapCall(ctx, c.deviceURL(), c.deviceURL(), "GetDeviceInformation", body)
 	if err != nil {
 		return nil, fmt.Errorf("GetDeviceInformation: %w", err)
 	}
@@ -265,6 +273,17 @@ func (c *Client) soapEnvelope(body string) string {
 }
 
 func (c *Client) soapCall(ctx context.Context, deviceAddr, serviceURL, action, body string) ([]byte, error) {
+	/* WS-Security UsernameToken 按 ONVIF 规范置于 SOAP Header(非 HTTP 头),
+	 * 每次请求随机 nonce;首次使用前与设备对时,规避钟差导致的 digest 拒绝 */
+	if c.config.Username != "" {
+		c.clockOnce.Do(func() { c.syncClock(ctx) })
+		body = c.injectSecurityHeader(body)
+	}
+	return c.doSoapCall(ctx, serviceURL, action, body)
+}
+
+/* doSoapCall 发送 SOAP 请求并校验应答(不带任何认证注入) */
+func (c *Client) doSoapCall(ctx context.Context, serviceURL, action, body string) ([]byte, error) {
 	soapAction := fmt.Sprintf("http://www.onvif.org/ver10/%s/wsdl/%s", soapActionDomain(action), action)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", serviceURL, strings.NewReader(body))
@@ -273,10 +292,6 @@ func (c *Client) soapCall(ctx context.Context, deviceAddr, serviceURL, action, b
 	}
 	req.Header.Set("Content-Type", "application/soap+xml; charset=utf-8")
 	req.Header.Set("SOAPAction", soapAction)
-
-	if c.config.Username != "" {
-		c.setWSSecurity(req)
-	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -289,6 +304,12 @@ func (c *Client) soapCall(ctx context.Context, deviceAddr, serviceURL, action, b
 		return nil, fmt.Errorf("read SOAP response: %w", err)
 	}
 
+	if resp.StatusCode == http.StatusUnauthorized {
+		if c.config.Username == "" {
+			return nil, fmt.Errorf("设备要求认证(401):请在设备连接时填写用户名和密码")
+		}
+		return nil, fmt.Errorf("设备认证失败(401):请检查用户名和密码")
+	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("SOAP call %s returned %d: %s", action, resp.StatusCode, string(respBody[:min(len(respBody), 500)]))
 	}
@@ -296,28 +317,99 @@ func (c *Client) soapCall(ctx context.Context, deviceAddr, serviceURL, action, b
 	return respBody, nil
 }
 
-func (c *Client) setWSSecurity(req *http.Request) {
-	nonce := make([]byte, 16)
-	for i := range nonce {
-		nonce[i] = byte(i*7 + 3)
-	}
-	created := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+/* ---------------- WS-Security UsernameToken ---------------- */
+
+const (
+	wsseNs          = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+	wsuNs           = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
+	passwordDigest  = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest"
+	nonceEncoding   = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary"
+	timeSyncTimeout = 3 * time.Second
+)
+
+/* buildSecurityHeader 生成 SOAP Header 内的 UsernameToken:
+ * digest = Base64(SHA1(nonce 原始字节 + Created + 口令)),OASIS Profile 1.0 */
+func buildSecurityHeader(username, password string, nonce []byte, created string) string {
+	sum := sha1.Sum(append(append(append([]byte{}, nonce...), []byte(created)...), []byte(password)...))
+	digest := base64.StdEncoding.EncodeToString(sum[:])
 	nonceB64 := base64.StdEncoding.EncodeToString(nonce)
+	return `<s:Header><wsse:Security xmlns:wsse="` + wsseNs + `" xmlns:wsu="` + wsuNs +
+		`" s:mustUnderstand="1"><wsse:UsernameToken>` +
+		`<wsse:Username>` + xmlEscape(username) + `</wsse:Username>` +
+		`<wsse:Password Type="` + passwordDigest + `">` + digest + `</wsse:Password>` +
+		`<wsse:Nonce EncodingType="` + nonceEncoding + `">` + nonceB64 + `</wsse:Nonce>` +
+		`<wsu:Created>` + created + `</wsu:Created>` +
+		`</wsse:UsernameToken></wsse:Security></s:Header>`
+}
 
-	digestInput := string(nonce) + created + c.config.Password
-	hash := sha1.Sum([]byte(digestInput))
-	digest := base64.StdEncoding.EncodeToString(hash[:])
+/* injectSecurityHeader 把 Security 头插进信封的 <s:Body> 之前 */
+func (c *Client) injectSecurityHeader(envelope string) string {
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		/* 随机源不可用属系统级异常,退化为时间熵仍优于固定 nonce */
+		now := time.Now().UnixNano()
+		for i := range nonce {
+			nonce[i] = byte(now >> (uint(i%8) * 8))
+		}
+	}
+	created := time.Now().UTC().Add(c.clockOffset).Format("2006-01-02T15:04:05Z")
+	header := buildSecurityHeader(c.config.Username, c.config.Password, nonce, created)
+	return strings.Replace(envelope, "<s:Body>", header+"<s:Body>", 1)
+}
 
-	wsse := fmt.Sprintf(`<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-		<wsse:UsernameToken>
-			<wsse:Username>%s</wsse:Username>
-			<wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">%s</wsse:Password>
-			<wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">%s</wsse:Nonce>
-			<wsu:Created xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">%s</wsu:Created>
-		</wsse:UsernameToken>
-	</wsse:Security>`, xmlEscape(c.config.Username), digest, nonceB64, created)
+/* syncClock 经免认证的 GetSystemDateAndTime 计算设备与本地时钟偏移;
+ * 失败保持偏移 0(部分设备不校验 Created 或钟差本就很小) */
+func (c *Client) syncClock(ctx context.Context) {
+	syncCtx, cancel := context.WithTimeout(ctx, timeSyncTimeout)
+	defer cancel()
 
-	req.Header.Set("X-WSSE", wsse)
+	body := c.soapEnvelope(`<tds:GetSystemDateAndTime/>`)
+	resp, err := c.doSoapCall(syncCtx, c.deviceURL(), "GetSystemDateAndTime", body)
+	if err != nil {
+		log.Printf("[onvif] clock sync skipped: %v", err)
+		return
+	}
+
+	var result struct {
+		UTCDateTime struct {
+			Year, Month, Day, Hour, Minute, Second int
+		} `xml:"UTCDateTime"`
+	}
+	if err := c.parseSOAPResponse(resp, "GetSystemDateAndTimeResponse", &result); err != nil {
+		log.Printf("[onvif] clock sync parse failed: %v", err)
+		return
+	}
+	t := result.UTCDateTime
+	if t.Year == 0 {
+		return
+	}
+	deviceTime := time.Date(t.Year, time.Month(t.Month), t.Day, t.Hour, t.Minute, t.Second, 0, time.UTC)
+	c.clockOffset = deviceTime.Sub(time.Now().UTC())
+	if absDuration(c.clockOffset) > 30*time.Second {
+		log.Printf("[onvif] device clock offset %v applied", c.clockOffset)
+	}
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
+}
+
+/* WithCredentials 把用户名口令注入 URL userinfo(特殊字符自动百分号转义),
+ * 供 RTSP 拉流/对讲使用:gortsplib、ffmpeg 收到 401 会凭 userinfo 自动重试
+ * Basic/Digest。无凭证或解析失败时原样返回。 */
+func WithCredentials(rawURL, username, password string) string {
+	if username == "" {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return rawURL
+	}
+	u.User = url.UserPassword(username, password)
+	return u.String()
 }
 
 func (c *Client) parseSOAPResponse(body []byte, responseTag string, result interface{}) error {
@@ -335,7 +427,7 @@ func (c *Client) parseSOAPResponse(body []byte, responseTag string, result inter
 }
 
 func stripNSPrefix(xmlStr string) string {
-	prefixes := []string{"tds:", "trt:", "tt:", "tptz:", "dn:", "d:", "a:", "s:", "SOAP-ENV:", "xsd:", "xsi:", "wsse:", "wsu:"}
+	prefixes := []string{"tds:", "trt:", "tt:", "tptz:", "tdt:", "dn:", "d:", "a:", "s:", "SOAP-ENV:", "xsd:", "xsi:", "wsse:", "wsu:"}
 	for _, p := range prefixes {
 		xmlStr = strings.ReplaceAll(xmlStr, "<"+p, "<")
 		xmlStr = strings.ReplaceAll(xmlStr, "</"+p, "</")

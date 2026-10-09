@@ -82,8 +82,8 @@ func main() {
 		handler:   h,
 	}
 
-	h.SetOnConnect(func(addr string) {
-		go cm.connect(addr)
+	h.SetOnConnect(func(addr, user, pass string) {
+		go cm.connect(addr, user, pass)
 	})
 
 	h.SetLLMUpdateCallback(func(baseURL, apiKey, model string) {
@@ -127,6 +127,11 @@ type cameraManager struct {
 	ttsClient   *tts.Client
 	handler     *server.Handler
 	onvifClient *onvif.Client
+
+	// authUser/authPass 是当前连接设备的凭证(受 mu 保护):SOAP 走
+	// WS-Security,RTSP/对讲注入 URL userinfo,HTTP 快照走 Basic
+	authUser string
+	authPass string
 
 	mu          sync.Mutex
 	units       []*camUnit
@@ -205,12 +210,14 @@ func (cm *cameraManager) isCurrent(life *streamLife) bool {
 // maxCams 限制同时拉取的画面路数：带宽与浏览器解码能力有限。
 const maxCams = 6
 
-func (cm *cameraManager) connect(address string) {
+func (cm *cameraManager) connect(address, username, password string) {
 	cm.disconnect()
 
 	cm.mu.Lock()
 	life := newStreamLife()
 	cm.life = life
+	cm.authUser = username
+	cm.authPass = password
 	cm.mu.Unlock()
 
 	log.Printf("Connecting to camera: %s", address)
@@ -218,6 +225,8 @@ func (cm *cameraManager) connect(address string) {
 
 	onvifClient := onvif.NewClient(onvif.Config{
 		DeviceAddr: address,
+		Username:   username,
+		Password:   password,
 		Timeout:    5 * time.Second,
 	})
 
@@ -262,7 +271,9 @@ func (cm *cameraManager) connect(address string) {
 		if uri, uriErr := onvifClient.GetStreamURI(ctx, p.Token); uriErr != nil {
 			log.Printf("GetStreamUri(%s) failed: %v, snapshot only", p.Token, uriErr)
 		} else {
-			u.rtspURL = uri.URI
+			/* 取流地址注入凭证:userinfo 形态让 gortsplib 在 401 时自动
+			 * 完成 Basic/Digest 重试,对讲回传通道复用同一地址 */
+			u.rtspURL = onvif.WithCredentials(uri.URI, username, password)
 		}
 
 		units = append(units, u)
@@ -755,7 +766,18 @@ func (cm *cameraManager) fetchAndShowSnapshot(u *camUnit, snapshotURL string) er
 	}
 
 	httpClient := &http.Client{Timeout: 5 * time.Second}
-	resp, err := httpClient.Get(snapshotURL)
+	req, err := http.NewRequest("GET", snapshotURL, nil)
+	if err != nil {
+		return fmt.Errorf("snapshot request: %w", err)
+	}
+	/* 设备开启认证时快照端点同样要求登录(HTTP Basic,与 RTSP/ONVIF 同账号) */
+	cm.mu.Lock()
+	user, pass := cm.authUser, cm.authPass
+	cm.mu.Unlock()
+	if user != "" {
+		req.SetBasicAuth(user, pass)
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("snapshot fetch: %w", err)
 	}
@@ -966,6 +988,8 @@ func (cm *cameraManager) disconnect() {
 	cm.units = nil
 	cm.cameraAudioBuf = nil
 	cm.cameraAudioRate = 0
+	cm.authUser = ""
+	cm.authPass = ""
 	cm.audioState = nil
 	cm.talkbackActive = false
 	cm.talkbackState = nil
