@@ -281,3 +281,48 @@ func TestForwarderRetryWhenTargetOffline(t *testing.T) {
 		return false
 	})
 }
+
+// TestSetDeviceSourcesIfAbsent 校验自动发现的写入不覆盖已登记设备：
+// 匿名解析窗口内用户手动连接了同一台设备时，晚到的匿名源集合必须被
+// 拒绝，已连接的带凭证源保持不变（Enabled 关闭，纯键集合断言）。
+func TestSetDeviceSourcesIfAbsent(t *testing.T) {
+	m := NewManager(Config{DiscoverInterval: time.Hour})
+	defer m.Close()
+
+	connected := []Source{{
+		DeviceAddr: "192.168.1.21",
+		Token:      "p1",
+		Name:       "cam",
+		RTSPURL:    "rtsp://admin:pw@192.168.1.21:554/cam",
+	}}
+	m.SetDeviceSources("192.168.1.21", connected)
+
+	// 同一设备以 XAddr 形态（缺省端口归一后同键）晚到：不得覆盖
+	anonymous := []Source{{
+		DeviceAddr: "http://192.168.1.21:80/onvif/device_service",
+		Token:      "p1",
+		Name:       "cam",
+		RTSPURL:    "rtsp://192.168.1.21:554/cam",
+	}}
+	if m.setDeviceSourcesIfAbsent("http://192.168.1.21:80/onvif/device_service", anonymous) {
+		t.Fatal("已登记设备不应被自动发现覆盖")
+	}
+	got := m.sources["http://192.168.1.21"]
+	if len(got) != 1 || got[0].RTSPURL != connected[0].RTSPURL {
+		t.Fatalf("已连接的带凭证源被覆盖: %+v", got)
+	}
+
+	// 未登记设备正常写入，且按归一化键登记
+	fresh := []Source{{
+		DeviceAddr: "http://192.168.1.5:80/onvif/device_service",
+		Token:      "p1",
+		Name:       "cam",
+		RTSPURL:    "rtsp://192.168.1.5:554/cam",
+	}}
+	if !m.setDeviceSourcesIfAbsent("http://192.168.1.5:80/onvif/device_service", fresh) {
+		t.Fatal("未登记设备应写入成功")
+	}
+	if _, ok := m.sources["http://192.168.1.5"]; !ok {
+		t.Fatalf("新设备应按归一化键登记，实际键集: %v", m.sources)
+	}
+}

@@ -128,6 +128,27 @@ func (m *Manager) RemoveDevice(deviceAddr string) {
 	m.SetDeviceSources(deviceAddr, nil)
 }
 
+// setDeviceSourcesIfAbsent 仅当设备尚未登记时写入源集合（自动发现专用）：
+// discoverOnce 的已知检查与写入之间隔着最长 10s 的匿名解析窗口，期间
+// 用户可能已手动连接同一台设备，晚到的匿名结果不能停掉并覆盖带凭证
+// 的源集合，否则转发会退化为无凭证拉流。
+func (m *Manager) setDeviceSourcesIfAbsent(deviceAddr string, srcs []Source) bool {
+	key := normalizeDeviceAddr(deviceAddr)
+	if key == "" || len(srcs) == 0 {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.sources[key]; exists {
+		return false
+	}
+	m.sources[key] = srcs
+	if m.cfg.Enabled {
+		m.startDeviceLocked(key)
+	}
+	return true
+}
+
 // discoverLoop 常驻循环：每个周期读取最新配置，AutoDiscover 关闭时空转，
 // 开启时执行一轮主动发现。对未登记的设备匿名解析流地址后自动转发；
 // 解析失败（含 401 要求认证）记日志跳过，下轮发现天然重试。
@@ -173,8 +194,10 @@ func (m *Manager) discoverOnce() {
 			log.Printf("[forward] 设备 %s 解析失败，跳过自动转发: %v", d.Address, err)
 			continue
 		}
-		m.SetDeviceSources(d.Address, srcs)
-		log.Printf("[forward] 自动发现设备 %s，转发 %d 路画面", d.Address, len(srcs))
+		// 解析窗口内用户可能已手动连接该设备：只在仍未登记时写入
+		if m.setDeviceSourcesIfAbsent(d.Address, srcs) {
+			log.Printf("[forward] 自动发现设备 %s，转发 %d 路画面", d.Address, len(srcs))
+		}
 	}
 }
 
