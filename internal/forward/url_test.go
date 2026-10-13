@@ -106,13 +106,18 @@ func TestBuildTargetURL(t *testing.T) {
 }
 
 // TestNormalizeDeviceAddr 校验设备键归一化：连接入口与发现 XAddr 的路径
-// 差异必须归并到同一键，否则同一设备会被当成两台重复转发。
+// 差异必须归并到同一键，否则同一设备会被当成两台重复转发；缺省端口也
+// 必须剥离——手动输入裸地址与 XAddr 显式带 :80 是同一台设备。
 func TestNormalizeDeviceAddr(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"http://192.168.1.21:80/onvif/device_service", "http://192.168.1.21:80"},
-		{"http://192.168.1.21:80/onvif/media_service", "http://192.168.1.21:80"},
-		{"192.168.1.21:80/onvif/device_service", "http://192.168.1.21:80"},
+		{"http://192.168.1.21:80/onvif/device_service", "http://192.168.1.21"},
+		{"http://192.168.1.21:80/onvif/media_service", "http://192.168.1.21"},
+		{"192.168.1.21:80/onvif/device_service", "http://192.168.1.21"},
 		{"192.168.1.21", "http://192.168.1.21"},
+		{"https://cam.example.com:443/onvif/device_service", "https://cam.example.com"},
+		{"http://192.168.1.21:8080/onvif/device_service", "http://192.168.1.21:8080"}, // 非缺省端口保留
+		{"http://[fe80::1]:80/onvif/device_service", "http://[fe80::1]"},               // IPv6 归一
+		{"http://[fe80::1]:8899/onvif/device_service", "http://[fe80::1]:8899"},
 	}
 	for _, tc := range cases {
 		if got := normalizeDeviceAddr(tc.in); got != tc.want {

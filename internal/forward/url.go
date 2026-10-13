@@ -2,6 +2,7 @@ package forward
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -86,9 +87,11 @@ func RedactUserinfo(raw string) string {
 	return u.String()
 }
 
-// normalizeDeviceAddr 把设备地址归一化为 scheme://host:port 形式，
+// normalizeDeviceAddr 把设备地址归一化为 scheme://host[:port] 形式，
 // 作为 Manager 里的设备唯一键：连接入口与 WS-Discovery 返回的 XAddr
-// 路径部分可能不同（/onvif/device_service 等），只比较服务端点。
+// 路径部分可能不同（/onvif/device_service 等），只比较服务端点；
+// 缺省端口（http:80 / https:443）一并剥离——XAddr 常显式带 :80 而手动
+// 输入的裸地址不带，保留会让同一台设备生成两个键、被重复转发。
 func normalizeDeviceAddr(addr string) string {
 	raw := strings.TrimSpace(addr)
 	if raw == "" {
@@ -101,7 +104,16 @@ func normalizeDeviceAddr(addr string) string {
 	if err != nil || u.Host == "" {
 		return raw
 	}
-	return u.Scheme + "://" + u.Host
+	host, port := u.Hostname(), u.Port()
+	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]" // IPv6 字面量在 URL 中必须带方括号
+	}
+	return u.Scheme + "://" + host
 }
 
 // deviceHostFromAddr 提取设备地址的主机名（不含端口），用作转发路径里的
