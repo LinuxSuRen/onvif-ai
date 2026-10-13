@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/gorilla/websocket"
+	"github.com/onvif-ai/internal/forward"
 	"github.com/onvif-ai/internal/onvif"
 	"github.com/onvif-ai/internal/onvif/discovery"
 	"github.com/onvif-ai/internal/ws"
@@ -76,6 +78,7 @@ type Handler struct {
 	upgrader       websocket.Upgrader
 	deviceState    DeviceState
 	llmConfig      *LLMConfig
+	forwardConfig  *ForwardConfig
 	snapshotFPS    int
 	onConnect      func(address, username, password string)
 	onAudioData    func([]byte)
@@ -87,6 +90,11 @@ type Handler struct {
 	onPTZMove      func(camera, direction string)
 	onSwitchMode   func(string)
 	onLLMUpdate    func(baseURL, apiKey, model string)
+	// onForwardUpdate 在转发配置保存成功后回调（携带合并后的完整配置），
+	// 由 main 换算成 forward.Config 热更新 Manager
+	onForwardUpdate func(ForwardConfig)
+	// forwardStatus 由 main 注入 Manager.Status，供 /api/forward/status 读取
+	forwardStatus func() []forward.Status
 	// 对讲会话回调：onTalkbackStart 受理会话（返回是否接受与拒绝码），
 	// onTalkbackData 转发 PCM 音频，onTalkbackStop 结束会话
 	onTalkbackStart func() (bool, string)
@@ -102,6 +110,45 @@ type LLMConfig struct {
 	BaseURL string `json:"base_url"`
 	APIKey  string `json:"api_key"`
 	Model   string `json:"model"`
+}
+
+// ForwardConfig 是转发功能的 API 契约（JSON 字段秒级，内部换算 Duration）。
+// 密码与 LLM API Key 同策略：GET 脱敏、PUT 回传脱敏值视为「未修改」。
+type ForwardConfig struct {
+	Enabled           bool   `json:"enabled"`
+	TargetURL         string `json:"target_url"`
+	Username          string `json:"username"`
+	Password          string `json:"password"`
+	UseTLS            bool   `json:"use_tls"`
+	AutoDiscover      bool   `json:"auto_discover"`
+	DiscoverIntervalS int    `json:"discover_interval"` // 秒，<=0 时按默认 30
+}
+
+// ToForward 换算为 internal/forward 的运行配置。
+func (c ForwardConfig) ToForward() forward.Config {
+	return forward.Config{
+		Enabled:          c.Enabled,
+		TargetURL:        c.TargetURL,
+		Username:         c.Username,
+		Password:         c.Password,
+		UseTLS:           c.UseTLS,
+		AutoDiscover:     c.AutoDiscover,
+		DiscoverInterval: time.Duration(c.DiscoverIntervalS) * time.Second,
+	}
+}
+
+// ForwardConfigFrom 把 internal/forward 的配置换算为 API 形态（启动时
+// 向 handler 播种环境变量默认值用）。
+func ForwardConfigFrom(f forward.Config) ForwardConfig {
+	return ForwardConfig{
+		Enabled:           f.Enabled,
+		TargetURL:         f.TargetURL,
+		Username:          f.Username,
+		Password:          f.Password,
+		UseTLS:            f.UseTLS,
+		AutoDiscover:      f.AutoDiscover,
+		DiscoverIntervalS: int(f.DiscoverInterval / time.Second),
+	}
 }
 
 func NewHandler(hub *ws.Hub, listener *discovery.Listener) *Handler {
@@ -211,7 +258,7 @@ func (h *Handler) RegisterRoutes() http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
-		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "OPTIONS"},
 		AllowedHeaders:   []string{"*"},
 		AllowCredentials: true,
 	}))
@@ -224,6 +271,9 @@ func (h *Handler) RegisterRoutes() http.Handler {
 	r.Get("/api/camera/device-info", h.handleDeviceInfo)
 	r.Get("/api/llm/config", h.handleLLMGetConfig)
 	r.Post("/api/llm/config", h.handleLLMSetConfig)
+	r.Get("/api/forward/config", h.handleForwardGetConfig)
+	r.Put("/api/forward/config", h.handleForwardSetConfig)
+	r.Get("/api/forward/status", h.handleForwardStatus)
 	r.Get("/api/settings", h.handleGetSettings)
 	r.Post("/api/settings", h.handleSetSettings)
 
@@ -351,6 +401,27 @@ func (h *Handler) SetLLMConfig(cfg *LLMConfig) {
 	h.llmConfig = cfg
 }
 
+// SetForwardConfig 播种转发配置（main 启动时来自环境变量）。
+func (h *Handler) SetForwardConfig(cfg *ForwardConfig) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.forwardConfig = cfg
+}
+
+// SetForwardUpdateCallback 注册转发配置保存后的热更新回调。
+func (h *Handler) SetForwardUpdateCallback(fn func(ForwardConfig)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onForwardUpdate = fn
+}
+
+// SetForwardStatusProvider 注入状态查询函数（Manager.Status）。
+func (h *Handler) SetForwardStatusProvider(fn func() []forward.Status) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.forwardStatus = fn
+}
+
 func (h *Handler) handleLLMGetConfig(w http.ResponseWriter, r *http.Request) {
 	h.mu.RLock()
 	cfg := h.llmConfig
@@ -398,6 +469,94 @@ func (h *Handler) handleLLMSetConfig(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleForwardGetConfig 返回转发配置，密码脱敏（与 LLM API Key 同策略）。
+func (h *Handler) handleForwardGetConfig(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	cfg := h.forwardConfig
+	h.mu.RUnlock()
+
+	resp := ForwardConfig{}
+	if cfg != nil {
+		resp = *cfg
+	}
+	resp.Password = maskKey(resp.Password)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleForwardSetConfig 保存转发配置并触发热更新。密码为空或含脱敏
+// 占位（***）时保留原值——前端把 GET 看到的脱敏值原样回传属正常操作，
+// 不能当成新密码存进去。
+func (h *Handler) handleForwardSetConfig(w http.ResponseWriter, r *http.Request) {
+	var req ForwardConfig
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+
+	// 启用转发时目标地址必填且必须能构造出合法推流地址，
+	// 校验规则与 Manager 实际使用完全一致（复用 BuildTargetURL）
+	if req.Enabled {
+		if strings.TrimSpace(req.TargetURL) == "" {
+			http.Error(w, `{"error":"启用转发时必须填写流媒体服务器地址"}`, http.StatusBadRequest)
+			return
+		}
+		if _, err := forward.BuildTargetURL(req.ToForward(), "check"); err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+			return
+		}
+	}
+
+	h.mu.Lock()
+	if h.forwardConfig == nil {
+		h.forwardConfig = &ForwardConfig{}
+	}
+	if req.Password == "" || strings.Contains(req.Password, "***") {
+		req.Password = h.forwardConfig.Password
+	}
+	// UI 不暴露发现周期字段：非正值视为「未修改」，保留种子值
+	// （否则一次保存会把环境变量里的自定义周期冲回默认）
+	if req.DiscoverIntervalS <= 0 {
+		req.DiscoverIntervalS = h.forwardConfig.DiscoverIntervalS
+	}
+	*h.forwardConfig = req
+	merged := *h.forwardConfig
+	onUpdate := h.onForwardUpdate
+	h.mu.Unlock()
+
+	if onUpdate != nil {
+		go onUpdate(merged)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleForwardStatus 返回每路转发的当前状态；未注入 provider 时返回空集。
+func (h *Handler) handleForwardStatus(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	fn := h.forwardStatus
+	h.mu.RUnlock()
+
+	statuses := []forward.Status{}
+	if fn != nil {
+		if got := fn(); got != nil {
+			statuses = got
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled":  h.forwardConfigEnabled(),
+		"forwards": statuses,
+	})
+}
+
+func (h *Handler) forwardConfigEnabled() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.forwardConfig != nil && h.forwardConfig.Enabled
 }
 
 func (h *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request) {

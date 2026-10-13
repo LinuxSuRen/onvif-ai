@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/onvif-ai/internal/audio"
+	"github.com/onvif-ai/internal/forward"
 	"github.com/onvif-ai/internal/llm"
 	"github.com/onvif-ai/internal/onvif"
 	"github.com/onvif-ai/internal/onvif/discovery"
@@ -66,6 +67,12 @@ func main() {
 		Endpoint: os.Getenv("TTS_ENDPOINT"),
 	}
 
+	// 转发（mediamtx 等）：环境变量只是启动默认值，运行时可经 API 覆盖，
+	// 覆盖为内存态、重启回落（见 internal/forward/config.go 注释）
+	fwdCfg := forward.ConfigFromEnv()
+	fwdMgr := forward.NewManager(fwdCfg)
+	defer fwdMgr.Close()
+
 	llmClient := llm.NewClient(llmCfg)
 	ttsClient := tts.NewClient(ttsCfg)
 
@@ -75,11 +82,21 @@ func main() {
 		Model:   llmCfg.Model,
 	})
 
+	fwdAPICfg := server.ForwardConfigFrom(fwdCfg)
+	h.SetForwardConfig(&fwdAPICfg)
+	h.SetForwardUpdateCallback(func(c server.ForwardConfig) {
+		fwdMgr.UpdateConfig(c.ToForward())
+		log.Printf("转发配置已更新: enabled=%v target=%s tls=%v autodiscover=%v",
+			c.Enabled, c.TargetURL, c.UseTLS, c.AutoDiscover)
+	})
+	h.SetForwardStatusProvider(fwdMgr.Status)
+
 	cm := &cameraManager{
 		hub:       hub,
 		llmClient: llmClient,
 		ttsClient: ttsClient,
 		handler:   h,
+		fwd:       fwdMgr,
 	}
 
 	h.SetOnConnect(func(addr, user, pass string) {
@@ -127,6 +144,10 @@ type cameraManager struct {
 	ttsClient   *tts.Client
 	handler     *server.Handler
 	onvifClient *onvif.Client
+	// fwd 是流媒体转发管理器；摄像头连接的画面自动登记为转发源
+	fwd *forward.Manager
+	// addr 是当前连接设备的地址（转发源登记/注销的设备键）
+	addr string
 
 	// authUser/authPass 是当前连接设备的凭证(受 mu 保护):SOAP 走
 	// WS-Security,RTSP/对讲注入 URL userinfo,HTTP 快照走 Basic
@@ -218,6 +239,7 @@ func (cm *cameraManager) connect(address, username, password string) {
 	cm.life = life
 	cm.authUser = username
 	cm.authPass = password
+	cm.addr = address
 	cm.mu.Unlock()
 
 	log.Printf("Connecting to camera: %s", address)
@@ -292,6 +314,7 @@ func (cm *cameraManager) connect(address, username, password string) {
 	cm.cameraAudioBufMax = 160000
 	cm.mu.Unlock()
 	cm.syncCameraStates()
+	cm.syncForwardSources()
 
 	for _, u := range units {
 		go cm.runUnit(u, life, address)
@@ -687,6 +710,29 @@ func (cm *cameraManager) ownsUnit(u *camUnit) bool {
 	return false
 }
 
+// syncForwardSources 把当前连接设备的各路画面登记到转发管理器：
+// rtspURL 已内嵌凭证，转发直接复用；仅快照降级（无 rtspURL）的画面跳过。
+func (cm *cameraManager) syncForwardSources() {
+	if cm.fwd == nil {
+		return
+	}
+	cm.mu.Lock()
+	addr := cm.addr
+	srcs := make([]forward.Source, 0, len(cm.units))
+	for _, u := range cm.units {
+		if u.rtspURL != "" {
+			srcs = append(srcs, forward.Source{
+				DeviceAddr: addr,
+				Token:      u.token,
+				Name:       u.name,
+				RTSPURL:    u.rtspURL,
+			})
+		}
+	}
+	cm.mu.Unlock()
+	cm.fwd.SetDeviceSources(addr, srcs)
+}
+
 // getProfilesWithRetry keeps polling the ONVIF endpoint: WiFi cameras are
 // often briefly unreachable right after a reboot/drop, and the RTSP-level
 // retry loop can only kick in once profiles are known.
@@ -976,6 +1022,8 @@ func (cm *cameraManager) disconnect() {
 	cm.mu.Lock()
 	life := cm.life
 	cm.life = nil
+	addr := cm.addr
+	cm.addr = ""
 	for _, u := range cm.units {
 		if u.stream != nil {
 			u.stream.Close()
@@ -1001,6 +1049,10 @@ func (cm *cameraManager) disconnect() {
 	cm.mu.Unlock()
 
 	life.stop()
+	// 断开连接即注销该设备的全部转发源（无源可转发时等价于停止转发）
+	if cm.fwd != nil && addr != "" {
+		cm.fwd.RemoveDevice(addr)
+	}
 	cm.handler.SetCameras(nil)
 	cm.handler.SetAudio(nil)
 	cm.handler.SetTalkback(nil)
