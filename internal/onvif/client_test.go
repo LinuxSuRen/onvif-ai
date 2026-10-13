@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -141,6 +142,13 @@ func TestClientUnauthorizedWithoutCredentials(t *testing.T) {
 	if !strings.Contains(err.Error(), "认证") {
 		t.Fatalf("error should mention 认证, got: %v", err)
 	}
+	var authErr *AuthError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("error should unwrap to *AuthError, got %T: %v", err, err)
+	}
+	if authErr.CredentialsProvided {
+		t.Fatal("CredentialsProvided should be false without credentials")
+	}
 }
 
 func TestClientWrongPasswordRejected(t *testing.T) {
@@ -154,6 +162,13 @@ func TestClientWrongPasswordRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "401") {
 		t.Fatalf("error should mention 401, got: %v", err)
+	}
+	var authErr *AuthError
+	if !errors.As(err, &authErr) {
+		t.Fatalf("error should unwrap to *AuthError, got %T: %v", err, err)
+	}
+	if !authErr.CredentialsProvided {
+		t.Fatal("CredentialsProvided should be true when credentials were sent")
 	}
 }
 
