@@ -4,7 +4,7 @@ import { ref } from 'vue'
  * WebSocket message from the ONVIF AI backend.
  */
 export interface WsMessage {
-  type: 'video_nal' | 'video_jpeg' | 'audio_out' | 'transcript' | 'status' | 'error' | 'audio_start' | 'audio_data' | 'audio_stop' | 'speech_text' | 'switch_mode' | 'device_state' | 'ptz_move' | 'camera_listen' | 'clear_history' | 'clock_sync' | 'talkback_start' | 'audio_in' | 'talkback_stop' | 'talkback_state'
+  type: 'video_nal' | 'video_jpeg' | 'audio_out' | 'transcript' | 'status' | 'error' | 'audio_start' | 'audio_data' | 'audio_stop' | 'speech_text' | 'switch_mode' | 'device_state' | 'ptz_move' | 'camera_listen' | 'clear_history' | 'clock_sync' | 'talkback_start' | 'audio_in' | 'talkback_stop' | 'talkback_state' | 'view_control'
   data?: string
   text?: string
   ts?: number

@@ -21,11 +21,14 @@ const (
 )
 
 type Hub struct {
-	clients    map[*Client]bool
-	broadcast  chan []byte
-	register   chan *Client
-	unregister chan *Client
-	mu         sync.RWMutex
+	clients   map[*Client]bool
+	broadcast chan []byte
+	// videoBroadcast 承载视频帧：与 broadcast 分离，投递时只发给
+	// 已显式请求画面的连接（issue #26），其余消息仍全员广播
+	videoBroadcast chan []byte
+	register       chan *Client
+	unregister     chan *Client
+	mu             sync.RWMutex
 }
 
 type Client struct {
@@ -35,16 +38,22 @@ type Client struct {
 	mu     sync.Mutex
 	closed bool
 
+	// wantVideo 由 hub.mu 保护：该连接是否已显式请求接收视频帧。
+	// 默认 false（页面打开不自动推流），view_control start 置 true。
+	// 状态挂在连接上，断开即销毁，重连自然回到默认关闭。
+	wantVideo bool
+
 	// slowSince 由 Run 循环独占访问：send 持续满仓的起始时刻
 	slowSince time.Time
 }
 
 func NewHub() *Hub {
 	return &Hub{
-		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte, 256),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
+		clients:        make(map[*Client]bool),
+		broadcast:      make(chan []byte, 256),
+		videoBroadcast: make(chan []byte, 256),
+		register:       make(chan *Client),
+		unregister:     make(chan *Client),
 	}
 }
 
@@ -68,26 +77,39 @@ func (h *Hub) Run() {
 			}
 
 		case message := <-h.broadcast:
-			h.mu.RLock()
-			for client := range h.clients {
-				select {
-				case client.send <- message:
-					client.slowSince = time.Time{}
-				default:
-					// 缓冲满：宽限期内丢消息（下个 IDR 自动恢复画面），
-					// 持续落后才移除，防止卡死客户端拖垮广播
-					if client.slowSince.IsZero() {
-						client.slowSince = time.Now()
-						continue
-					}
-					if time.Since(client.slowSince) > slowClientGrace {
-						go h.removeClient(client)
-					}
-				}
-			}
-			h.mu.RUnlock()
+			h.dispatch(message, false)
+
+		case message := <-h.videoBroadcast:
+			h.dispatch(message, true)
 		}
 	}
+}
+
+// dispatch 把一条已序列化的消息投递给客户端；videoOnly 为 true 时仅投给
+// 已显式请求画面的连接。只在 Run 循环内调用，slowSince 的独占访问约定
+// 保持不变。
+func (h *Hub) dispatch(message []byte, videoOnly bool) {
+	h.mu.RLock()
+	for client := range h.clients {
+		if videoOnly && !client.wantVideo {
+			continue
+		}
+		select {
+		case client.send <- message:
+			client.slowSince = time.Time{}
+		default:
+			// 缓冲满：宽限期内丢消息（下个 IDR 自动恢复画面），
+			// 持续落后才移除，防止卡死客户端拖垮广播
+			if client.slowSince.IsZero() {
+				client.slowSince = time.Now()
+				continue
+			}
+			if time.Since(client.slowSince) > slowClientGrace {
+				go h.removeClient(client)
+			}
+		}
+	}
+	h.mu.RUnlock()
 }
 
 func (h *Hub) removeClient(client *Client) {
@@ -111,6 +133,25 @@ func (h *Hub) BroadcastMessage(msg *Message) {
 	h.broadcast <- data
 }
 
+// BroadcastVideo 把视频消息只投递给已显式请求画面的客户端（issue #26：
+// 未打开画面的连接不搬运视频帧，省带宽），其余消息仍走 BroadcastMessage
+// 全员广播。
+func (h *Hub) BroadcastVideo(msg *Message) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	h.videoBroadcast <- data
+}
+
+// SetVideoView 设置某条连接是否接收视频广播，是 view_control start/stop
+// 的落地动作。写侧持 hub 锁，与 dispatch 的读侧互斥。
+func (h *Hub) SetVideoView(client *Client, enabled bool) {
+	h.mu.Lock()
+	client.wantVideo = enabled
+	h.mu.Unlock()
+}
+
 // BroadcastVideoNAL sends one H.264 NAL unit; cam is the media profile token
 // of the camera it belongs to (may be empty for single-camera devices).
 func (h *Hub) BroadcastVideoNAL(cam string, nalu []byte) {
@@ -120,7 +161,7 @@ func (h *Hub) BroadcastVideoNAL(cam string, nalu []byte) {
 		Ts:   time.Now().UnixMilli(),
 		Cam:  cam,
 	}
-	h.BroadcastMessage(msg)
+	h.BroadcastVideo(msg)
 }
 
 // BroadcastVideoJPEG sends one JPEG snapshot frame for the given camera.
@@ -130,7 +171,7 @@ func (h *Hub) BroadcastVideoJPEG(cam string, jpeg []byte) {
 		Data: base64.StdEncoding.EncodeToString(jpeg),
 		Cam:  cam,
 	}
-	h.BroadcastMessage(msg)
+	h.BroadcastVideo(msg)
 }
 
 // BroadcastAudioPCM sends one linear PCM chunk from the camera's audio track.

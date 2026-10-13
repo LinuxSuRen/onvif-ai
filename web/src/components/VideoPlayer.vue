@@ -30,6 +30,9 @@ const mode = ref<'grid' | 'single'>(
 )
 const activeCam = ref('')
 const videoError = ref('')
+// 画面开关（issue #26）：默认不自动播放，用户点击占位符后才向服务端
+// 请求视频帧。服务端按连接记忆该状态，断线重连是新连接，需要重发 start。
+const viewing = ref(false)
 
 const { isConnected, isConnecting, send, subscribe } = useWebSocket('/ws')
 const { paused, togglePause } = usePaused()
@@ -101,6 +104,13 @@ function switchCamera(token: string) {
   activeCam.value = token
 }
 
+// 用户点击占位符打开画面：只需发一次 start，服务端会持续推帧到本连接
+function openView() {
+  if (viewing.value) return
+  viewing.value = true
+  send({ type: 'view_control', payload: { action: 'start' } })
+}
+
 function camDisplayName(cam: CamInfo, index: number) {
   return cam.name || `摄像头 ${index + 1}`
 }
@@ -138,6 +148,10 @@ const resetKey = ref(0)
 watch(isConnected, (connected) => {
   if (connected) {
     connectionStatus.value = 'connected'
+    // 服务端按连接记忆画面开关：重连后默认回到关闭，已打开过则重发 start
+    if (viewing.value) {
+      send({ type: 'view_control', payload: { action: 'start' } })
+    }
     bestSyncRtt = Number.POSITIVE_INFINITY
     clockOffsetRef.value = null
     resetKey.value++
@@ -318,7 +332,15 @@ onUnmounted(() => {
       <!-- 右下角：设备级音频状态与播放控制（浮层，不占布局空间） -->
       <AudioMonitor />
 
-      <div v-if="!hasAnyStream" class="video-player__placeholder">
+      <!-- 默认占位（issue #26）：点击后才向服务端请求视频帧，覆盖在画面区域之上 -->
+      <button v-if="!viewing" class="video-player__open" type="button" @click="openView">
+        <svg class="video-player__open-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M8 5.5v13l11-6.5-11-6.5z" />
+        </svg>
+        <span class="video-player__open-text">点击打开画面</span>
+      </button>
+
+      <div v-else-if="!hasAnyStream" class="video-player__placeholder">
         <span class="video-player__placeholder-icon">📷</span>
         <span class="video-player__placeholder-text">暂无摄像头画面</span>
       </div>
@@ -567,6 +589,47 @@ onUnmounted(() => {
 
 .video-player__cam-btn:not(.video-player__cam-btn--active):hover {
   color: rgba(255, 255, 255, 0.95);
+}
+
+/* 默认占位（issue #26）：整块可点击；层级低于模式切换/音频控件（z-20），
+   这些控件与画面无关，未打开画面时也应可用 */
+.video-player__open {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  background: #020408;
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.video-player__open:hover,
+.video-player__open:focus-visible {
+  background: #050b14;
+}
+
+.video-player__open-icon {
+  width: 40px;
+  height: 40px;
+  color: var(--color-text-dim);
+  transition: color 0.15s;
+}
+
+.video-player__open:hover .video-player__open-icon,
+.video-player__open:focus-visible .video-player__open-icon {
+  color: var(--color-accent-green);
+}
+
+.video-player__open-text {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--color-text-dim);
+  letter-spacing: 0.04em;
 }
 
 .video-player__placeholder {

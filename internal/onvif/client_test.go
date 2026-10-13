@@ -78,8 +78,11 @@ func deviceTimeBody() string {
 		now.Year(), int(now.Month()), now.Day(), now.Hour(), now.Minute(), now.Second()))
 }
 
-/* newAuthDevice 模拟开启认证的 ONVIF 设备:
-对时免认证,其余操作要求合法 UsernameToken,否则 HTTP 401 */
+/*
+	newAuthDevice 模拟开启认证的 ONVIF 设备:
+
+对时免认证,其余操作要求合法 UsernameToken,否则 HTTP 401
+*/
 func newAuthDevice(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

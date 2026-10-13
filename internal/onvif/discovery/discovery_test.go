@@ -1,4 +1,4 @@
-﻿package discovery
+package discovery
 
 import (
 	"strings"
