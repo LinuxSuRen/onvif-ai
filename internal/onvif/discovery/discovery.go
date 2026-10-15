@@ -217,20 +217,27 @@ func Probe(ifaceName string) ([]Device, error) {
 	// 可能选中不可达的虚拟网卡导致 wsasendto: unreachable（实测），
 	// Probe 一个包都发不出去。改为逐个候选源地址绑定发送：
 	// 绑定源 IP 后组播从对应接口发出，发送失败的接口直接跳过。
+	candidates, err := candidateIPs(ifaceName)
+	if err != nil {
+		return nil, err
+	}
 	var conns []net.PacketConn
-	for _, ip := range candidateIPs(ifaceName) {
+	for _, ip := range candidates {
 		conn, err := net.ListenPacket("udp4", ip+":0")
 		if err != nil {
+			log.Printf("[discovery] 接口 %s 绑定失败: %v", ip, err)
 			continue
 		}
 		if _, err := conn.WriteTo([]byte(probe), mcastAddr); err != nil {
 			_ = conn.Close()
+			log.Printf("[discovery] 接口 %s 发送探测失败: %v", ip, err)
 			continue
 		}
 		conns = append(conns, conn)
 	}
 	if len(conns) == 0 {
 		// 兜底退回历史行为（单网卡机器上依旧可用）。
+		log.Printf("[discovery] 候选 %d 个接口全部发送失败，回退 0.0.0.0", len(candidates))
 		conn, err := net.ListenPacket("udp4", "0.0.0.0:0")
 		if err != nil {
 			return nil, fmt.Errorf("listen UDP: %w", err)
@@ -301,19 +308,26 @@ func isVirtualIface(name string) bool {
 // candidateIPs 返回探测应绑定的本机 IPv4 源地址：
 //   - ifaceName 为 IP 时直接使用；为接口名时取该接口的 IPv4；
 //   - 为空时枚举所有 up 的非回环物理候选接口（过滤常见虚拟网卡）。
-func candidateIPs(ifaceName string) []string {
+//
+// ifaceName 非空但解析不到候选（接口不存在/无可用 IPv4/传入 IPv6）时
+// 返回明确错误——静默回退全网卡探测会让「只在指定接口探测」的语义被
+// 丢弃，接口名拼写错误这类配置问题也无从察觉。
+func candidateIPs(ifaceName string) ([]string, error) {
 	if ifaceName != "" {
 		if ip := net.ParseIP(ifaceName); ip != nil && ip.To4() != nil {
-			return []string{ip.String()}
+			return []string{ip.String()}, nil
 		}
 		if iface, err := net.InterfaceByName(ifaceName); err == nil {
-			return ipv4Addrs(iface)
+			if ips := ipv4Addrs(iface); len(ips) > 0 {
+				return ips, nil
+			}
+			return nil, fmt.Errorf("指定的网络接口 %s 无可用 IPv4 地址", ifaceName)
 		}
-		return nil
+		return nil, fmt.Errorf("指定的网络接口 %s 不存在", ifaceName)
 	}
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var ips []string
 	for _, ifc := range ifaces {
@@ -325,7 +339,7 @@ func candidateIPs(ifaceName string) []string {
 		}
 		ips = append(ips, ipv4Addrs(&ifc)...)
 	}
-	return ips
+	return ips, nil
 }
 
 func ipv4Addrs(iface *net.Interface) []string {
