@@ -436,16 +436,31 @@ func (s *Stream) Connect() error {
 					s.auNALs = append(s.auNALs, nalu)
 				}
 			}
-			if s.videoNALHandler == nil {
-				return
-			}
 			for _, nalu := range nalus {
-				if !s.resKnown && len(nalu) > 0 && nalu[0]&0x1F == 7 {
-					// SDP 未携带参数集时，从带内首个 SPS NAL 解析分辨率
+				if len(nalu) == 0 {
+					continue
+				}
+				// 带内参数集回写：SDP 未携带 sprop-parameter-sets 的相机只有
+				// 带内 SPS/PPS 可用；分辨率切换后的新 SPS 也经此刷新——
+				// fmp4 muxer 的 SPSChanged 重建依赖这里持续更新，否则带内
+				// 参数集的相机整路无画面、重建能力是死代码。
+				switch nalu[0] & 0x1F {
+				case 7:
+					s.sps = nalu
+				case 8:
+					s.pps = nalu
+				}
+				// SDP 未携带参数集时，从带内首个 SPS NAL 解析分辨率
+				if !s.resKnown && nalu[0]&0x1F == 7 {
 					if w, h := resolutionFromSPS(nalu); w > 0 {
 						s.reportResolution(w, h)
 					}
 				}
+			}
+			if s.videoNALHandler == nil {
+				return
+			}
+			for _, nalu := range nalus {
 				if isIDRNAL(nalu) {
 					// Parameter sets usually live only in the SDP; re-send
 					// them ahead of each keyframe so any client that just
