@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -149,6 +151,9 @@ type cameraManager struct {
 	fwd *forward.Manager
 	// addr 是当前连接设备的地址（转发源登记/注销的设备键）
 	addr string
+	// eventSub 是设备的 ONVIF Event 订阅器（PullPoint 模型），
+	// 设备不支持 Event 时静默降级（不影响取流）
+	eventSub *onvif.EventSubscriber
 
 	// authUser/authPass 是当前连接设备的凭证(受 mu 保护):SOAP 走
 	// WS-Security,RTSP/对讲注入 URL userinfo,HTTP 快照走 Basic
@@ -326,6 +331,18 @@ func (cm *cameraManager) connect(address, username, password string) {
 	cm.mu.Unlock()
 	cm.syncCameraStates()
 	cm.syncForwardSources()
+
+	// 启动 Event 订阅（PullPoint）：设备端实时推送 SignalLoss/Motion/Battery 等，
+	// 不支持 Event 的设备静默降级。Motion 事件触发 AI 分析管线。
+	cm.mu.Lock()
+	client := cm.onvifClient
+	cm.mu.Unlock()
+	if client != nil {
+		logger := slog.Default()
+		cm.mu.Lock()
+		cm.eventSub = client.StartEventSubscriber(address, logger, cm.onDeviceEvent)
+		cm.mu.Unlock()
+	}
 
 	for _, u := range units {
 		go cm.runUnit(u, life, address)
@@ -1076,6 +1093,10 @@ func (cm *cameraManager) disconnect() {
 	cm.life = nil
 	addr := cm.addr
 	cm.addr = ""
+	if cm.eventSub != nil {
+		cm.eventSub.Stop()
+		cm.eventSub = nil
+	}
 	for _, u := range cm.units {
 		if u.stream != nil {
 			u.stream.Close()
@@ -1210,3 +1231,121 @@ func isAddrInUse(err error) bool {
 var _ = audio.PCM16kSampleRate
 var _ = base64.StdEncoding
 var _ = strings.TrimSpace
+
+// ===================== ONVIF Event 路由 =====================
+
+// onDeviceEvent 是 EventSubscriber 的回调（订阅 goroutine 上执行，不阻塞）：
+// 全量广播 device_event 到前端 + Motion 事件触发 AI 分析管线。
+func (cm *cameraManager) onDeviceEvent(ev onvif.EventMessage) {
+	// 1. 全量推送到前端（前端按 topic 渲染健康徽标/告警横幅/事件面板）
+	cm.hub.BroadcastMessage(&ws.Message{
+		Type: ws.MsgTypeDeviceEvent,
+		Payload: mustJSON(ws.DeviceEventPayload{
+			Topic:  ev.Topic,
+			Source: ev.Source,
+			Data:   ev.Data,
+			Device: ev.Device,
+			Time:   ev.UTCTime,
+		}),
+	})
+
+	// 2. Motion State=true → AI 分析管线（快照→LLM→TTS）
+	if ev.IsMotion() && ev.Data["State"] == "true" {
+		go cm.motionAIPipeline(ev)
+	}
+}
+
+// motionAIPipeline 移动侦测触发的 AI 分析：
+// 抓快照 → 发 LLM 分析画面内容 → TTS 播报到设备扬声器（可用时）。
+// 全流程可失败降级（LLM 未配置/TTS 不可用/快照失败——只记日志不中断）。
+func (cm *cameraManager) motionAIPipeline(ev onvif.EventMessage) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[motion-ai] pipeline panic: %v", r)
+		}
+	}()
+
+	// 找 Source Camera_N 对应的 camUnit 取快照 URL
+	cm.mu.Lock()
+	var snapURL string
+	for _, u := range cm.units {
+		if u.snapshotURL != "" {
+			snapURL = u.snapshotURL
+			break
+		}
+	}
+	cm.mu.Unlock()
+	if snapURL == "" {
+		log.Printf("[motion-ai] no snapshot URL available, skip")
+		return
+	}
+
+	// 抓快照（带 Basic 认证）
+	cm.mu.Lock()
+	authUser, authPass := cm.authUser, cm.authPass
+	cm.mu.Unlock()
+	snapURL = onvif.WithCredentials(snapURL, authUser, authPass)
+	jpegData, err := httpGetBinary(snapURL, 5*time.Second)
+	if err != nil || len(jpegData) < 100 {
+		log.Printf("[motion-ai] snapshot failed: %v (%d bytes)", err, len(jpegData))
+		return
+	}
+
+	// LLM 分析（发送 base64 JPEG）
+	cm.mu.Lock()
+	llmCl := cm.llmClient
+	cm.mu.Unlock()
+	if llmCl == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	analysis, err := llmCl.Chat(ctx, []llm.Message{
+		{Role: "user", Content: fmt.Sprintf(
+			"[移动侦测触发] 请用一句话描述这个画面中发生了什么（中文，不超过30字）：\n[data:image/jpeg;base64,%s]",
+			base64.StdEncoding.EncodeToString(jpegData))},
+	})
+	if err != nil {
+		log.Printf("[motion-ai] LLM analysis failed: %v", err)
+		return
+	}
+	analysis = strings.TrimSpace(analysis)
+	if analysis == "" {
+		return
+	}
+
+	// 广播 AI 分析结果到前端（transcript 消息，前端聊天面板展示）
+	cm.hub.BroadcastTranscript("[AI 移动侦测] " + analysis)
+	log.Printf("[motion-ai] %s", analysis)
+
+	// TTS 播报到设备扬声器（backchannel 可用且无对讲/播报占用时）
+	cm.mu.Lock()
+	ready := cm.talkbackReady && !cm.talkbackActive && !cm.ttsAudioActive
+	ttsClient := cm.ttsClient
+	cm.mu.Unlock()
+	if ready && ttsClient != nil {
+		go func() {
+			cm.speakToBackchannel(ctx, ttsClient, analysis)
+		}()
+	}
+}
+
+// mustJSON 序列化（内部使用，序列化失败返回空 JSON——不应发生）。
+func mustJSON(v interface{}) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+// httpGetBinary 抓取 URL 内容为 []byte（带超时；用于快照）。
+func httpGetBinary(url string, timeout time.Duration) ([]byte, error) {
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+}

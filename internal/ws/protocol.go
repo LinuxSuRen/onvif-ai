@@ -34,6 +34,7 @@ const (
 	MsgTypePTZCommand    MessageType = "ptz_command"    // PTZ command result (direction + text)
 	MsgTypeTalkbackState MessageType = "talkback_state" // Intercom session accept/reject result
 	MsgTypeConnectError  MessageType = "connect_error"  // Structured connect failure (stable code)
+	MsgTypeDeviceEvent   MessageType = "device_event"   // ONVIF device event (SignalLoss/Motion/Battery/AuthFailure)
 )
 
 // Message is the JSON envelope for all WebSocket messages.
@@ -135,6 +136,16 @@ type ConnectErrorPayload struct {
 // NewMessage creates a new Message of the given type.
 func NewMessage(t MessageType) *Message {
 	return &Message{Type: t}
+}
+
+// DeviceEventPayload 是 device_event 消息的负载：来自 ONVIF 设备的实时事件。
+// Topic 为标准 ONVIF topic（如 tns1:VideoSource/SignalLoss），Data 携带键值对。
+type DeviceEventPayload struct {
+	Topic  string            `json:"topic"`
+	Source map[string]string `json:"source,omitempty"`
+	Data   map[string]string `json:"data,omitempty"`
+	Device string            `json:"device,omitempty"` // 设备地址
+	Time   string            `json:"time,omitempty"`   // 设备侧 UTC 时间
 }
 
 // WithData sets the data field (base64).
