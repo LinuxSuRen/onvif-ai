@@ -51,6 +51,9 @@ let objectUrl = ''
 // codec 由首个 init 段携带（avc1.XXXX，来自 SPS），SourceBuffer 必须用
 // 真实 codec 创建——猜错会导致首 init 触发无谓重建并错过整个 GOP。
 let codecString = ''
+// 最近一次接受的 init 段字节：后端每 GOP 重发同一 init，字节比较检测
+// 编码参数变化（见 feedFMP4 的 init 分支）
+let lastInitBytes: Uint8Array | null = null
 const appendQueue: (ArrayBuffer | Uint8Array)[] = []
 // 管线未就绪（等 init / 等 sourceopen）期间缓存最近一个关键帧段：
 // 播放必须从关键帧起步，缓存它可保证 init 到位后立即可播。
@@ -158,6 +161,15 @@ function onSourceBufferError(e: Event) {
   scheduleReset()
 }
 
+// initBytesEqual 比较两段 init 的字节内容（同长度时逐字节比对）。
+function initBytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
 // 缓冲瘦身：实时流只保留播放点附近的历史，防止 SourceBuffer 无限增长。
 function evictBuffer() {
   const v = videoRef.value
@@ -192,17 +204,19 @@ function feedFMP4(kind: string, codec: string, base64Data: string, serverTs?: nu
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
 
   if (kind === 'init') {
-    if (!awaitingInit && sourceBuffer) return // 就绪后忽略随 GOP 重发的 init
-    if (codec) {
-      const cs = `video/mp4; codecs="${codec}"`
-      if (cs !== codecString && sourceBuffer) {
-        // codec 变化（SPS 换了，分辨率切换）：当前 buffer 无法复用，重建
-        codecString = cs
-        scheduleReset()
-        return
-      }
-      codecString = cs
+    if (!awaitingInit && sourceBuffer) {
+      // 就绪后对随 GOP 重发的 init 做字节比较（init 段仅几百字节，代价
+      // 可忽略）：相同则忽略；不同说明编码参数变化（SPS 更换、分辨率
+      // 切换），旧 SourceBuffer 无法复用，整条管线重建。此前仅比较
+      // codec 字符串的分支在稳态下不可达（init 在此之前已被忽略）。
+      if (lastInitBytes && initBytesEqual(lastInitBytes, bytes)) return
+      lastInitBytes = bytes
+      if (codec) codecString = `video/mp4; codecs="${codec}"`
+      scheduleReset()
+      return
     }
+    if (codec) codecString = `video/mp4; codecs="${codec}"`
+    lastInitBytes = bytes
     appendQueue.length = 0
     appendQueue.push(bytes)
     if (pendingKeySeg) appendQueue.push(pendingKeySeg) // 缓存的关键帧段紧随 init
