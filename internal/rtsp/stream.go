@@ -62,17 +62,62 @@ type Stream struct {
 
 	closeOnce sync.Once
 
-	videoNALHandler  func([]byte)
-	videoJPEGHandler func([]byte)
-	audioPCMHandler  func(pcm []byte, sampleRate, channels int)
+	videoNALHandler   func([]byte)
+	videoFrameHandler func(au [][]byte, durTicks uint32, key bool)
+	videoJPEGHandler  func([]byte)
+	audioPCMHandler   func(pcm []byte, sampleRate, channels int)
+
+	// AU 组装状态（fMP4 路径），由 RTSP 读循环独占访问
+	auNALs      [][]byte
+	auTS        uint32 // 本帧起始 RTP 时间戳（同帧各包共享）
+	auHasVCL    bool
+	lastFrameTS uint32
+	haveLastTS  bool
 }
 
 func NewStream(rtspURL string) *Stream {
 	return &Stream{rawURL: rtspURL}
 }
 
+// rtpVideoTimescale H.264 RTP 视频时钟（90kHz）。
+const rtpVideoTimescale = 90000
+
 func (s *Stream) OnVideoNAL(handler func([]byte)) {
 	s.videoNALHandler = handler
+}
+
+// OnVideoFrame 注册整帧回调（fMP4 封装路径）：au 为本帧行长前缀前的
+// 裸 NAL 列表（含 IDR 前置的 SPS/PPS），durTicks 为 90kHz 帧时长，
+// key 为是否关键帧。与 OnVideoNAL 互不干扰，可同时注册。
+func (s *Stream) OnVideoFrame(handler func(au [][]byte, durTicks uint32, key bool)) {
+	s.videoFrameHandler = handler
+}
+
+// emitFrame 结束一个 AU：计算时长并回调。时基回绕用无符号减法（RTP 32 位环绕安全）；
+// 首帧时长未知时按 15fps 兜底。
+func (s *Stream) emitFrame(ts uint32) {
+	au := s.auNALs
+	s.auNALs = nil
+	s.auHasVCL = false
+	if len(au) == 0 {
+		return
+	}
+	dur := uint32(rtpVideoTimescale / 15)
+	if s.haveLastTS {
+		if d := ts - s.lastFrameTS; d > 0 && d < rtpVideoTimescale*2 {
+			dur = d
+		}
+	}
+	s.lastFrameTS = ts
+	s.haveLastTS = true
+	key := false
+	for _, n := range au {
+		if isIDRNAL(n) {
+			key = true
+			break
+		}
+	}
+	s.videoFrameHandler(au, dur, key)
 }
 
 // OnVideoJPEG registers the handler for complete JPEG frames (MJPEG over
@@ -86,6 +131,10 @@ func (s *Stream) OnVideoJPEG(handler func([]byte)) {
 func (s *Stream) IsMJPEG() bool {
 	return s.mjpegDec != nil
 }
+
+// SPS/PPS 返回 SDP（或带内缓存的）参数集，供 fMP4 封装器构造 init 段。
+func (s *Stream) SPS() []byte { return s.sps }
+func (s *Stream) PPS() []byte { return s.pps }
 
 // OnVideoResolution registers the handler for the stream's pixel resolution.
 // It fires exactly once per connection attempt, as soon as the resolution is
@@ -356,7 +405,38 @@ func (s *Stream) Connect() error {
 	if s.h264Dec != nil {
 		s.client.OnPacketRTP(videoMedia, videoH264, func(pkt *rtp.Packet) {
 			nalus, err := s.h264Dec.Decode(pkt)
-			if err != nil || s.videoNALHandler == nil {
+			if err != nil {
+				return
+			}
+			// AU 组装（fMP4 路径）：按 RTP timestamp 变化判帧边界——
+			// 同一帧的所有包（含多个 slice，x264 帧内多线程时每帧 ~N 个
+			// slice NAL）共享同一 timestamp，timestamp 变化即新帧开始。
+			// 非 VCL（SPS/PPS/SEI）归属其后的帧。不依赖 RTP marker：
+			// 服务端转发链（gortsplib ServerStream 重打包）实测会稀疏化
+			// marker（8-11 帧才一个）；也不按"每个 VCL NAL 都是帧边界"
+			//（多 slice 帧会被拆碎，实测 150 emits/s）。
+			if s.videoFrameHandler != nil {
+				for _, nalu := range nalus {
+					if len(nalu) == 0 {
+						continue
+					}
+					t := nalu[0] & 0x1F
+					isVCL := t >= 1 && t <= 5
+					if isVCL {
+						if s.auHasVCL && pkt.Header.Timestamp != s.auTS {
+							s.emitFrame(s.auTS)
+							s.auNALs = nil
+							s.auHasVCL = false
+						}
+						if !s.auHasVCL {
+							s.auTS = pkt.Header.Timestamp
+							s.auHasVCL = true
+						}
+					}
+					s.auNALs = append(s.auNALs, nalu)
+				}
+			}
+			if s.videoNALHandler == nil {
 				return
 			}
 			for _, nalu := range nalus {

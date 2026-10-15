@@ -39,13 +39,16 @@ const { paused, togglePause } = usePaused()
 
 let lastErrorText = ''
 function handleMessage(msg: WsMessage) {
-  if (msg.type === 'video_nal' && msg.data) {
-    // 照常刷新 lastFrameTime（避免误报“视频流中断”）；暂停时丢弃新帧，
-    // 画面冻结在最后一帧，恢复后由 tile 的追帧逻辑跳回直播沿
+  if (msg.type === 'video_fmp4' && msg.data) {
+    // 标准 fMP4 段（服务端封装）：kind=init/frag，直接进 MSE 管线
     lastFrameTime = Date.now()
     if (!paused.value) {
-      const data = msg.data
-      routeToTile(msg.cam, (tile) => tile.feedNal(msg.ts, data))
+      const seg = msg.data
+      const kind = msg.kind || 'frag'
+      const codec = msg.codec || ''
+      const ts = msg.ts
+      const key = !!msg.key
+      routeToTile(msg.cam, (tile) => tile.feedFMP4(kind, codec, seg, ts, key))
     }
     return
   }
@@ -73,12 +76,12 @@ function handleMessage(msg: WsMessage) {
     videoError.value = msg.text
   }
 }
-subscribe(['video_nal', 'video_jpeg', 'device_state', 'clock_sync', 'error'], handleMessage)
+subscribe(['video_fmp4', 'video_jpeg', 'device_state', 'clock_sync', 'error'], handleMessage)
 
 // tile 自注册表：v-for 的函数 ref 在模式切换时挂载/卸载回调顺序不确定，
 // 由 CameraTile 在自身生命周期内注册/注销，避免 Map 被旧实例误删。
 interface TileAPI {
-  feedNal: (ts: number | undefined, data: string) => void
+  feedFMP4: (kind: string, codec: string, data: string, serverTs?: number, key?: boolean) => void
   feedJpeg: (data: string) => void
 }
 const tiles = new Map<string, TileAPI>()

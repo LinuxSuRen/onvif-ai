@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/onvif-ai/internal/audio"
+	"github.com/onvif-ai/internal/fmp4mux"
 	"github.com/onvif-ai/internal/forward"
 	"github.com/onvif-ai/internal/llm"
 	"github.com/onvif-ai/internal/onvif"
@@ -433,8 +434,43 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 
 		stream := rtsp.NewStream(u.rtspURL)
 		cam := u.token
-		stream.OnVideoNAL(func(nalu []byte) {
-			cm.hub.BroadcastVideoNAL(cam, nalu)
+		// H.264 → 服务端 fMP4 封装 → MSE 直播（替代 jmuxer 自制封装：
+		// 其输出不合规范，硬解拒绝/软解绿条，见 fmp4mux 包注释）。
+		// muxer 在首个关键帧到达且 SPS/PPS 就绪时创建/按需重建
+		//（分辨率切换会换 SPS）；每个关键帧附带重发 init 段，
+		// 浏览器端管线（重）初始化即可用。
+		var mux *fmp4mux.Muxer
+		stream.OnVideoFrame(func(au [][]byte, durTicks uint32, key bool) {
+			if !key || len(stream.SPS()) == 0 || len(stream.PPS()) == 0 {
+				if mux == nil {
+					return // 首帧必须是关键帧才有参数集
+				}
+			} else {
+				if mux == nil || mux.SPSChanged(stream.SPS()) {
+					m, err := fmp4mux.New(stream.SPS(), stream.PPS())
+					if err != nil {
+						log.Printf("[%s] fmp4 init failed: %v", cam, err)
+						return
+					}
+					mux = m
+				}
+			}
+			if mux == nil {
+				return
+			}
+			// 每个关键帧前重发 init 段（每 GOP 一次，约 700 字节）：
+			// 浏览器端管线（重）初始化（codec 变化、WS 重连、解码器重建）
+			// 都要等一份 init 才能开始 append，只在连接建立时发一次会造成
+			// 前端 awaitingInit 死锁。
+			if key {
+				cm.hub.BroadcastVideoFMP4(cam, "init", mux.InitSegment(), true, mux.CodecString())
+			}
+			seg, err := mux.Fragment(au, durTicks, key)
+			if err != nil {
+				log.Printf("[%s] fmp4 fragment failed: %v", cam, err)
+				return
+			}
+			cm.hub.BroadcastVideoFMP4(cam, "frag", seg, key, "")
 		})
 		// MJPEG（RFC 2435）帧为完整 JPEG，复用快照通道推给浏览器
 		stream.OnVideoJPEG(func(jpeg []byte) {

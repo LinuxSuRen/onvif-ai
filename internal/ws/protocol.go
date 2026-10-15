@@ -23,7 +23,8 @@ const (
 	MsgTypeViewControl   MessageType = "view_control"   // Open/close video push for this connection (start/stop)
 
 	// Server → Client
-	MsgTypeVideoNAL      MessageType = "video_nal"      // H.264 NAL unit (base64)
+	MsgTypeVideoNAL      MessageType = "video_nal"      // H.264 NAL unit (base64)（旧路径，保留兼容）
+	MsgTypeVideoFMP4     MessageType = "video_fmp4"     // fMP4 段：init（moov）或 frag（moof+mdat），base64
 	MsgTypeVideoJPEG     MessageType = "video_jpeg"     // JPEG snapshot frame (base64)
 	MsgTypeTranscript    MessageType = "transcript"     // LLM text response
 	MsgTypeStatus        MessageType = "status"         // System status
@@ -49,6 +50,13 @@ type Message struct {
 	// legacy single-camera case, where the frontend treats it as the only
 	// camera.
 	Cam string `json:"cam,omitempty"`
+	// Kind 限定 video_fmp4 消息：init（初始化段）或 frag（媒体段）。
+	Kind string `json:"kind,omitempty"`
+	// Key 标记 video_fmp4/frag 是否关键帧；hub 丢帧时据此实现"丢到下个
+	// 关键帧"（丢弃期间画面冻结而非花屏）。
+	Key bool `json:"key,omitempty"`
+	// Codec 限定 video_fmp4/init：MSE SourceBuffer 的 codec 串（avc1.XXXX）。
+	Codec string `json:"codec,omitempty"`
 }
 
 // StatusState represents the system state.

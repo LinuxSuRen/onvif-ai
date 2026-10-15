@@ -1,10 +1,15 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, inject } from 'vue'
-import JMuxer from 'jmuxer'
 
 /**
  * CameraTile 承载一路摄像头画面（对应一个 ONVIF media profile）：
- * 独立的 jmuxer/MSE 解码、快照降级显示、端到端延迟测量与云台控制。
+ * 标准 fMP4 → MSE（服务端封装，SourceBuffer 直接 append）、快照降级显示、
+ * 端到端延迟测量与云台控制。
+ *
+ * 播放管线（替代 jmuxer 自制封装——其输出不合规范：硬件解码拒绝黑屏、
+ * 软件解码绿条伪影）：后端把 H.264 AU 封装为标准 fMP4 init/frag 段，
+ * 浏览器 appendBuffer 后走原生 MSE 解码路径（与 robot-platform-ui 的
+ * RTSPtoWeb 模式一致）。
  */
 const props = defineProps<{
   cam: {
@@ -39,71 +44,199 @@ const resolution = computed(() =>
   props.cam.width > 0 && props.cam.height > 0 ? `${props.cam.width}x${props.cam.height}` : '',
 )
 
-let jmuxer: JMuxer | null = null
+// ---- MSE 管线状态（全部由主线程串行访问，无并发） ----
+let mediaSource: MediaSource | null = null
+let sourceBuffer: SourceBuffer | null = null
+let objectUrl = ''
+// codec 由首个 init 段携带（avc1.XXXX，来自 SPS），SourceBuffer 必须用
+// 真实 codec 创建——猜错会导致首 init 触发无谓重建并错过整个 GOP。
+let codecString = ''
+const appendQueue: (ArrayBuffer | Uint8Array)[] = []
+// 管线未就绪（等 init / 等 sourceopen）期间缓存最近一个关键帧段：
+// 播放必须从关键帧起步，缓存它可保证 init 到位后立即可播。
+let pendingKeySeg: Uint8Array | null = null
+let awaitingInit = true
+
 let transitEma: number | null = null
 let presentedMediaTime = 0
 let rVfcHandle = 0
 let latencyTimer: ReturnType<typeof setInterval> | null = null
-let jmuxerErrTimes: number[] = []
+let evictTimer: ReturnType<typeof setInterval> | null = null
 let lastCatchUpAt = 0
 
 // 向父组件注册本 tile 的数据入口（生命周期内自管理，避免 ref 顺序竞态）
 const registry = inject<{
-  register: (token: string, api: { feedNal: typeof feedNal; feedJpeg: typeof feedJpeg }) => void
-  unregister: (token: string, api: { feedNal: typeof feedNal; feedJpeg: typeof feedJpeg }) => void
+  register: (token: string, api: { feedFMP4: typeof feedFMP4; feedJpeg: typeof feedJpeg }) => void
+  unregister: (token: string, api: { feedFMP4: typeof feedFMP4; feedJpeg: typeof feedJpeg }) => void
 } | null>('cameraTileRegistry', null)
 
-function destroyJMuxer() {
-  if (jmuxer) {
+function destroyPipeline() {
+  appendQueue.length = 0
+  pendingKeySeg = null
+  if (sourceBuffer) {
     try {
-      jmuxer.destroy()
+      sourceBuffer.abort()
     } catch {
-      /* destroy 在 MSE 已关闭时可能抛错，忽略 */
+      /* updating/已移除时可能抛错 */
     }
-    jmuxer = null
+    sourceBuffer.onupdateend = null
+    sourceBuffer.onerror = null
+    sourceBuffer = null
+  }
+  if (mediaSource) {
+    try {
+      if (mediaSource.readyState === 'open') mediaSource.endOfStream()
+    } catch {
+      /* ignore */
+    }
+    mediaSource = null
+  }
+  if (objectUrl) {
+    URL.revokeObjectURL(objectUrl)
+    objectUrl = ''
   }
 }
 
-function createJMuxer() {
-  if (!videoRef.value || jmuxer) return
-  jmuxer = new JMuxer({
-    node: videoRef.value,
-    mode: 'video',
-    videoCodec: 'H264',
-    flushingTime: 100,
-    debug: false,
-    onError: handleJMuxerError,
-  })
+function createPipeline() {
+  if (!videoRef.value || mediaSource) return
+  awaitingInit = true
+  const ms = new MediaSource()
+  mediaSource = ms
+  objectUrl = URL.createObjectURL(ms)
+  videoRef.value.src = objectUrl
   videoRef.value.play()?.catch(() => {})
-  hasVideo.value = false // 等待新管线首帧
+  hasVideo.value = false
   presentedMediaTime = 0
+  ms.addEventListener('sourceopen', () => {
+    // SourceBuffer 延迟到收到 init 段（携带真实 codec）后创建，
+    // 避免 codec 猜错导致的无谓重建。sourceopen 只标记就绪。
+    if (ms.readyState !== 'open') return
+    tryAttachBuffer()
+  })
 }
 
-// jmuxer 错误分三类：QuotaExceeded（内部自动清理）、InvalidStateError（内部
-// 自动 reset）、其余（endMSE，管线永久失效）。但 InvalidStateError 有一个
-// 必须立即重建的子类：video 元素 error 已置位（硬解码失败等）——此时 MSE
-// 已经死亡，appendBuffer 会无限抛 InvalidStateError，等 IDR 自愈无效。
-function handleJMuxerError(error: unknown) {
-  console.warn('[CameraTile] jmuxer error:', error)
-  const data = error as { name?: string } | null | undefined
-  const now = Date.now()
-  jmuxerErrTimes = jmuxerErrTimes.filter((t) => now - t < 60_000)
-  jmuxerErrTimes.push(now)
-  const videoDead = !!(videoRef.value && videoRef.value.error)
-  const fatal =
-    videoDead ||
-    (data && data.name !== 'QuotaExceeded' && data.name !== 'InvalidStateError')
-  if (fatal || jmuxerErrTimes.length >= 3) {
-    jmuxerErrTimes = []
+// 用 init 携带的 codec 创建 SourceBuffer（幂等）。
+function tryAttachBuffer() {
+  if (sourceBuffer || !mediaSource || mediaSource.readyState !== 'open') return
+  if (!codecString) return // 等首个 init 段告知 codec
+  try {
+    const sb = mediaSource.addSourceBuffer(codecString)
+    sb.mode = 'segments'
+    sb.addEventListener('updateend', flushQueue)
+    sb.addEventListener('error', onSourceBufferError)
+    sourceBuffer = sb
+    flushQueue()
+  } catch (e) {
+    console.warn('[CameraTile] addSourceBuffer failed:', e, codecString)
     scheduleReset()
   }
 }
 
-// 带节流的管线重建：解码错误可能连续触发（元素 error 与 jmuxer 错误并发），
-// 无节流会陷入重建风暴；1s 冷却已足够新 MediaSource 完成初始化。
+// 队列串联：SourceBuffer updating 期间不可 append，updateend 驱动下一段。
+function flushQueue() {
+  if (!sourceBuffer || sourceBuffer.updating || awaitingInit) return
+  while (appendQueue.length > 0) {
+    const next = appendQueue.shift()!
+    try {
+      sourceBuffer.appendBuffer(next as BufferSource)
+      return // 本次 append 异步，等 updateend 再续
+    } catch (e) {
+      const name = (e as DOMException).name
+      if (name === 'QuotaExceededError') {
+        evictBuffer()
+        continue // 丢弃本段，清出空间后继续（实时流允许丢段）
+      }
+      console.warn('[CameraTile] appendBuffer:', e)
+      scheduleReset()
+      return
+    }
+  }
+}
+
+function onSourceBufferError(e: Event) {
+  console.warn('[CameraTile] SourceBuffer error:', e)
+  scheduleReset()
+}
+
+// 缓冲瘦身：实时流只保留播放点附近的历史，防止 SourceBuffer 无限增长。
+function evictBuffer() {
+  const v = videoRef.value
+  const sb = sourceBuffer
+  if (!v || !sb || sb.updating) return
+  try {
+    const b = sb.buffered
+    if (b.length > 0 && b.start(0) < v.currentTime - 5) {
+      sb.remove(b.start(0), v.currentTime - 5)
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+// fMP4 数据入口：kind=init（携带 codec，建立 SourceBuffer）或 frag（媒体段）。
+// key 为后端按 IDR 标记的关键帧标志。
+function feedFMP4(kind: string, codec: string, base64Data: string, serverTs?: number, key = false) {
+  if (decodeDegraded.value) return
+  if (!mediaSource) createPipeline()
+  if (!mediaSource) return
+
+  if (serverTs && props.clockOffset !== null) {
+    const raw = Date.now() + props.clockOffset - serverTs
+    if (raw >= 0 && raw < 5000) {
+      transitEma = transitEma === null ? raw : transitEma * 0.85 + raw * 0.15
+    }
+  }
+
+  const binary = atob(base64Data)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+
+  if (kind === 'init') {
+    if (!awaitingInit && sourceBuffer) return // 就绪后忽略随 GOP 重发的 init
+    if (codec) {
+      const cs = `video/mp4; codecs="${codec}"`
+      if (cs !== codecString && sourceBuffer) {
+        // codec 变化（SPS 换了，分辨率切换）：当前 buffer 无法复用，重建
+        codecString = cs
+        scheduleReset()
+        return
+      }
+      codecString = cs
+    }
+    appendQueue.length = 0
+    appendQueue.push(bytes)
+    if (pendingKeySeg) appendQueue.push(pendingKeySeg) // 缓存的关键帧段紧随 init
+    awaitingInit = false
+    tryAttachBuffer() // sourceopen 可能早于首个 init，此刻才知 codec
+    flushQueue()
+    return
+  }
+
+  if (kind !== 'frag') return
+  if (awaitingInit || !sourceBuffer) {
+    // 管线未就绪：只保留最近一个关键帧段（播放必须关键帧起步），
+    // 其余丢弃——否则首个 append 的起点会落在缓冲之外（实测卡 rs1）。
+    if (key) pendingKeySeg = bytes
+    return
+  }
+  appendQueue.push(bytes)
+  if (appendQueue.length > 64) appendQueue.shift() // 防积压：丢最旧段
+  flushQueue()
+  if (inSnapshot.value && !props.cam.mjpeg) inSnapshot.value = false
+  hasVideo.value = true
+}
+
+function feedJpeg(base64Data: string) {
+  if (!imgRef.value) return
+  imgRef.value.src = `data:image/jpeg;base64,${base64Data}`
+  hasVideo.value = true
+  inSnapshot.value = true
+}
+
+// 带节流的管线重建：解码错误可能连续触发，无节流会陷入重建风暴。
 // 连续快速重建达阈值后停止自愈并显示引导：典型场景是远程桌面/虚拟显示器
-// 环境下浏览器 GPU 硬解整体不可用（Chrome/Edge 同源），重建多少次都无效，
-// 唯一解法是关闭浏览器硬件加速——继续重建只会表现为持续黑闪。
+// 环境下浏览器 GPU 硬解整体不可用，重建多少次都无效，唯一解法是关闭
+// 浏览器硬件加速——继续重建只会表现为持续黑闪。
 let lastResetAt = 0
 let resetTimes: number[] = []
 const decodeDegraded = ref(false)
@@ -114,7 +247,7 @@ function scheduleReset() {
   resetTimes.push(now)
   if (resetTimes.length >= 5) {
     decodeDegraded.value = true
-    destroyJMuxer() // 停止无效重建；feedNal 在降级态直接丢弃
+    destroyPipeline() // 停止无效重建；feedFMP4 在降级态直接丢弃
     return
   }
   lastResetAt = now
@@ -137,14 +270,14 @@ function onVideoElementError() {
 
 // 重建整条展示管线（WS 重连 / 显式重置时调用）
 function resetPipeline() {
-  destroyJMuxer()
+  destroyPipeline()
   transitEma = null
-  lastFrameTs = 0
   latencyMs.value = 0
-  createJMuxer()
+  createPipeline()
 }
+
 onMounted(() => {
-  createJMuxer()
+  createPipeline()
   videoRef.value?.addEventListener('error', onVideoElementError)
   const video = videoRef.value as any
   if (video && typeof video.requestVideoFrameCallback === 'function') {
@@ -155,89 +288,41 @@ onMounted(() => {
     rVfcHandle = video.requestVideoFrameCallback(onFrame)
   }
   latencyTimer = setInterval(measurePresentationLag, 500)
-  registry?.register(props.cam.token, { feedNal, feedJpeg })
+  evictTimer = setInterval(evictBuffer, 5000)
+  registry?.register(props.cam.token, { feedFMP4, feedJpeg })
 })
 
 onUnmounted(() => {
-  registry?.unregister(props.cam.token, { feedNal, feedJpeg })
+  registry?.unregister(props.cam.token, { feedFMP4, feedJpeg })
   videoRef.value?.removeEventListener('error', onVideoElementError)
   if (latencyTimer) clearInterval(latencyTimer)
+  if (evictTimer) clearInterval(evictTimer)
   const video = videoRef.value as any
   if (video && rVfcHandle && typeof video.cancelVideoFrameCallback === 'function') {
     video.cancelVideoFrameCallback(rVfcHandle)
   }
   rVfcHandle = 0
-  if (jmuxer) {
-    jmuxer.destroy()
-    jmuxer = null
-  }
+  destroyPipeline()
 })
-
-// 逐帧真实时间戳：用服务器 NAL 时间戳计算帧间隔传给 jmuxer。
-// 不传 duration 时 jmuxer 按构造时的固定 fps 假设打时间轴（并把帧扣到
-// pendingUnits）——我们 15fps 的流会被按 30fps 假设错标，时间轴失真在
-// 硬解码路径上表现更严格（实测黑闪）；传真实 duration 后由 jmuxer 按批内
-// 帧数均分。
-let lastFrameTs = 0
-
-function feedNal(serverTs: number | undefined, base64Data: string) {
-  if (decodeDegraded.value) return // 硬解不可用降级态：管线已停，丢弃
-  if (!jmuxer) createJMuxer()
-  if (!jmuxer) return
-
-  // 传输延迟：服务器收帧时刻 → 本端收到（时钟偏移由父组件校准）
-  if (serverTs && props.clockOffset !== null) {
-    const raw = Date.now() + props.clockOffset - serverTs
-    if (raw >= 0 && raw < 5000) {
-      transitEma = transitEma === null ? raw : transitEma * 0.85 + raw * 0.15
-    }
-  }
-
-  const binary = atob(base64Data)
-  // jmuxer 的 H.264 解析器按 Annex-B 起始码（00 00 00 01）切分 NAL，
-  // 裸 NAL 无法被提取，需逐个加起始码后再喂入
-  const bytes = new Uint8Array(4 + binary.length)
-  bytes[0] = 0
-  bytes[1] = 0
-  bytes[2] = 0
-  bytes[3] = 1
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i + 4] = binary.charCodeAt(i)
-  }
-
-  // NAL 头 type（低 5 位）：1-5 为 VCL（真实视频帧）；SPS/PPS/AUD 等
-  // 非 VCL 单元不带 duration 喂入，由 jmuxer 并入下一帧。
-  const isVCL = binary.length > 0 && (bytes[4] & 0x1f) >= 1 && (bytes[4] & 0x1f) <= 5
-  let feedArg: { video: Uint8Array; duration?: number }
-  if (isVCL && serverTs && lastFrameTs > 0 && serverTs > lastFrameTs) {
-    // 限幅：异常抖动（批量补发等）时钳到 [1, 500]ms
-    const d = Math.min(500, Math.max(1, serverTs - lastFrameTs))
-    feedArg = { video: bytes, duration: d }
-  } else {
-    feedArg = { video: bytes }
-  }
-  if (isVCL && serverTs) lastFrameTs = serverTs
-
-  jmuxer.feed(feedArg)
-  // RTSP 恢复直播后退出快照视图（video 元素重新可见）
-  if (inSnapshot.value && !props.cam.mjpeg) inSnapshot.value = false
-  hasVideo.value = true
-}
-
-function feedJpeg(base64Data: string) {
-  if (!imgRef.value) return
-  imgRef.value.src = `data:image/jpeg;base64,${base64Data}`
-  hasVideo.value = true
-  inSnapshot.value = true
-}
 
 function measurePresentationLag() {
   const video = videoRef.value
-  if (!video || !hasVideo.value || inSnapshot.value) return
-  const presented = presentedMediaTime > 0 ? presentedMediaTime : video.currentTime
-  if (presented <= 0) return
+  if (!video || hasVideo.value === false || inSnapshot.value) return
   const buffered = video.buffered
   if (buffered.length === 0) return
+
+  // 缓冲起点超前兜底：播放点落在缓冲区间之外（如关键帧起步丢段/重建后
+  // 时间轴错位）时视频会卡在 rs1 永远等数据——直接跳到缓冲起点。
+  if (!video.seeking && video.currentTime + 0.3 < buffered.start(0)) {
+    try {
+      video.currentTime = buffered.start(0)
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const presented = presentedMediaTime > 0 ? presentedMediaTime : video.currentTime
+  if (presented <= 0) return
   let bufferedEnd = -1
   for (let i = 0; i < buffered.length; i++) {
     if (buffered.start(i) <= presented + 0.25 && buffered.end(i) > bufferedEnd) {
@@ -294,7 +379,7 @@ function ptzMove(direction: string) {
   emit('ptz', direction)
 }
 
-defineExpose({ feedNal, feedJpeg })
+defineExpose({ feedFMP4, feedJpeg })
 </script>
 
 <template>
@@ -374,119 +459,115 @@ defineExpose({ feedNal, feedJpeg })
 }
 
 .cam-tile__snapshot {
-  display: none;
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+  pointer-events: none;
 }
 
 .cam-tile__snapshot--visible {
-  display: block;
+  opacity: 1;
 }
 
 .cam-tile__label {
   position: absolute;
   top: 6px;
-  left: 6px;
-  z-index: 4;
-  max-width: 60%;
+  left: 8px;
+  z-index: 2;
+  font-size: 0.68rem;
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(0, 0, 0, 0.45);
+  padding: 2px 8px;
+  border-radius: 3px;
+  max-width: calc(100% - 16px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: rgba(0, 0, 0, 0.55);
-  color: rgba(255, 255, 255, 0.9);
-  font-size: 0.6875rem;
-  letter-spacing: 0.04em;
-  pointer-events: none;
 }
 
-/* 左下角角标行：快照提示与分辨率同排，互不遮挡 */
 .cam-tile__badges {
   position: absolute;
   bottom: 6px;
-  left: 6px;
-  z-index: 4;
+  left: 8px;
+  z-index: 2;
   display: flex;
-  align-items: center;
   gap: 4px;
-  max-width: calc(100% - 12px);
-  pointer-events: none;
 }
 
 .cam-tile__badge {
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: rgba(255, 184, 0, 0.15);
-  color: rgba(255, 184, 0, 0.95);
   font-size: 0.65rem;
-  white-space: nowrap;
+  color: #ffce4d;
+  background: rgba(0, 0, 0, 0.45);
+  padding: 1px 6px;
+  border-radius: 3px;
 }
 
 .cam-tile__res {
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: rgba(0, 0, 0, 0.55);
-  color: rgba(255, 255, 255, 0.85);
-  font-family: var(--font-mono);
+  font-family: var(--font-mono, monospace);
   font-size: 0.65rem;
-  letter-spacing: 0.04em;
-  white-space: nowrap;
+  color: rgba(255, 255, 255, 0.7);
+  background: rgba(0, 0, 0, 0.45);
+  padding: 1px 6px;
+  border-radius: 3px;
 }
 
 .cam-tile__latency {
   position: absolute;
   top: 6px;
-  right: 6px;
-  z-index: 4;
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: rgba(0, 0, 0, 0.55);
-  color: rgba(0, 229, 160, 0.95);
-  font-family: var(--font-mono);
+  right: 8px;
+  z-index: 2;
+  font-family: var(--font-mono, monospace);
   font-size: 0.65rem;
-  pointer-events: none;
+  color: rgba(255, 255, 255, 0.7);
+  background: rgba(0, 0, 0, 0.45);
+  padding: 1px 6px;
+  border-radius: 3px;
 }
 
 .cam-tile__ptz {
   position: absolute;
-  inset: 0;
-  pointer-events: none;
-  z-index: 5;
+  bottom: 40px;
+  right: 10px;
+  z-index: 3;
+  display: grid;
+  grid-template-columns: repeat(3, 30px);
+  grid-template-rows: repeat(3, 30px);
+  gap: 2px;
 }
 
 .cam-tile__ptz-btn {
-  position: absolute;
-  width: 36px;
-  height: 36px;
-  border: 1px solid rgba(0, 229, 160, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.3);
   background: rgba(0, 0, 0, 0.5);
-  color: rgba(0, 229, 160, 0.7);
-  font-size: 0.9rem;
-  cursor: pointer;
-  pointer-events: auto;
+  color: rgba(255, 255, 255, 0.85);
   border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.7rem;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.cam-tile__ptz-btn:hover {
-  background: rgba(0, 229, 160, 0.15);
-  color: #00e5a0;
+.cam-tile__ptz-btn:active {
+  background: rgba(0, 229, 160, 0.35);
 }
 
-/* 触屏：触摸目标不小于 44px，避免误触 */
-@media (pointer: coarse) {
-  .cam-tile__ptz-btn {
-    width: 44px;
-    height: 44px;
-    font-size: 1.1rem;
-  }
+.cam-tile__ptz-btn--up {
+  grid-column: 2;
+  grid-row: 1;
 }
-
-.cam-tile__ptz-btn--up { top: 4px; left: 50%; transform: translateX(-50%); }
-.cam-tile__ptz-btn--down { bottom: 4px; left: 50%; transform: translateX(-50%); }
-.cam-tile__ptz-btn--left { left: 4px; top: 50%; transform: translateY(-50%); }
-.cam-tile__ptz-btn--right { right: 4px; top: 50%; transform: translateY(-50%); }
+.cam-tile__ptz-btn--left {
+  grid-column: 1;
+  grid-row: 2;
+}
+.cam-tile__ptz-btn--right {
+  grid-column: 3;
+  grid-row: 2;
+}
+.cam-tile__ptz-btn--down {
+  grid-column: 2;
+  grid-row: 3;
+}
 
 .cam-tile__placeholder {
   position: absolute;
