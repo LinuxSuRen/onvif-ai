@@ -156,9 +156,15 @@ func (s *Stream) Connect() error {
 		return fmt.Errorf("parse RTSP URL: %w", err)
 	}
 
+	// 强制 TCP interleaved（v5 的传输选择在 Protocol 字段，Setup 端口参数
+	// 在 TCP 模式下被忽略）：默认 nil 时先尝试 UDP，多路高码率流会打爆
+	// UDP 接收缓冲导致持续丢包（实测本机回环 5 路 2Mbps 即出现
+	// "N RTP packets lost"，画面闪烁/花屏），TCP 无此问题。
+	tcp := gortsplib.ProtocolTCP
 	s.client = &gortsplib.Client{
-		Scheme: u.Scheme,
-		Host:   u.Host,
+		Scheme:   u.Scheme,
+		Host:     u.Host,
+		Protocol: &tcp,
 	}
 
 	if err := s.client.Start(); err != nil {
