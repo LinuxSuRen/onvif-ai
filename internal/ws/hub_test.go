@@ -208,3 +208,38 @@ func TestViewControlMessageContract(t *testing.T) {
 		t.Fatalf("unexpected round-trip: %+v", p)
 	}
 }
+
+// TestJPEGClearsSkipUntilKey 锁定 JPEG 路的关键帧语义回归：JPEG 每帧
+// 独立可解、Key 恒为 true——丢帧模式下 JPEG 必须照常送达并解除该路的
+// 丢帧状态，否则快照/MJPEG 相机在慢客户端一次满仓后永久冻结。
+func TestJPEGClearsSkipUntilKey(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	viewer := newDirectClient(hub)
+	hub.SetVideoView(viewer, true)
+
+	frag, _ := json.Marshal(&Message{Type: MsgTypeVideoFMP4, Cam: "cam1", Kind: "frag"})
+
+	// 灌满 send 缓冲后投递非关键帧 → 进入丢帧模式
+	for len(viewer.send) < cap(viewer.send) {
+		viewer.send <- []byte("x")
+	}
+	hub.dispatch(frag, true, "cam1", false)
+	for len(viewer.send) > 0 {
+		<-viewer.send
+	}
+	hub.dispatch(frag, true, "cam1", false)
+	expectNothing(t, "viewer during skip", viewer.send)
+
+	// JPEG 帧必须穿透丢帧模式送达（Key=true），并解除丢帧
+	hub.BroadcastVideoJPEG("cam1", []byte{0xFF, 0xD8, 0xFF, 0xE0})
+	if m := expectReceived(t, viewer.send); m.Type != MsgTypeVideoJPEG {
+		t.Fatalf("expected video_jpeg delivered during skip mode, got %+v", m)
+	}
+
+	// 解除后普通帧恢复送达
+	hub.dispatch(frag, true, "cam1", false)
+	if m := expectReceived(t, viewer.send); m.Type != MsgTypeVideoFMP4 {
+		t.Fatalf("expected frag delivered after jpeg recovery, got %+v", m)
+	}
+}

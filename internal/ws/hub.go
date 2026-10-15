@@ -210,11 +210,14 @@ func (h *Hub) BroadcastVideoNAL(cam string, nalu []byte) {
 }
 
 // BroadcastVideoJPEG sends one JPEG snapshot frame for the given camera.
+// Key 恒为 true：JPEG 每帧独立可解，语义上等价关键帧——否则「丢到
+// 关键帧」策略在 JPEG 路永远无法解除，慢客户端一次满仓后该路永久冻结。
 func (h *Hub) BroadcastVideoJPEG(cam string, jpeg []byte) {
 	msg := &Message{
 		Type: MsgTypeVideoJPEG,
 		Data: base64.StdEncoding.EncodeToString(jpeg),
 		Cam:  cam,
+		Key:  true,
 	}
 	h.BroadcastVideo(msg)
 }
