@@ -101,11 +101,31 @@ function handleJMuxerError(error: unknown) {
 
 // 带节流的管线重建：解码错误可能连续触发（元素 error 与 jmuxer 错误并发），
 // 无节流会陷入重建风暴；1s 冷却已足够新 MediaSource 完成初始化。
+// 连续快速重建达阈值后停止自愈并显示引导：典型场景是远程桌面/虚拟显示器
+// 环境下浏览器 GPU 硬解整体不可用（Chrome/Edge 同源），重建多少次都无效，
+// 唯一解法是关闭浏览器硬件加速——继续重建只会表现为持续黑闪。
 let lastResetAt = 0
+let resetTimes: number[] = []
+const decodeDegraded = ref(false)
 function scheduleReset() {
   const now = Date.now()
   if (now - lastResetAt < 1000) return
+  resetTimes = resetTimes.filter((t) => now - t < 60_000)
+  resetTimes.push(now)
+  if (resetTimes.length >= 5) {
+    decodeDegraded.value = true
+    destroyJMuxer() // 停止无效重建；feedNal 在降级态直接丢弃
+    return
+  }
   lastResetAt = now
+  resetPipeline()
+}
+
+// 用户点击"已关闭硬件加速，重试"或 WS 重连后重新开始自愈
+function retryDecode() {
+  decodeDegraded.value = false
+  resetTimes = []
+  lastResetAt = 0
   resetPipeline()
 }
 
@@ -119,10 +139,10 @@ function onVideoElementError() {
 function resetPipeline() {
   destroyJMuxer()
   transitEma = null
+  lastFrameTs = 0
   latencyMs.value = 0
   createJMuxer()
 }
-
 onMounted(() => {
   createJMuxer()
   videoRef.value?.addEventListener('error', onVideoElementError)
@@ -153,7 +173,15 @@ onUnmounted(() => {
   }
 })
 
+// 逐帧真实时间戳：用服务器 NAL 时间戳计算帧间隔传给 jmuxer。
+// 不传 duration 时 jmuxer 按构造时的固定 fps 假设打时间轴（并把帧扣到
+// pendingUnits）——我们 15fps 的流会被按 30fps 假设错标，时间轴失真在
+// 硬解码路径上表现更严格（实测黑闪）；传真实 duration 后由 jmuxer 按批内
+// 帧数均分。
+let lastFrameTs = 0
+
 function feedNal(serverTs: number | undefined, base64Data: string) {
+  if (decodeDegraded.value) return // 硬解不可用降级态：管线已停，丢弃
   if (!jmuxer) createJMuxer()
   if (!jmuxer) return
 
@@ -177,7 +205,20 @@ function feedNal(serverTs: number | undefined, base64Data: string) {
     bytes[i + 4] = binary.charCodeAt(i)
   }
 
-  jmuxer.feed({ video: bytes })
+  // NAL 头 type（低 5 位）：1-5 为 VCL（真实视频帧）；SPS/PPS/AUD 等
+  // 非 VCL 单元不带 duration 喂入，由 jmuxer 并入下一帧。
+  const isVCL = binary.length > 0 && (bytes[4] & 0x1f) >= 1 && (bytes[4] & 0x1f) <= 5
+  let feedArg: { video: Uint8Array; duration?: number }
+  if (isVCL && serverTs && lastFrameTs > 0 && serverTs > lastFrameTs) {
+    // 限幅：异常抖动（批量补发等）时钳到 [1, 500]ms
+    const d = Math.min(500, Math.max(1, serverTs - lastFrameTs))
+    feedArg = { video: bytes, duration: d }
+  } else {
+    feedArg = { video: bytes }
+  }
+  if (isVCL && serverTs) lastFrameTs = serverTs
+
+  jmuxer.feed(feedArg)
   // RTSP 恢复直播后退出快照视图（video 元素重新可见）
   if (inSnapshot.value && !props.cam.mjpeg) inSnapshot.value = false
   hasVideo.value = true
@@ -228,11 +269,16 @@ function measurePresentationLag() {
   }
 }
 
-// WS 重连后递增 resetKey：旧管线的 MSE 时间轴已作废，重建
+// WS 重连后递增 resetKey：旧管线的 MSE 时间轴已作废，重建；
+// 若处于硬解降级态也一并重试（用户可能已改完浏览器设置后刷新页面）
 watch(
   () => props.resetKey,
   (key) => {
-    if (key > 0) resetPipeline()
+    if (key > 0) {
+      decodeDegraded.value = false
+      resetTimes = []
+      resetPipeline()
+    }
   },
 )
 
@@ -288,7 +334,18 @@ defineExpose({ feedNal, feedJpeg })
       <button class="cam-tile__ptz-btn cam-tile__ptz-btn--down" @pointerdown.prevent="ptzMove('down')">▼</button>
     </div>
 
-    <div v-if="!hasVideo" class="cam-tile__placeholder">暂无画面</div>
+    <div v-if="!hasVideo && !decodeDegraded" class="cam-tile__placeholder">暂无画面</div>
+
+    <!-- 硬解不可用降级提示：远程桌面/虚拟显示器环境下 GPU 解码整体失效，
+         继续重建只会黑闪；引导用户关闭浏览器硬件加速后重试 -->
+    <div v-if="decodeDegraded" class="cam-tile__degraded">
+      <div class="cam-tile__degraded-title">解码持续失败</div>
+      <div class="cam-tile__degraded-text">
+        当前环境浏览器硬件解码不可用（远程桌面常见）。请在浏览器设置中关闭
+        「硬件加速/图形加速」并重启浏览器后刷新页面。
+      </div>
+      <button class="cam-tile__degraded-retry" @click="retryDecode">已调整，重试</button>
+    </div>
   </div>
 </template>
 
@@ -441,5 +498,44 @@ defineExpose({ feedNal, feedJpeg })
   font-size: 0.75rem;
   letter-spacing: 0.06em;
   pointer-events: none;
+}
+
+/* 硬解降级提示：覆盖整块画面，深色底保证可读 */
+.cam-tile__degraded {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+  background: rgba(2, 4, 8, 0.92);
+  text-align: center;
+}
+.cam-tile__degraded-title {
+  color: #ffce4d;
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.cam-tile__degraded-text {
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 0.75rem;
+  line-height: 1.6;
+  max-width: 260px;
+}
+.cam-tile__degraded-retry {
+  border: 1px solid rgba(0, 229, 160, 0.5);
+  background: rgba(0, 229, 160, 0.12);
+  color: var(--color-accent-green, #00e5a0);
+  font-size: 0.78rem;
+  padding: 5px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.cam-tile__degraded-retry:hover {
+  background: rgba(0, 229, 160, 0.22);
 }
 </style>
