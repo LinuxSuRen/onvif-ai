@@ -571,11 +571,21 @@ func (c *Client) ContinuousMove(ctx context.Context, profileToken, direction str
 func soapActionDomain(action string) string {
 	deviceActions := map[string]bool{"GetCapabilities": true, "GetServices": true, "GetDeviceInformation": true}
 	ptzActions := map[string]bool{"ContinuousMove": true, "Stop": true}
+	// events 动作必须落在 events 域：未登记会落入默认 media 域，
+	// 校验 SOAPAction 头的设备会拒绝（PullPoint 订阅链路整体失效）
+	eventActions := map[string]bool{
+		"CreatePullPointSubscription": true,
+		"PullMessages":               true,
+		"Unsubscribe":                true,
+	}
 	if deviceActions[action] {
 		return "device"
 	}
 	if ptzActions[action] {
 		return "ptz"
+	}
+	if eventActions[action] {
+		return "events"
 	}
 	return "media"
 }

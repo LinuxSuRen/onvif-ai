@@ -40,6 +40,17 @@ type EventSubscriber struct {
 	cancel  context.CancelFunc
 }
 
+// 事件长轮询的时限契约：PullMessages 按规范可阻塞至 tev:Timeout 才返回
+// （设备空闲时必然如此），因此事件路径的 HTTP 客户端超时必须大于该值。
+// 若沿用连接时 5s 的通用超时，空闲长轮询会被客户端先中止、订阅被拆除
+// 重建：重建间隙的事件丢失，且旧订阅从不 Unsubscribe，设备侧 pull point
+// 堆积到规范最低支持数（≥5）后会拒绝新建订阅，事件链路彻底断流。
+const (
+	pullWaitXML   = "PT5S"               // PullMessages 长轮询时长（SOAP 内）
+	eventHTTPWait = 15 * time.Second     // 事件路径 HTTP 超时，须 > pullWait
+	unsubWait     = 3 * time.Second      // 拆除订阅的独立超时
+)
+
 // StartEventSubscriber 启动设备的 Event 订阅（后台 goroutine）。
 // handler 在订阅 goroutine 上回调（不要阻塞）。
 func (c *Client) StartEventSubscriber(deviceAddr string, logger *slog.Logger,
@@ -47,9 +58,14 @@ func (c *Client) StartEventSubscriber(deviceAddr string, logger *slog.Logger,
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// 事件路径使用独立的更长 HTTP 超时客户端（其余配置沿用连接客户端）
+	cfg := c.config
+	cfg.Timeout = eventHTTPWait
+	evtClient := NewClient(cfg)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &EventSubscriber{
-		client:  c,
+		client:  evtClient,
 		device:  deviceAddr,
 		logger:  logger.With("device", deviceAddr),
 		handler: handler,
@@ -94,6 +110,7 @@ func (s *EventSubscriber) loop(ctx context.Context) {
 		}
 		backoff = time.Second
 		s.pullLoop(ctx, addr)
+		s.unsubscribe(addr) // best-effort 显式拆除，不依赖设备侧 60s 超时回收
 		if s.isStopped() || ctx.Err() != nil {
 			return
 		}
@@ -130,7 +147,7 @@ func (s *EventSubscriber) pullLoop(ctx context.Context, subAddr string) {
 	for !s.isStopped() && ctx.Err() == nil {
 		envelope := s.client.soapEnvelope(
 			`<tev:PullMessages xmlns:tev="http://www.onvif.org/ver10/events/wsdl">` +
-				`<tev:Timeout>PT10S</tev:Timeout>` +
+				`<tev:Timeout>` + pullWaitXML + `</tev:Timeout>` +
 				`<tev:MessageLimit>20</tev:MessageLimit>` +
 				`</tev:PullMessages>`)
 		if s.client.config.Username != "" {
@@ -150,6 +167,22 @@ func (s *EventSubscriber) pullLoop(ctx context.Context, subAddr string) {
 				s.handler(msg)
 			}
 		}
+	}
+}
+
+// unsubscribe 显式拆除订阅（best-effort，失败仅记日志）：使用独立于订阅
+// 生命周期 ctx 的短超时，订阅因错误重建或正常停止时都尽量通知设备回收
+// pull point，避免堆积到订阅上限。
+func (s *EventSubscriber) unsubscribe(subAddr string) {
+	ctx, cancel := context.WithTimeout(context.Background(), unsubWait)
+	defer cancel()
+	envelope := s.client.soapEnvelope(
+		`<tev:Unsubscribe xmlns:tev="http://www.onvif.org/ver10/events/wsdl"/>`)
+	if s.client.config.Username != "" {
+		envelope = s.client.injectSecurityHeader(envelope)
+	}
+	if _, err := s.client.doSoapCall(ctx, subAddr, "Unsubscribe", envelope); err != nil {
+		s.logger.Debug("unsubscribe", "err", err.Error())
 	}
 }
 
