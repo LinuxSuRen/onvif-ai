@@ -13,6 +13,7 @@ require (
 )
 
 require (
+	github.com/Eyevinn/mp4ff v0.60.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/logging v0.2.4 // indirect
 	github.com/pion/randutil v0.1.0 // indirect

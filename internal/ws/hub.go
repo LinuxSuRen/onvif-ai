@@ -25,10 +25,17 @@ type Hub struct {
 	broadcast chan []byte
 	// videoBroadcast 承载视频帧：与 broadcast 分离，投递时只发给
 	// 已显式请求画面的连接（issue #26），其余消息仍全员广播
-	videoBroadcast chan []byte
+	videoBroadcast chan videoMsg
 	register       chan *Client
 	unregister     chan *Client
 	mu             sync.RWMutex
+}
+
+// videoMsg 视频广播单元：序列化后的消息 + 关键帧语义（供丢到关键帧策略）。
+type videoMsg struct {
+	data []byte
+	cam  string
+	key  bool
 }
 
 type Client struct {
@@ -45,13 +52,19 @@ type Client struct {
 
 	// slowSince 由 Run 循环独占访问：send 持续满仓的起始时刻
 	slowSince time.Time
+
+	// skipUntilKey 由 Run 循环独占访问：cam → 是否丢弃该路非关键帧。
+	// send 满仓丢帧后置位：H.264 丢掉 GOP 中间的参考帧后，后续 P 帧会
+	// 解码出绿色/花屏伪影；改为持续丢弃非关键帧直到下一个关键帧，
+	// 表现为画面短暂冻结而非花屏。
+	skipUntilKey map[string]bool
 }
 
 func NewHub() *Hub {
 	return &Hub{
 		clients:        make(map[*Client]bool),
 		broadcast:      make(chan []byte, 256),
-		videoBroadcast: make(chan []byte, 256),
+		videoBroadcast: make(chan videoMsg, 512),
 		register:       make(chan *Client),
 		unregister:     make(chan *Client),
 	}
@@ -77,29 +90,46 @@ func (h *Hub) Run() {
 			}
 
 		case message := <-h.broadcast:
-			h.dispatch(message, false)
+			h.dispatch(message, false, "", false)
 
-		case message := <-h.videoBroadcast:
-			h.dispatch(message, true)
+		case vm := <-h.videoBroadcast:
+			h.dispatch(vm.data, true, vm.cam, vm.key)
 		}
 	}
 }
 
 // dispatch 把一条已序列化的消息投递给客户端；videoOnly 为 true 时仅投给
-// 已显式请求画面的连接。只在 Run 循环内调用，slowSince 的独占访问约定
+// 已显式请求画面的连接。video 消息带 key 语义（cam 非空时启用丢到关键帧
+// 策略）。只在 Run 循环内调用，slowSince/skipUntilKey 的独占访问约定
 // 保持不变。
-func (h *Hub) dispatch(message []byte, videoOnly bool) {
+func (h *Hub) dispatch(message []byte, videoOnly bool, cam string, key bool) {
 	h.mu.RLock()
 	for client := range h.clients {
 		if videoOnly && !client.wantVideo {
 			continue
 		}
+		if videoOnly && cam != "" && client.skipUntilKey[cam] && !key {
+			// 该路正处丢帧期：非关键帧直接丢弃（不计慢、不触发断开）
+			continue
+		}
 		select {
 		case client.send <- message:
 			client.slowSince = time.Time{}
+			if videoOnly && cam != "" {
+				if client.skipUntilKey == nil {
+					client.skipUntilKey = map[string]bool{}
+				}
+				delete(client.skipUntilKey, cam)
+			}
 		default:
-			// 缓冲满：宽限期内丢消息（下个 IDR 自动恢复画面），
+			// 缓冲满：宽限期内丢消息，并进入丢到关键帧模式；
 			// 持续落后才移除，防止卡死客户端拖垮广播
+			if client.skipUntilKey == nil {
+				client.skipUntilKey = map[string]bool{}
+			}
+			if videoOnly && cam != "" {
+				client.skipUntilKey[cam] = true
+			}
 			if client.slowSince.IsZero() {
 				client.slowSince = time.Now()
 				continue
@@ -135,13 +165,28 @@ func (h *Hub) BroadcastMessage(msg *Message) {
 
 // BroadcastVideo 把视频消息只投递给已显式请求画面的客户端（issue #26：
 // 未打开画面的连接不搬运视频帧，省带宽），其余消息仍走 BroadcastMessage
-// 全员广播。
+// 全员广播。cam/key 驱动丢到关键帧策略（见 dispatch）。
 func (h *Hub) BroadcastVideo(msg *Message) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
-	h.videoBroadcast <- data
+	h.videoBroadcast <- videoMsg{data: data, cam: msg.Cam, key: msg.Key}
+}
+
+// BroadcastVideoFMP4 sends one fMP4 segment (init or fragment).
+// kind is "init" or "frag"; key marks a keyframe fragment.
+func (h *Hub) BroadcastVideoFMP4(cam, kind string, data []byte, key bool, codec string) {
+	msg := &Message{
+		Type:  MsgTypeVideoFMP4,
+		Data:  base64.StdEncoding.EncodeToString(data),
+		Kind:  kind,
+		Key:   key,
+		Cam:   cam,
+		Codec: codec,
+		Ts:    time.Now().UnixMilli(),
+	}
+	h.BroadcastVideo(msg)
 }
 
 // SetVideoView 设置某条连接是否接收视频广播，是 view_control start/stop

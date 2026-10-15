@@ -16,6 +16,43 @@ func newDirectClient(h *Hub) *Client {
 	return c
 }
 
+// TestDispatchDropToKey 丢到关键帧策略：send 满仓丢一次视频帧后，
+// 该路非关键帧持续被丢弃（画面冻结），关键帧送达并解除丢弃。
+func TestDispatchDropToKey(t *testing.T) {
+	hub := NewHub()
+	viewer := newDirectClient(hub)
+	hub.SetVideoView(viewer, true)
+
+	frag, _ := json.Marshal(&Message{Type: MsgTypeVideoFMP4, Cam: "cam1", Kind: "frag"})
+
+	// 灌满 send 缓冲后投递非关键帧 → 入队失败进入丢帧模式
+	for len(viewer.send) < cap(viewer.send) {
+		viewer.send <- []byte("x")
+	}
+	hub.dispatch(frag, true, "cam1", false)
+	// 消化缓冲
+	for len(viewer.send) > 0 {
+		<-viewer.send
+	}
+
+	// 丢帧期内：非关键帧被跳过
+	hub.dispatch(frag, true, "cam1", false)
+	expectNothing(t, "viewer during skip", viewer.send)
+
+	// 关键帧送达并解除丢帧
+	hub.dispatch(frag, true, "cam1", true)
+	m := expectReceived(t, viewer.send)
+	if m.Type != MsgTypeVideoFMP4 {
+		t.Fatalf("expected key frame delivered, got %+v", m)
+	}
+
+	// 解除后非关键帧恢复送达
+	hub.dispatch(frag, true, "cam1", false)
+	if m := expectReceived(t, viewer.send); m.Type != MsgTypeVideoFMP4 {
+		t.Fatalf("expected p-frame delivered after recovery, got %+v", m)
+	}
+}
+
 // expectReceived 断言通道里恰好有一条消息并返回它（带超时，用于
 // 异步投递的正向断言）。
 func expectReceived(t *testing.T, ch <-chan []byte) Message {
@@ -57,7 +94,7 @@ func TestDispatchVideoFiltering(t *testing.T) {
 	status, _ := json.Marshal(&Message{Type: MsgTypeStatus})
 
 	// 默认（未 start）：视频不投递，两个连接都不收
-	hub.dispatch(nal, true)
+	hub.dispatch(nal, true, "cam1", true)
 	for name, c := range map[string]*Client{"viewer": viewer, "bystander": bystander} {
 		select {
 		case raw := <-c.send:
@@ -67,7 +104,7 @@ func TestDispatchVideoFiltering(t *testing.T) {
 	}
 
 	// 非视频消息不受过滤影响：全员送达
-	hub.dispatch(status, false)
+	hub.dispatch(status, false, "", false)
 	if m := expectReceived(t, viewer.send); m.Type != MsgTypeStatus {
 		t.Fatalf("viewer expected status, got %s", m.Type)
 	}
@@ -77,7 +114,7 @@ func TestDispatchVideoFiltering(t *testing.T) {
 
 	// start 后：仅 viewer 收视频
 	hub.SetVideoView(viewer, true)
-	hub.dispatch(nal, true)
+	hub.dispatch(nal, true, "cam1", true)
 	if m := expectReceived(t, viewer.send); m.Type != MsgTypeVideoNAL || m.Cam != "cam1" {
 		t.Fatalf("viewer expected video_nal of cam1, got %+v", m)
 	}
@@ -89,13 +126,13 @@ func TestDispatchVideoFiltering(t *testing.T) {
 
 	// stop 后：viewer 不再收视频，但非视频消息照常
 	hub.SetVideoView(viewer, false)
-	hub.dispatch(nal, true)
+	hub.dispatch(nal, true, "cam1", true)
 	select {
 	case raw := <-viewer.send:
 		t.Fatalf("viewer received video after stop: %s", raw)
 	default:
 	}
-	hub.dispatch(status, false)
+	hub.dispatch(status, false, "", false)
 	if m := expectReceived(t, viewer.send); m.Type != MsgTypeStatus {
 		t.Fatalf("viewer expected status after stop, got %s", m.Type)
 	}
