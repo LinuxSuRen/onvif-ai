@@ -213,42 +213,135 @@ func Probe(ifaceName string) ([]Device, error) {
 		return nil, fmt.Errorf("resolve multicast: %w", err)
 	}
 
-	conn, err := net.ListenPacket("udp4", "0.0.0.0:0")
-	if err != nil {
-		return nil, fmt.Errorf("listen UDP: %w", err)
+	// 多网卡机器上，绑定 0.0.0.0 时 Windows 会按组播路由表选接口，
+	// 可能选中不可达的虚拟网卡导致 wsasendto: unreachable（实测），
+	// Probe 一个包都发不出去。改为逐个候选源地址绑定发送：
+	// 绑定源 IP 后组播从对应接口发出，发送失败的接口直接跳过。
+	var conns []net.PacketConn
+	for _, ip := range candidateIPs(ifaceName) {
+		conn, err := net.ListenPacket("udp4", ip+":0")
+		if err != nil {
+			continue
+		}
+		if _, err := conn.WriteTo([]byte(probe), mcastAddr); err != nil {
+			_ = conn.Close()
+			continue
+		}
+		conns = append(conns, conn)
 	}
-	defer conn.Close()
-
-	if _, err := conn.WriteTo([]byte(probe), mcastAddr); err != nil {
-		return nil, fmt.Errorf("send probe: %w", err)
+	if len(conns) == 0 {
+		// 兜底退回历史行为（单网卡机器上依旧可用）。
+		conn, err := net.ListenPacket("udp4", "0.0.0.0:0")
+		if err != nil {
+			return nil, fmt.Errorf("listen UDP: %w", err)
+		}
+		if _, err := conn.WriteTo([]byte(probe), mcastAddr); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("send probe: %w", err)
+		}
+		conns = append(conns, conn)
 	}
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
 
 	devices := make(map[string]Device)
 	var mu sync.Mutex
 
-	buf := make([]byte, 65535)
-	conn.SetReadDeadline(time.Now().Add(probeTimeout))
-
-	for {
-		n, _, err := conn.ReadFrom(buf)
-		if err != nil {
-			break
-		}
-
-		for _, d := range parseDevices(string(buf[:n])) {
-			mu.Lock()
-			if _, exists := devices[d.Address]; !exists {
-				devices[d.Address] = d
+	var wg sync.WaitGroup
+	for _, c := range conns {
+		wg.Add(1)
+		go func(c net.PacketConn) {
+			defer wg.Done()
+			buf := make([]byte, 65535)
+			for {
+				_ = c.SetReadDeadline(time.Now().Add(probeTimeout))
+				n, _, err := c.ReadFrom(buf)
+				if err != nil {
+					return // 超时或连接关闭
+				}
+				mu.Lock()
+				for _, d := range parseDevices(string(buf[:n])) {
+					if _, exists := devices[d.Address]; !exists {
+						devices[d.Address] = d
+					}
+				}
+				mu.Unlock()
 			}
-			mu.Unlock()
-		}
+		}(c)
 	}
+	wg.Wait()
 
 	result := make([]Device, 0, len(devices))
 	for _, d := range devices {
 		result = append(result, d)
 	}
 	return result, nil
+}
+
+// virtualIfaceHints 常见虚拟/隧道网卡的名称特征（小写包含匹配）。
+// 这些接口通常不具备可用的组播路径，作为候选源地址只会徒增失败发送。
+var virtualIfaceHints = []string{
+	"vethernet", "wsl", "virtualbox", "vbox", "tailscale",
+	"docker", "bluetooth", "蓝牙", "loopback", "tap", "tun",
+}
+
+func isVirtualIface(name string) bool {
+	n := strings.ToLower(name)
+	for _, h := range virtualIfaceHints {
+		if strings.Contains(n, h) {
+			return true
+		}
+	}
+	return false
+}
+
+// candidateIPs 返回探测应绑定的本机 IPv4 源地址：
+//   - ifaceName 为 IP 时直接使用；为接口名时取该接口的 IPv4；
+//   - 为空时枚举所有 up 的非回环物理候选接口（过滤常见虚拟网卡）。
+func candidateIPs(ifaceName string) []string {
+	if ifaceName != "" {
+		if ip := net.ParseIP(ifaceName); ip != nil && ip.To4() != nil {
+			return []string{ip.String()}
+		}
+		if iface, err := net.InterfaceByName(ifaceName); err == nil {
+			return ipv4Addrs(iface)
+		}
+		return nil
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var ips []string
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if isVirtualIface(ifc.Name) {
+			continue
+		}
+		ips = append(ips, ipv4Addrs(&ifc)...)
+	}
+	return ips
+}
+
+func ipv4Addrs(iface *net.Interface) []string {
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	var ips []string
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok || ipn.IP.To4() == nil || ipn.IP.IsLoopback() || ipn.IP.IsLinkLocalUnicast() {
+			continue
+		}
+		ips = append(ips, ipn.IP.String())
+	}
+	return ips
 }
 
 var Discover = Probe
