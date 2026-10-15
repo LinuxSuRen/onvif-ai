@@ -4,7 +4,7 @@ import { ref } from 'vue'
  * WebSocket message from the ONVIF AI backend.
  */
 export interface WsMessage {
-  type: 'video_fmp4' | 'video_nal' | 'video_jpeg' | 'audio_out' | 'transcript' | 'status' | 'error' | 'audio_start' | 'audio_data' | 'audio_stop' | 'speech_text' | 'switch_mode' | 'device_state' | 'ptz_move' | 'camera_listen' | 'clear_history' | 'clock_sync' | 'talkback_start' | 'audio_in' | 'talkback_stop' | 'talkback_state' | 'view_control' | 'connect_error'
+  type: 'video_fmp4' | 'video_nal' | 'video_jpeg' | 'audio_out' | 'transcript' | 'status' | 'error' | 'audio_start' | 'audio_data' | 'audio_stop' | 'speech_text' | 'switch_mode' | 'device_state' | 'ptz_move' | 'camera_listen' | 'clear_history' | 'clock_sync' | 'talkback_start' | 'audio_in' | 'talkback_stop' | 'talkback_state' | 'view_control' | 'connect_error' | 'device_event'
   data?: string
   text?: string
   ts?: number
@@ -16,6 +16,15 @@ export interface WsMessage {
     state?: string
     [key: string]: unknown
   }
+}
+
+/** device_event 消息的负载（与后端 ws.DeviceEventPayload 对应） */
+export interface DeviceEventData {
+  topic: string
+  source?: Record<string, string>
+  data?: Record<string, string>
+  device?: string
+  time?: string
 }
 
 /**

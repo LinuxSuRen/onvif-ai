@@ -4,6 +4,7 @@ import VideoPlayer from './components/VideoPlayer.vue'
 import IntercomPanel from './components/IntercomPanel.vue'
 import VoicePanel from './components/VoicePanel.vue'
 import DeviceInfo from './components/DeviceInfo.vue'
+import EventPanel from './components/EventPanel.vue'
 
 const clockText = ref('--:--:--')
 let clockTimer: ReturnType<typeof setInterval> | null = null
@@ -55,6 +56,7 @@ onUnmounted(() => {
       <aside class="app-main__sidebar">
         <IntercomPanel />
         <DeviceInfo />
+        <EventPanel />
         <VoicePanel />
       </aside>
     </main>
