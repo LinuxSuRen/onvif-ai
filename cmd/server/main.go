@@ -1255,6 +1255,10 @@ func (cm *cameraManager) onDeviceEvent(ev onvif.EventMessage) {
 	}
 }
 
+// motionSnapshotMaxBytes 限制送入 LLM 的快照体积：base64 后约膨胀 4/3，
+// 超限直接跳过分析（避免撞 LLM 网关的请求体/token 上限）。
+const motionSnapshotMaxBytes = 4 << 20 // 4MB
+
 // motionAIPipeline 移动侦测触发的 AI 分析：
 // 抓快照 → 发 LLM 分析画面内容 → TTS 播报到设备扬声器（可用时）。
 // 全流程可失败降级（LLM 未配置/TTS 不可用/快照失败——只记日志不中断）。
@@ -1291,19 +1295,27 @@ func (cm *cameraManager) motionAIPipeline(ev onvif.EventMessage) {
 		return
 	}
 
-	// LLM 分析（发送 base64 JPEG）
+	// LLM 分析（多模态消息：文本 + image_url 各占一段 content，
+	// base64 放进 data URL——嵌在纯文本里模型看不到画面且易撞请求上限）
 	cm.mu.Lock()
 	llmCl := cm.llmClient
 	cm.mu.Unlock()
 	if llmCl == nil {
 		return
 	}
+	if len(jpegData) > motionSnapshotMaxBytes {
+		log.Printf("[motion-ai] snapshot too large (%d bytes), skip", len(jpegData))
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	analysis, err := llmCl.Chat(ctx, []llm.Message{
-		{Role: "user", Content: fmt.Sprintf(
-			"[移动侦测触发] 请用一句话描述这个画面中发生了什么（中文，不超过30字）：\n[data:image/jpeg;base64,%s]",
-			base64.StdEncoding.EncodeToString(jpegData))},
+		{Role: "user", Content: []llm.ImageContent{
+			{Type: "text", Text: "[移动侦测触发] 请用一句话描述这个画面中发生了什么（中文，不超过30字）："},
+			{Type: "image_url", ImageURL: &llm.ImageURL{
+				URL: "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(jpegData),
+			}},
+		}},
 	})
 	if err != nil {
 		log.Printf("[motion-ai] LLM analysis failed: %v", err)
@@ -1324,8 +1336,12 @@ func (cm *cameraManager) motionAIPipeline(ev onvif.EventMessage) {
 	ttsClient := cm.ttsClient
 	cm.mu.Unlock()
 	if ready && ttsClient != nil {
+		// TTS 独立生命周期：主管线的 ctx 随本函数返回被 defer cancel，
+		// 若沿用会把 http 请求立即取消、合成立即失败
 		go func() {
-			cm.speakToBackchannel(ctx, ttsClient, analysis)
+			ttsCtx, ttsCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer ttsCancel()
+			cm.speakToBackchannel(ttsCtx, ttsClient, analysis)
 		}()
 	}
 }
