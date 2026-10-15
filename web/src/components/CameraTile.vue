@@ -79,22 +79,40 @@ function createJMuxer() {
   presentedMediaTime = 0
 }
 
-// jmuxer 错误分三类：QuotaExceeded（内部自动清理）、InvalidStateError
-// （内部自动 reset）、其余（endMSE，管线永久失效）。前两类之外的错误，
-// 或 60s 内反复出错时直接重建管线 —— 后端在每个 IDR 前重发 SPS/PPS，
-// 一个 GOP 内即可自动恢复画面。
+// jmuxer 错误分三类：QuotaExceeded（内部自动清理）、InvalidStateError（内部
+// 自动 reset）、其余（endMSE，管线永久失效）。但 InvalidStateError 有一个
+// 必须立即重建的子类：video 元素 error 已置位（硬解码失败等）——此时 MSE
+// 已经死亡，appendBuffer 会无限抛 InvalidStateError，等 IDR 自愈无效。
 function handleJMuxerError(error: unknown) {
   console.warn('[CameraTile] jmuxer error:', error)
   const data = error as { name?: string } | null | undefined
   const now = Date.now()
   jmuxerErrTimes = jmuxerErrTimes.filter((t) => now - t < 60_000)
   jmuxerErrTimes.push(now)
-  const fatal = data && data.name !== 'QuotaExceeded' && data.name !== 'InvalidStateError'
+  const videoDead = !!(videoRef.value && videoRef.value.error)
+  const fatal =
+    videoDead ||
+    (data && data.name !== 'QuotaExceeded' && data.name !== 'InvalidStateError')
   if (fatal || jmuxerErrTimes.length >= 3) {
     jmuxerErrTimes = []
-    destroyJMuxer()
-    createJMuxer()
+    scheduleReset()
   }
+}
+
+// 带节流的管线重建：解码错误可能连续触发（元素 error 与 jmuxer 错误并发），
+// 无节流会陷入重建风暴；1s 冷却已足够新 MediaSource 完成初始化。
+let lastResetAt = 0
+function scheduleReset() {
+  const now = Date.now()
+  if (now - lastResetAt < 1000) return
+  lastResetAt = now
+  resetPipeline()
+}
+
+// video 元素 error 置位（MEDIA_ERROR_DECODE 等）后 MSE 立即失效，
+// 后续 feed 全部作废 —— 必须整条管线重建（新 MediaSource + 解码器重初始化）
+function onVideoElementError() {
+  scheduleReset()
 }
 
 // 重建整条展示管线（WS 重连 / 显式重置时调用）
@@ -107,6 +125,7 @@ function resetPipeline() {
 
 onMounted(() => {
   createJMuxer()
+  videoRef.value?.addEventListener('error', onVideoElementError)
   const video = videoRef.value as any
   if (video && typeof video.requestVideoFrameCallback === 'function') {
     const onFrame = (_now: number, metadata: { mediaTime: number }) => {
@@ -121,6 +140,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   registry?.unregister(props.cam.token, { feedNal, feedJpeg })
+  videoRef.value?.removeEventListener('error', onVideoElementError)
   if (latencyTimer) clearInterval(latencyTimer)
   const video = videoRef.value as any
   if (video && rVfcHandle && typeof video.cancelVideoFrameCallback === 'function') {
