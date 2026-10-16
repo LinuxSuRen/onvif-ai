@@ -81,7 +81,7 @@ type Handler struct {
 	forwardConfig  *ForwardConfig
 	snapshotFPS    int
 	onConnect          func(address, username, password string)
-	onWallConnect      func(address, username, password, profile string)
+	onWallConnect      func(address, username, password string, profiles []string)
 	onWallDisconnect   func(address, profile string)
 	wallState        func() []ws.WallDevice
 	onAudioData    func([]byte)
@@ -193,7 +193,7 @@ func (h *Handler) SetOnConnect(fn func(address, username, password string)) {
 //（凭证由前端每次携带，后端不落盘；profile 为空时取子码流近似），
 // onWallDisconnect 下墙一台设备，wallState 提供当前墙设备快照
 //（GET /api/wall/devices 与 WS 广播共用）。
-func (h *Handler) SetWallCallbacks(onWallConnect func(address, username, password, profile string), onWallDisconnect func(address, profile string), wallState func() []ws.WallDevice) {
+func (h *Handler) SetWallCallbacks(onWallConnect func(address, username, password string, profiles []string), onWallDisconnect func(address, profile string), wallState func() []ws.WallDevice) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onWallConnect = onWallConnect
@@ -365,12 +365,12 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 // 后端不落盘。路数超限由 cameraManager 侧拒绝并广播错误。
 func (h *Handler) handleWallConnect(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Address  string `json:"address"`
-		Username string `json:"username"`
-		Password string `json:"password"`
-		Profile  string `json:"profile"`
+		Address  string   `json:"address"`
+		Username string   `json:"username"`
+		Password string   `json:"password"`
+		Profiles []string `json:"profiles"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" || len(req.Profiles) == 0 {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
 		return
 	}
@@ -383,7 +383,7 @@ func (h *Handler) handleWallConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"wall not available"}`, http.StatusServiceUnavailable)
 		return
 	}
-	go fn(req.Address, req.Username, req.Password, req.Profile)
+	go fn(req.Address, req.Username, req.Password, req.Profiles)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "connecting", "address": req.Address})

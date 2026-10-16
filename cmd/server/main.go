@@ -111,7 +111,7 @@ func main() {
 	// 视频墙：上墙/下墙/快照（凭证由前端每次携带，后端不落盘；
 	// 下墙 profile 为空表示整台设备下墙）
 	h.SetWallCallbacks(
-		func(addr, user, pass, profile string) { cm.connectWall(addr, user, pass, profile) },
+		func(addr, user, pass string, profiles []string) { cm.connectWall(addr, user, pass, profiles) },
 		func(addr, profile string) {
 			if profile == "" {
 				cm.disconnectDevice(addr)
@@ -294,34 +294,55 @@ func (cm *cameraManager) connect(address, username, password string) {
 	cm.startSession(address, username, password, nil, true)
 }
 
-// connectWall 把一路画面上墙（视频墙入口）。同一设备可以多路画面同时在
-// 墙上：已存在会话时按「现有画面 + 新画面」重建（token 已在墙上则拒绝）；
-// 路数超限拒绝。
-func (cm *cameraManager) connectWall(address, username, password, profile string) {
+// connectWall 把一组画面上墙（视频墙入口，支持一次多路）。同一设备可
+// 多路画面同时在墙上：已存在会话时按「现有画面 + 新增画面」重建；
+// 已在墙上的 token 静默跳过，全部已存在或超限则拒绝。
+func (cm *cameraManager) connectWall(address, username, password string, profiles []string) {
 	cm.mu.Lock()
 	existing, exists := cm.registry.Get(address)
 	wasFocused := exists && cm.deviceSession == existing
 	var tokens []string
 	if exists {
 		for _, u := range existing.units {
-			if u.token == profile {
-				cm.mu.Unlock()
-				cm.hub.BroadcastError("该画面已在墙上")
-				return
-			}
 			tokens = append(tokens, u.token)
 		}
+	}
+	// 去重并跳过已在墙上的 token
+	seen := make(map[string]bool, len(profiles))
+	var adding []string
+	for _, t := range profiles {
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		if exists {
+			onWall := false
+			for _, u := range existing.units {
+				if u.token == t {
+					onWall = true
+					break
+				}
+			}
+			if onWall {
+				continue
+			}
+		}
+		adding = append(adding, t)
 	}
 	total := 0
 	for _, s := range cm.registry.Sessions() {
 		total += len(s.units)
 	}
 	cm.mu.Unlock()
-	if total+1 > maxWallStreams {
+	if len(adding) == 0 {
+		cm.hub.BroadcastError("所选画面已在墙上")
+		return
+	}
+	if total+len(adding) > maxWallStreams {
 		cm.hub.BroadcastError(fmt.Sprintf("视频墙路数已达上限（%d），请先下墙部分画面", maxWallStreams))
 		return
 	}
-	tokens = append(tokens, profile)
+	tokens = append(tokens, adding...)
 	if exists {
 		cm.teardownSession(existing)
 	}

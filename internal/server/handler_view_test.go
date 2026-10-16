@@ -130,17 +130,22 @@ func TestWallEndpoints(t *testing.T) {
 	// 未注册回调：503
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/wall/connect",
-		strings.NewReader(`{"address":"192.168.1.10"}`)))
+		strings.NewReader(`{"address":"192.168.1.10","profiles":["profile_1"]}`)))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("without callbacks expected 503, got %d", rec.Code)
 	}
 
-	type connectReq struct{ addr, user, pass, profile string }
+	type connectReq struct {
+		addr     string
+		user     string
+		pass     string
+		profiles []string
+	}
 	connects := make(chan connectReq, 2)
 	type disconnectReq struct{ addr, profile string }
 	disconnects := make(chan disconnectReq, 2)
 	h.SetWallCallbacks(
-		func(addr, user, pass, profile string) { connects <- connectReq{addr, user, pass, profile} },
+		func(addr, user, pass string, profiles []string) { connects <- connectReq{addr, user, pass, profiles} },
 		func(addr, profile string) { disconnects <- disconnectReq{addr, profile} },
 		func() []ws.WallDevice {
 			return []ws.WallDevice{{
@@ -151,20 +156,29 @@ func TestWallEndpoints(t *testing.T) {
 		},
 	)
 
-	// connect：参数透传（含 profile），立即返回 connecting
+	// connect：参数透传（profiles 数组），立即返回 connecting
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/wall/connect",
-		strings.NewReader(`{"address":"192.168.1.10","username":"admin","password":"pw","profile":"profile_2"}`)))
+		strings.NewReader(`{"address":"192.168.1.10","username":"admin","password":"pw","profiles":["profile_1","profile_2"]}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("connect status = %d, body %s", rec.Code, rec.Body.String())
 	}
 	select {
 	case got := <-connects:
-		if got.addr != "192.168.1.10" || got.user != "admin" || got.pass != "pw" || got.profile != "profile_2" {
+		if got.addr != "192.168.1.10" || got.user != "admin" || got.pass != "pw" ||
+			len(got.profiles) != 2 || got.profiles[0] != "profile_1" || got.profiles[1] != "profile_2" {
 			t.Fatalf("connect callback args: %+v", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("connect callback not fired")
+	}
+
+	// 空 profiles：400
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/wall/connect",
+		strings.NewReader(`{"address":"192.168.1.10"}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty profiles expected 400, got %d", rec.Code)
 	}
 
 	// 非法请求：400

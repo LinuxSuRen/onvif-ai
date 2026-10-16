@@ -51,16 +51,33 @@ const loadingDiscovery = ref(false)
 const addError = ref('')
 const busy = ref(false)
 
-// ---- profile 选择：选定设备后拉取画面列表（纯 SOAP 查询，不建会话）----
+// ---- profile 选择：选定设备后拉取画面列表（纯 SOAP 查询，不建会话），复选多选 ----
 interface ProfileItem {
   token: string
   name: string
   ptz: boolean
 }
 const profiles = ref<ProfileItem[]>([])
-const selectedProfile = ref('')
+const selectedProfiles = ref<string[]>([])
 const loadingProfiles = ref(false)
 const profileError = ref('')
+
+function toggleProfile(token: string) {
+  const idx = selectedProfiles.value.indexOf(token)
+  if (idx >= 0) {
+    selectedProfiles.value.splice(idx, 1)
+  } else {
+    selectedProfiles.value.push(token)
+  }
+}
+
+function selectableProfiles(): ProfileItem[] {
+  return profiles.value.filter((p) => !profileOnWall(selectedAddress.value, p.token))
+}
+
+function selectAllSelectable() {
+  selectedProfiles.value = selectableProfiles().map((p) => p.token)
+}
 
 const discovered = computed(() =>
   discoveredRaw.value.map((d: DiscoveredDevice) => ({
@@ -209,7 +226,7 @@ async function fetchProfiles() {
   loadingProfiles.value = true
   profileError.value = ''
   profiles.value = []
-  selectedProfile.value = ''
+  selectedProfiles.value = []
   try {
     const q = new URLSearchParams({
       address,
@@ -226,10 +243,10 @@ async function fetchProfiles() {
       name: p.name || p.token,
       ptz: !!p.ptz,
     }))
-    // 已全部上墙的设备保持可选（等待重新获取）；只剩一路未上墙时自动选中
-    const selectable = profiles.value.filter((p) => !profileOnWall(selectedAddress.value, p.token))
+    // 只剩一路未上墙时自动勾选；多路交给用户勾选（可「全选」）
+    const selectable = selectableProfiles()
     if (selectable.length === 1) {
-      selectedProfile.value = selectable[0].token
+      selectedProfiles.value = [selectable[0].token]
     }
   } catch (e) {
     profileError.value = e instanceof Error ? e.message : '无法获取画面列表，请检查凭证后重试'
@@ -249,7 +266,7 @@ async function openAddDialog() {
   addForm.value = { username: '', password: '' }
   selectedAddress.value = ''
   profiles.value = []
-  selectedProfile.value = ''
+  selectedProfiles.value = []
   profileError.value = ''
   refreshDiscovery()
 }
@@ -260,12 +277,9 @@ async function submitAdd() {
     addError.value = '请先在列表中选择一台设备'
     return
   }
-  if (!selectedProfile.value) {
-    addError.value = '请选择要上墙的画面（profile）'
-    return
-  }
-  if (profileOnWall(address, selectedProfile.value)) {
-    addError.value = '该画面已在墙上'
+  const toAdd = selectedProfiles.value.filter((t) => !profileOnWall(address, t))
+  if (!toAdd.length) {
+    addError.value = '请勾选要上墙的画面（profile）'
     return
   }
   busy.value = true
@@ -278,7 +292,7 @@ async function submitAdd() {
         address,
         username: addForm.value.username,
         password: addForm.value.password,
-        profile: selectedProfile.value,
+        profiles: toAdd,
       }),
     })
     if (!resp.ok) {
@@ -517,34 +531,45 @@ function deviceLabel(d: WallDeviceView): string {
 
         <div v-if="selectedAddress" class="wall__pick">
           <div class="wall__pick-head">
-            <span>上墙画面</span>
-            <button
-              class="wall__refresh"
-              type="button"
-              :disabled="loadingProfiles"
-              @click="fetchProfiles"
-            >{{ loadingProfiles ? '获取中…' : '重新获取' }}</button>
+            <span>上墙画面（可多选）</span>
+            <span class="wall__pick-actions">
+              <button
+                v-if="selectableProfiles().length > 1"
+                class="wall__refresh"
+                type="button"
+                @click="selectAllSelectable"
+              >全选</button>
+              <button
+                class="wall__refresh"
+                type="button"
+                :disabled="loadingProfiles"
+                @click="fetchProfiles"
+              >{{ loadingProfiles ? '获取中…' : '重新获取' }}</button>
+            </span>
           </div>
           <div v-if="loadingProfiles" class="wall__device-empty">正在获取画面列表…</div>
           <div v-else-if="profileError" class="wall__device-empty">{{ profileError }}</div>
           <div v-else class="wall__device-list">
-            <button
+            <label
               v-for="p in profiles"
               :key="p.token"
               class="wall__device-item"
               :class="{
-                'wall__device-item--selected': selectedProfile === p.token,
+                'wall__device-item--selected': selectedProfiles.includes(p.token),
                 'wall__device-item--onwall': profileOnWall(selectedAddress, p.token),
               }"
-              type="button"
-              :disabled="profileOnWall(selectedAddress, p.token)"
               :title="p.token"
-              @click="selectedProfile = p.token"
             >
+              <input
+                type="checkbox"
+                :checked="selectedProfiles.includes(p.token)"
+                :disabled="profileOnWall(selectedAddress, p.token)"
+                @change="toggleProfile(p.token)"
+              />
               <span class="wall__device-name">{{ p.name }}</span>
               <span class="wall__device-host">{{ p.ptz ? '支持云台' : '' }}</span>
               <span v-if="profileOnWall(selectedAddress, p.token)" class="wall__device-badge">已在墙上</span>
-            </button>
+            </label>
             <div v-if="!profiles.length" class="wall__device-empty">填写凭证后点击「重新获取」拉取画面列表</div>
           </div>
         </div>
@@ -821,6 +846,11 @@ function deviceLabel(d: WallDeviceView): string {
   overflow-y: auto;
 }
 
+.wall__pick-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
 .wall__device-item {
   display: flex;
   align-items: center;
@@ -832,6 +862,14 @@ function deviceLabel(d: WallDeviceView): string {
   cursor: pointer;
   text-align: left;
   transition: all 0.12s;
+}
+
+.wall__device-item input[type='checkbox'] {
+  accent-color: var(--color-accent-green);
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  cursor: inherit;
 }
 
 .wall__device-item:hover:not(:disabled) {
