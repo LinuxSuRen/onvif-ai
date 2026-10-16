@@ -549,8 +549,8 @@ func (c *Client) PTZGotoHomePosition(ctx context.Context, profileToken string) e
 }
 
 // ImagingFocusMove 以连续速度调整焦距（对焦）：speed 取 (-1,1)，
-// 正值向远（FAR）对焦、负值向近（NEAR）对焦。焦距属 Imaging 服务
-// 而非 PTZ 服务。
+// 正值向远（FAR）对焦、负值向近（NEAR）对焦。携带 10s 超时：部分
+// 固件的 Imaging Stop 返回 500（海康实测），超时保证移动自终止。
 func (c *Client) ImagingFocusMove(ctx context.Context, profileToken string, speed float64) error {
 	if err := c.discoverServices(ctx); err != nil {
 		return err
@@ -564,8 +564,9 @@ func (c *Client) ImagingFocusMove(ctx context.Context, profileToken string, spee
 					<tt:Speed>%f</tt:Speed>
 				</timg:Continuous>
 			</timg:Focus>
+			<timg:Timeout>%s</timg:Timeout>
 		</timg:Move>
-	`, xmlEscape(profileToken), speed))
+	`, xmlEscape(profileToken), speed, formatISO8601(10*time.Second)))
 
 	resp, err := c.soapCall(ctx, c.deviceURL(), c.imagingURL(), "Move", body)
 	if err != nil {
@@ -575,7 +576,8 @@ func (c *Client) ImagingFocusMove(ctx context.Context, profileToken string, spee
 	return nil
 }
 
-// ImagingFocusStop 停止焦距马达的连续移动。
+// ImagingFocusStop 停止焦距马达的连续移动。部分固件不支持 Imaging
+// Stop（返回 500，海康实测）：失败时退化为零速度 Move（等效停止）。
 func (c *Client) ImagingFocusStop(ctx context.Context, profileToken string) error {
 	if err := c.discoverServices(ctx); err != nil {
 		return err
@@ -587,12 +589,11 @@ func (c *Client) ImagingFocusStop(ctx context.Context, profileToken string) erro
 		</timg:Stop>
 	`, xmlEscape(profileToken)))
 
-	resp, err := c.soapCall(ctx, c.deviceURL(), c.imagingURL(), "Stop", body)
-	if err != nil {
-		return err
+	if _, err := c.soapCall(ctx, c.deviceURL(), c.imagingURL(), "Stop", body); err == nil {
+		return nil
 	}
-	_ = resp
-	return nil
+	// 兜底：零速度连续移动在绝大多数实现里等价于停止
+	return c.ImagingFocusMove(ctx, profileToken, 0)
 }
 
 // ImagingSetAutoFocus 切换自动/手动对焦。read-before-write：先取当前

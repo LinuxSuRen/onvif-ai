@@ -149,10 +149,20 @@ function camDisplayName(cam: CamInfo, index: number) {
   return cam.name || `摄像头 ${index + 1}`
 }
 
+// PTZ：hold:xxx = 按住连转（30s 上限后端钳制），stop = 松开停止，
+// home = 回中。dev 携带聚焦设备地址（后端据此路由到对应会话）
 function ptzMove(direction: string) {
   const cam = activeCamera.value
   if (!cam) return
-  send({ type: 'ptz_move', payload: { camera: cam.token, direction } })
+  let action = direction
+  let durationMs: number | undefined
+  if (action.startsWith('hold:')) {
+    action = action.slice(5)
+    durationMs = 30000
+  }
+  const payload: Record<string, unknown> = { dev: focusedDev.value, camera: cam.token, direction: action }
+  if (durationMs) payload.duration_ms = durationMs
+  send({ type: 'ptz_move', payload })
 }
 
 // ---- 时钟同步：为各路延迟测量提供统一的时钟偏移 ----
