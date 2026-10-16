@@ -137,10 +137,11 @@ func TestWallEndpoints(t *testing.T) {
 
 	type connectReq struct{ addr, user, pass, profile string }
 	connects := make(chan connectReq, 2)
-	disconnects := make(chan string, 2)
+	type disconnectReq struct{ addr, profile string }
+	disconnects := make(chan disconnectReq, 2)
 	h.SetWallCallbacks(
 		func(addr, user, pass, profile string) { connects <- connectReq{addr, user, pass, profile} },
-		func(addr string) { disconnects <- addr },
+		func(addr, profile string) { disconnects <- disconnectReq{addr, profile} },
 		func() []ws.WallDevice {
 			return []ws.WallDevice{{
 				Address: "192.168.1.10",
@@ -174,17 +175,17 @@ func TestWallEndpoints(t *testing.T) {
 		t.Fatalf("invalid connect expected 400, got %d", rec.Code)
 	}
 
-	// disconnect：参数透传
+	// disconnect：参数透传（profile 非空 = 只下墙该路画面）
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/wall/disconnect",
-		strings.NewReader(`{"address":"192.168.1.10"}`)))
+		strings.NewReader(`{"address":"192.168.1.10","profile":"profile_2"}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disconnect status = %d", rec.Code)
 	}
 	select {
 	case got := <-disconnects:
-		if got != "192.168.1.10" {
-			t.Fatalf("disconnect callback arg: %s", got)
+		if got.addr != "192.168.1.10" || got.profile != "profile_2" {
+			t.Fatalf("disconnect callback args: %+v", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("disconnect callback not fired")

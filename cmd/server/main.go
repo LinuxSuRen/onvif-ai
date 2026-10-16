@@ -109,10 +109,16 @@ func main() {
 	})
 
 	// 视频墙：上墙/下墙/快照（凭证由前端每次携带，后端不落盘；
-	// profile 为空时取子码流近似）
+	// 下墙 profile 为空表示整台设备下墙）
 	h.SetWallCallbacks(
 		func(addr, user, pass, profile string) { cm.connectWall(addr, user, pass, profile) },
-		func(addr string) { cm.disconnectDevice(addr) },
+		func(addr, profile string) {
+			if profile == "" {
+				cm.disconnectDevice(addr)
+			} else {
+				cm.disconnectWallProfile(addr, profile)
+			}
+		},
 		cm.wallState,
 	)
 
@@ -285,32 +291,80 @@ func (cm *cameraManager) connect(address, username, password string) {
 	if focused != nil && focused.addr != "" {
 		cm.teardownSession(focused)
 	}
-	cm.startSession(address, username, password, false, "")
+	cm.startSession(address, username, password, nil, true)
 }
 
-// connectWall 把一台设备上墙（视频墙入口）：只取一路画面——优先用
-// 前端选定的 profile，未指定时取列表末位（主码流在前的设备惯例）作为
-// 子码流近似；不动当前聚焦设备；路数超限时拒绝。
+// connectWall 把一路画面上墙（视频墙入口）。同一设备可以多路画面同时在
+// 墙上：已存在会话时按「现有画面 + 新画面」重建（token 已在墙上则拒绝）；
+// 路数超限拒绝。
 func (cm *cameraManager) connectWall(address, username, password, profile string) {
 	cm.mu.Lock()
+	existing, exists := cm.registry.Get(address)
+	wasFocused := exists && cm.deviceSession == existing
+	var tokens []string
+	if exists {
+		for _, u := range existing.units {
+			if u.token == profile {
+				cm.mu.Unlock()
+				cm.hub.BroadcastError("该画面已在墙上")
+				return
+			}
+			tokens = append(tokens, u.token)
+		}
+	}
 	total := 0
 	for _, s := range cm.registry.Sessions() {
 		total += len(s.units)
 	}
-	_, exists := cm.registry.Get(address)
 	cm.mu.Unlock()
-	if !exists && total >= maxWallStreams {
-		cm.hub.BroadcastError(fmt.Sprintf("视频墙路数已达上限（%d），请先下墙部分设备", maxWallStreams))
+	if total+1 > maxWallStreams {
+		cm.hub.BroadcastError(fmt.Sprintf("视频墙路数已达上限（%d），请先下墙部分画面", maxWallStreams))
 		return
 	}
-	cm.startSession(address, username, password, true, profile)
+	tokens = append(tokens, profile)
+	if exists {
+		cm.teardownSession(existing)
+	}
+	cm.startSession(address, username, password, tokens, wasFocused)
 }
 
-// disconnectDevice 下墙一台设备（视频墙入口）。
+// disconnectDevice 下墙一台设备的全部画面（视频墙入口，profile 为空）。
 func (cm *cameraManager) disconnectDevice(address string) {
 	if sess, ok := cm.registry.Get(address); ok {
 		cm.teardownSession(sess)
 	}
+}
+
+// disconnectWallProfile 下墙一路画面：设备还有其它画面时按剩余集合
+// 重建会话，最后一路移除时整个会话拆除。
+func (cm *cameraManager) disconnectWallProfile(address, token string) {
+	cm.mu.Lock()
+	sess, ok := cm.registry.Get(address)
+	if !ok {
+		cm.mu.Unlock()
+		return
+	}
+	wasFocused := cm.deviceSession == sess
+	user, pass := sess.authUser, sess.authPass
+	var remaining []string
+	found := false
+	for _, u := range sess.units {
+		if u.token == token {
+			found = true
+			continue
+		}
+		remaining = append(remaining, u.token)
+	}
+	cm.mu.Unlock()
+	if !found {
+		return
+	}
+	if len(remaining) == 0 {
+		cm.teardownSession(sess)
+		return
+	}
+	cm.teardownSession(sess)
+	cm.startSession(address, user, pass, remaining, wasFocused)
 }
 
 // shutdown 拆除全部设备会话（进程退出时调用）。
@@ -321,10 +375,10 @@ func (cm *cameraManager) shutdown() {
 	cm.disconnect()
 }
 
-// startSession 建立并运行一台设备的会话。wallMode 为 true 是视频墙上墙：
-// 只取一路画面（profileToken 指定则按 token 匹配，否则取列表末位）、
-// 不替换聚焦；否则为聚焦连接（详情页），取全部 profile 并设为当前聚焦。
-func (cm *cameraManager) startSession(address, username, password string, wallMode bool, profileToken string) {
+// startSession 建立并运行一台设备的会话。profileTokens 为 nil 表示取
+// 全部 profile（聚焦连接，详情页）；否则按 token 集合精确过滤（视频墙
+// 可以一路或多路）。focus 为 true 时把会话设为当前聚焦。
+func (cm *cameraManager) startSession(address, username, password string, profileTokens []string, focus bool) {
 	cm.mu.Lock()
 	life := newStreamLife()
 	sess := &deviceSession{
@@ -335,8 +389,8 @@ func (cm *cameraManager) startSession(address, username, password string, wallMo
 		state:    "connecting",
 	}
 	cm.registry.Register(address, sess)
-	if !wallMode || cm.deviceSession.addr == "" {
-		// 聚焦连接直接接管详情页；首台设备上墙时顺带聚焦，
+	if focus || cm.deviceSession.addr == "" {
+		// 聚焦连接接管详情页；首台设备上墙时顺带聚焦，
 		// 详情页不至于空屏
 		cm.deviceSession = sess
 	}
@@ -377,21 +431,23 @@ func (cm *cameraManager) startSession(address, username, password string, wallMo
 		return
 	}
 
-	if wallMode {
-		// 视频墙只取一路画面：优先前端选定的 profile（按 token 精确匹配，
-		// 匹配不到回退末位），未指定时按「主码流在前」的设备惯例取列表
-		// 末位作为子码流近似（#39）
-		if profileToken != "" {
-			for _, p := range profiles {
-				if p.Token == profileToken {
-					profiles = []onvif.Profile{p}
+	if profileTokens != nil {
+		// 视频墙模式：按 token 集合精确过滤（可一路或多路），
+		// 一个都没匹配到视为配置错误
+		filtered := make([]onvif.Profile, 0, len(profileTokens))
+		for _, p := range profiles {
+			for _, t := range profileTokens {
+				if p.Token == t {
+					filtered = append(filtered, p)
 					break
 				}
 			}
 		}
-		if len(profiles) > 1 {
-			profiles = profiles[len(profiles)-1:]
+		if len(filtered) == 0 {
+			cm.hub.BroadcastError("指定的画面（profile）不存在或不可用")
+			return
 		}
+		profiles = filtered
 	}
 	if len(profiles) > maxCams {
 		log.Printf("Found %d profiles, using first %d", len(profiles), maxCams)
@@ -440,7 +496,7 @@ func (cm *cameraManager) startSession(address, username, password string, wallMo
 	sess.cameraAudioBufMax = 160000
 	sess.state = "online"
 	cm.mu.Unlock()
-	if wallMode {
+	if !focus {
 		cm.broadcastWallState()
 	} else {
 		cm.syncCameraStates()

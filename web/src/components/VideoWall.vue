@@ -184,8 +184,14 @@ function onWall(address: string): boolean {
   return devices.value.some((d) => d.address === address || hostOf(d.address) === host)
 }
 
+// 某设备的某路画面是否已在墙上（地址精确匹配或按主机匹配）
+function profileOnWall(address: string, token: string): boolean {
+  const host = hostOf(address)
+  const d = devices.value.find((x) => x.address === address || hostOf(x.address) === host)
+  return !!d && d.cameras.some((c) => c.token === token)
+}
+
 function pickDevice(address: string) {
-  if (onWall(address)) return
   selectedAddress.value = address
   const cred = loadCreds()[address]
   if (cred) {
@@ -220,9 +226,10 @@ async function fetchProfiles() {
       name: p.name || p.token,
       ptz: !!p.ptz,
     }))
-    if (profiles.value.length === 1) {
-      // 单画面设备无需选择
-      selectedProfile.value = profiles.value[0].token
+    // 已全部上墙的设备保持可选（等待重新获取）；只剩一路未上墙时自动选中
+    const selectable = profiles.value.filter((p) => !profileOnWall(selectedAddress.value, p.token))
+    if (selectable.length === 1) {
+      selectedProfile.value = selectable[0].token
     }
   } catch (e) {
     profileError.value = e instanceof Error ? e.message : '无法获取画面列表，请检查凭证后重试'
@@ -253,8 +260,12 @@ async function submitAdd() {
     addError.value = '请先在列表中选择一台设备'
     return
   }
-  if (profiles.value.length > 1 && !selectedProfile.value) {
+  if (!selectedProfile.value) {
     addError.value = '请选择要上墙的画面（profile）'
+    return
+  }
+  if (profileOnWall(address, selectedProfile.value)) {
+    addError.value = '该画面已在墙上'
     return
   }
   busy.value = true
@@ -283,12 +294,12 @@ async function submitAdd() {
   }
 }
 
-async function removeDevice(address: string) {
+async function removeDevice(address: string, profile: string) {
   try {
     await fetch('/api/wall/disconnect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ address }),
+      body: JSON.stringify({ address, profile }),
     })
   } catch {
     /* 界面随 wall_state 广播自然更新 */
@@ -308,11 +319,6 @@ function focusDevice(address: string) {
 const visibleTiles = new Set<string>()
 let observer: IntersectionObserver | null = null
 const resetKey = ref(0)
-
-function tileRouteKey(d: WallDeviceView): string | null {
-  const cam = d.cameras[0]
-  return cam ? `${d.address}/${cam.token}` : null
-}
 
 function subscribeTile(routeKey: string) {
   const [dev, ...rest] = routeKey.split('/')
@@ -425,32 +431,32 @@ function deviceLabel(d: WallDeviceView): string {
     </div>
 
     <div class="wall__grid" :style="{ gridTemplateColumns: gridTemplate }">
-      <div
-        v-for="d in devices"
-        :key="d.address"
-        class="wall__cell"
-        :data-route-key="tileRouteKey(d) || undefined"
-      >
-        <div class="wall__cell-bar">
-          <span class="wall__cell-name" :title="d.address">{{ deviceLabel(d) }}</span>
-          <span v-if="d.state === 'connecting'" class="wall__cell-state wall__cell-state--connecting">连接中</span>
-          <button class="wall__cell-remove" title="下墙" @click.stop="removeDevice(d.address)">×</button>
-        </div>
-        <div class="wall__cell-body" @click="focusDevice(d.address)">
-          <CameraTile
-            v-if="d.cameras.length"
-            :dev="d.address"
-            :cam="d.cameras[0]"
-            :active="layout === 1"
-            :show-label="false"
-            :clock-offset="null"
-            :reset-key="resetKey"
-          />
-          <div v-else class="wall__cell-placeholder">
-            <span>{{ d.state === 'connecting' ? '正在连接设备…' : '等待画面…' }}</span>
+      <template v-for="d in devices" :key="d.address">
+        <div
+          v-for="cam in d.cameras"
+          :key="`${d.address}/${cam.token}`"
+          class="wall__cell"
+          :data-route-key="`${d.address}/${cam.token}`"
+        >
+          <div class="wall__cell-bar">
+            <span class="wall__cell-name" :title="`${d.address} · ${cam.name}`">
+              {{ deviceLabel(d) }}<span class="wall__cell-cam"> · {{ cam.name }}</span>
+            </span>
+            <span v-if="d.state === 'connecting'" class="wall__cell-state wall__cell-state--connecting">连接中</span>
+            <button class="wall__cell-remove" title="下墙" @click.stop="removeDevice(d.address, cam.token)">×</button>
+          </div>
+          <div class="wall__cell-body" @click="focusDevice(d.address)">
+            <CameraTile
+              :dev="d.address"
+              :cam="cam"
+              :active="layout === 1"
+              :show-label="false"
+              :clock-offset="null"
+              :reset-key="resetKey"
+            />
           </div>
         </div>
-      </div>
+      </template>
 
       <div v-if="!devices.length" class="wall__empty">
         <span class="wall__empty-icon">▦</span>
@@ -526,13 +532,18 @@ function deviceLabel(d: WallDeviceView): string {
               v-for="p in profiles"
               :key="p.token"
               class="wall__device-item"
-              :class="{ 'wall__device-item--selected': selectedProfile === p.token }"
+              :class="{
+                'wall__device-item--selected': selectedProfile === p.token,
+                'wall__device-item--onwall': profileOnWall(selectedAddress, p.token),
+              }"
               type="button"
+              :disabled="profileOnWall(selectedAddress, p.token)"
               :title="p.token"
               @click="selectedProfile = p.token"
             >
               <span class="wall__device-name">{{ p.name }}</span>
               <span class="wall__device-host">{{ p.ptz ? '支持云台' : '' }}</span>
+              <span v-if="profileOnWall(selectedAddress, p.token)" class="wall__device-badge">已在墙上</span>
             </button>
             <div v-if="!profiles.length" class="wall__device-empty">填写凭证后点击「重新获取」拉取画面列表</div>
           </div>
@@ -675,6 +686,10 @@ function deviceLabel(d: WallDeviceView): string {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.wall__cell-cam {
+  color: rgba(255, 255, 255, 0.55);
 }
 
 .wall__cell-state {

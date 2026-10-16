@@ -82,7 +82,7 @@ type Handler struct {
 	snapshotFPS    int
 	onConnect          func(address, username, password string)
 	onWallConnect      func(address, username, password, profile string)
-	onWallDisconnect   func(string)
+	onWallDisconnect   func(address, profile string)
 	wallState        func() []ws.WallDevice
 	onAudioData    func([]byte)
 	onAudioStart   func()
@@ -193,7 +193,7 @@ func (h *Handler) SetOnConnect(fn func(address, username, password string)) {
 //（凭证由前端每次携带，后端不落盘；profile 为空时取子码流近似），
 // onWallDisconnect 下墙一台设备，wallState 提供当前墙设备快照
 //（GET /api/wall/devices 与 WS 广播共用）。
-func (h *Handler) SetWallCallbacks(onWallConnect func(address, username, password, profile string), onWallDisconnect func(string), wallState func() []ws.WallDevice) {
+func (h *Handler) SetWallCallbacks(onWallConnect func(address, username, password, profile string), onWallDisconnect func(address, profile string), wallState func() []ws.WallDevice) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onWallConnect = onWallConnect
@@ -389,10 +389,12 @@ func (h *Handler) handleWallConnect(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "connecting", "address": req.Address})
 }
 
-// handleWallDisconnect 下墙一台设备。
+// handleWallDisconnect 下墙：body 携带 profile 时只下墙该路画面，
+// 否则整台设备下墙。
 func (h *Handler) handleWallDisconnect(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Address string `json:"address"`
+		Profile string `json:"profile"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -407,7 +409,7 @@ func (h *Handler) handleWallDisconnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"wall not available"}`, http.StatusServiceUnavailable)
 		return
 	}
-	fn(req.Address)
+	fn(req.Address, req.Profile)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
