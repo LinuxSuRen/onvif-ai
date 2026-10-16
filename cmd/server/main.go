@@ -95,11 +95,13 @@ func main() {
 	h.SetForwardStatusProvider(fwdMgr.Status)
 
 	cm := &cameraManager{
-		hub:       hub,
-		llmClient: llmClient,
-		ttsClient: ttsClient,
-		handler:   h,
-		fwd:       fwdMgr,
+		hub:           hub,
+		llmClient:     llmClient,
+		ttsClient:     ttsClient,
+		handler:       h,
+		fwd:           fwdMgr,
+		deviceSession: &deviceSession{},
+		registry:      newDeviceRegistry(),
 	}
 
 	h.SetOnConnect(func(addr, user, pass string) {
@@ -142,15 +144,32 @@ func main() {
 }
 
 type cameraManager struct {
-	hub         *ws.Hub
-	llmClient   *llm.Client
-	ttsClient   *tts.Client
-	handler     *server.Handler
-	onvifClient *onvif.Client
+	hub       *ws.Hub
+	llmClient *llm.Client
+	ttsClient *tts.Client
+	handler   *server.Handler
 	// fwd 是流媒体转发管理器；摄像头连接的画面自动登记为转发源
 	fwd *forward.Manager
+
+	mu sync.Mutex
+	// deviceSession 以匿名嵌入承载「当前设备」的全部状态，字段经结构体
+	// 提升仍以 cm.xxx 访问。指针恒非 nil：断开时原地替换为空白会话，
+	// 保证任何时刻的晋升访问都安全。多设备开放后由 registry 管理多个
+	// 会话（#39 第一步重构，单设备行为保持不变）。
+	*deviceSession
+	// registry 是设备会话登记表：连接登记、断开注销。当前仅承担生命
+	// 周期记账，多设备取流入口在后续 PR 基于它开放。
+	registry *deviceRegistry
+}
+
+// deviceSession 承载一台 ONVIF 设备连接的全部状态：设备地址与凭证、
+// 各路画面单元、事件订阅、对讲/TTS 音频引擎与对话历史。所有字段受
+// cameraManager.mu 保护（与重构前的 cameraManager 字段一致）。
+type deviceSession struct {
 	// addr 是当前连接设备的地址（转发源登记/注销的设备键）
 	addr string
+	// onvifClient 是设备的 SOAP 客户端
+	onvifClient *onvif.Client
 	// eventSub 是设备的 ONVIF Event 订阅器（PullPoint 模型），
 	// 设备不支持 Event 时静默降级（不影响取流）
 	eventSub *onvif.EventSubscriber
@@ -160,7 +179,6 @@ type cameraManager struct {
 	authUser string
 	authPass string
 
-	mu          sync.Mutex
 	units       []*camUnit
 	backchannel *rtsp.Backchannel
 	life        *streamLife
@@ -242,10 +260,14 @@ func (cm *cameraManager) connect(address, username, password string) {
 
 	cm.mu.Lock()
 	life := newStreamLife()
-	cm.life = life
-	cm.authUser = username
-	cm.authPass = password
-	cm.addr = address
+	sess := &deviceSession{
+		addr:     address,
+		authUser: username,
+		authPass: password,
+		life:     life,
+	}
+	cm.deviceSession = sess
+	cm.registry.Register(address, sess)
 	cm.mu.Unlock()
 
 	log.Printf("Connecting to camera: %s", address)
@@ -1089,15 +1111,18 @@ func (cm *cameraManager) processCameraAudio() {
 
 func (cm *cameraManager) disconnect() {
 	cm.mu.Lock()
-	life := cm.life
-	cm.life = nil
-	addr := cm.addr
-	cm.addr = ""
-	if cm.eventSub != nil {
-		cm.eventSub.Stop()
-		cm.eventSub = nil
+	// 取下旧会话并原地换上空白会话：晋升字段（cm.units 等）在锁外也
+	// 恒非 nil；旧会话的字段仍在锁内拆解（goroutine 以 cm.mu 访问）。
+	old := cm.deviceSession
+	life := old.life
+	old.life = nil
+	addr := old.addr
+	old.addr = ""
+	if old.eventSub != nil {
+		old.eventSub.Stop()
+		old.eventSub = nil
 	}
-	for _, u := range cm.units {
+	for _, u := range old.units {
 		if u.stream != nil {
 			u.stream.Close()
 			u.stream = nil
@@ -1106,19 +1131,21 @@ func (cm *cameraManager) disconnect() {
 		u.snapshotOn = false
 		u.snapLife.stop()
 	}
-	cm.units = nil
-	cm.cameraAudioBuf = nil
-	cm.cameraAudioRate = 0
-	cm.authUser = ""
-	cm.authPass = ""
-	cm.audioState = nil
-	cm.talkbackActive = false
-	cm.talkbackState = nil
-	cm.talkbackReady = false
-	if cm.backchannel != nil {
-		cm.backchannel.Close()
-		cm.backchannel = nil
+	old.units = nil
+	old.cameraAudioBuf = nil
+	old.cameraAudioRate = 0
+	old.authUser = ""
+	old.authPass = ""
+	old.audioState = nil
+	old.talkbackActive = false
+	old.talkbackState = nil
+	old.talkbackReady = false
+	if old.backchannel != nil {
+		old.backchannel.Close()
+		old.backchannel = nil
 	}
+	cm.deviceSession = &deviceSession{}
+	cm.registry.Unregister(addr)
 	cm.mu.Unlock()
 
 	life.stop()
