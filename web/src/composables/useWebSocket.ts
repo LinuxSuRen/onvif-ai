@@ -27,6 +27,7 @@ export interface WallStateData {
     cameras: Array<{
       token: string
       name: string
+      ptz: boolean
       streaming: boolean
       snapshot: boolean
       mjpeg: boolean

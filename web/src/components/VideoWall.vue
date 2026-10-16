@@ -156,7 +156,7 @@ function applyWallState(data: WallStateData) {
     cameras: (d.cameras || []).map((c) => ({
       token: c.token,
       name: c.name || c.token,
-      ptz: false,
+      ptz: !!c.ptz,
       streaming: !!c.streaming,
       snapshot: !!c.snapshot,
       mjpeg: !!c.mjpeg,
