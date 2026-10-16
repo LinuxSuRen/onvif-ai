@@ -1,10 +1,14 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import VideoPlayer from './components/VideoPlayer.vue'
+import VideoWall from './components/VideoWall.vue'
 import IntercomPanel from './components/IntercomPanel.vue'
 import VoicePanel from './components/VoicePanel.vue'
 import DeviceInfo from './components/DeviceInfo.vue'
 import EventPanel from './components/EventPanel.vue'
+
+// 顶层视图：查看器（单设备详情 + 语音对讲）↔ 视频墙（多设备同开，#39）
+const view = ref<'viewer' | 'wall'>('viewer')
 
 const clockText = ref('--:--:--')
 let clockTimer: ReturnType<typeof setInterval> | null = null
@@ -20,6 +24,33 @@ onMounted(() => {
 onUnmounted(() => {
   if (clockTimer) clearInterval(clockTimer)
 })
+
+// 视频墙点击 tile → 切回查看器并以该设备聚焦连接（凭证取自视频墙的
+// localStorage 存储；无凭证时详情页会按匿名连接引导补填）
+async function focusFromWall(address: string) {
+  view.value = 'viewer'
+  let username = ''
+  let password = ''
+  try {
+    const creds = JSON.parse(localStorage.getItem('onvif-ai-wall-creds') || '{}')
+    const cred = creds[address]
+    if (cred) {
+      username = cred.username || ''
+      password = cred.password || ''
+    }
+  } catch {
+    /* 凭证解析失败按匿名处理 */
+  }
+  try {
+    await fetch('/api/camera/connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ address, username, password }),
+    })
+  } catch {
+    /* 连接结果经 device_state/connect_error 广播反馈 */
+  }
+}
 </script>
 
 <template>
@@ -44,21 +75,42 @@ onUnmounted(() => {
             <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/>
           </svg>
         </a>
+        <div class="app-header__views" role="tablist">
+          <button
+            class="app-header__view-btn"
+            :class="{ 'app-header__view-btn--active': view === 'viewer' }"
+            role="tab"
+            :aria-selected="view === 'viewer'"
+            @click="view = 'viewer'"
+          >查看器</button>
+          <button
+            class="app-header__view-btn"
+            :class="{ 'app-header__view-btn--active': view === 'wall' }"
+            role="tab"
+            :aria-selected="view === 'wall'"
+            @click="view = 'wall'"
+          >视频墙</button>
+        </div>
         <span class="app-header__time">{{ clockText }}</span>
       </div>
     </header>
 
-    <main class="app-main">
-      <section class="app-main__video">
-        <VideoPlayer />
+    <main class="app-main" :class="{ 'app-main--wall': view === 'wall' }">
+      <template v-if="view === 'viewer'">
+        <section class="app-main__video">
+          <VideoPlayer />
+        </section>
+        <!-- 核心流程：搜索设备 → 查看画面 → 语音对讲；AI 助手折叠置底 -->
+        <aside class="app-main__sidebar">
+          <IntercomPanel />
+          <DeviceInfo />
+          <EventPanel />
+          <VoicePanel />
+        </aside>
+      </template>
+      <section v-else class="app-main__wall">
+        <VideoWall @focus="focusFromWall" />
       </section>
-      <!-- 核心流程：搜索设备 → 查看画面 → 语音对讲；AI 助手折叠置底 -->
-      <aside class="app-main__sidebar">
-        <IntercomPanel />
-        <DeviceInfo />
-        <EventPanel />
-        <VoicePanel />
-      </aside>
     </main>
   </div>
 </template>
@@ -87,6 +139,49 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: var(--space-3);
+}
+
+/* 顶层视图切换（查看器 / 视频墙） */
+.app-header__views {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 6px;
+  background: var(--color-bg-hover);
+}
+
+.app-header__view-btn {
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  padding: 4px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.app-header__view-btn--active {
+  background: rgba(0, 229, 160, 0.85);
+  color: #04110c;
+}
+
+.app-header__view-btn:not(.app-header__view-btn--active):hover {
+  color: var(--color-text-bright);
+}
+
+/* 视频墙视图：主区不再分栏，墙满幅展开 */
+.app-main--wall {
+  display: flex;
+  flex-direction: column;
+}
+
+.app-main__wall {
+  flex: 1;
+  min-height: 0;
+  padding: var(--space-4) var(--space-6);
+  overflow: auto;
 }
 
 .app-header__logo {

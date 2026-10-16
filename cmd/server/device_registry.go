@@ -61,3 +61,19 @@ func (r *deviceRegistry) Addresses() []string {
 	sort.Strings(out)
 	return out
 }
+
+// Sessions 返回全部已登记会话的快照（按地址排序，输出稳定）。
+func (r *deviceRegistry) Sessions() []*deviceSession {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	addrs := make([]string, 0, len(r.sessions))
+	for a := range r.sessions {
+		addrs = append(addrs, a)
+	}
+	sort.Strings(addrs)
+	out := make([]*deviceSession, 0, len(addrs))
+	for _, a := range addrs {
+		out = append(out, r.sessions[a])
+	}
+	return out
+}

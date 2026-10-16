@@ -80,7 +80,10 @@ type Handler struct {
 	llmConfig      *LLMConfig
 	forwardConfig  *ForwardConfig
 	snapshotFPS    int
-	onConnect      func(address, username, password string)
+	onConnect        func(address, username, password string)
+	onWallConnect    func(address, username, password string)
+	onWallDisconnect func(string)
+	wallState        func() []ws.WallDevice
 	onAudioData    func([]byte)
 	onAudioStart   func()
 	onAudioStop    func()
@@ -186,6 +189,17 @@ func (h *Handler) SetOnConnect(fn func(address, username, password string)) {
 	h.onConnect = fn
 }
 
+// SetWallCallbacks 注册视频墙连接管理回调：onWallConnect 上墙一台设备
+//（凭证由前端每次携带，后端不落盘），onWallDisconnect 下墙一台设备，
+// wallState 提供当前墙设备快照（GET /api/wall/devices 与 WS 广播共用）。
+func (h *Handler) SetWallCallbacks(onWallConnect func(address, username, password string), onWallDisconnect func(string), wallState func() []ws.WallDevice) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onWallConnect = onWallConnect
+	h.onWallDisconnect = onWallDisconnect
+	h.wallState = wallState
+}
+
 // SetTalkbackCallbacks 注册对讲（浏览器麦克风 → 摄像头扬声器）会话回调。
 // onTalkbackStart 在收到 talkback_start 时调用，返回是否受理与稳定拒绝码；
 // onTalkbackData 在收到 audio_in 时调用（仅会话属主的消息会被转发）；
@@ -268,6 +282,9 @@ func (h *Handler) RegisterRoutes() http.Handler {
 	r.Get("/api/camera/discover", h.handleDiscover)
 	r.Get("/api/camera/info", h.handleCameraInfo)
 	r.Post("/api/camera/connect", h.handleConnect)
+	r.Post("/api/wall/connect", h.handleWallConnect)
+	r.Post("/api/wall/disconnect", h.handleWallDisconnect)
+	r.Get("/api/wall/devices", h.handleWallDevices)
 	r.Get("/api/camera/device-info", h.handleDeviceInfo)
 	r.Get("/api/llm/config", h.handleLLMGetConfig)
 	r.Post("/api/llm/config", h.handleLLMSetConfig)
@@ -340,6 +357,74 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "connecting", "address": req.Address})
+}
+
+// handleWallConnect 上墙一台设备：凭证由前端每次携带（浏览器侧保存），
+// 后端不落盘。路数超限由 cameraManager 侧拒绝并广播错误。
+func (h *Handler) handleWallConnect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Address  string `json:"address"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	h.mu.RLock()
+	fn := h.onWallConnect
+	h.mu.RUnlock()
+
+	if fn == nil {
+		http.Error(w, `{"error":"wall not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	go fn(req.Address, req.Username, req.Password)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "connecting", "address": req.Address})
+}
+
+// handleWallDisconnect 下墙一台设备。
+func (h *Handler) handleWallDisconnect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	h.mu.RLock()
+	fn := h.onWallDisconnect
+	h.mu.RUnlock()
+
+	if fn == nil {
+		http.Error(w, `{"error":"wall not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	fn(req.Address)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleWallDevices 返回视频墙设备快照（前端初始加载用，后续更新走
+// wall_state WS 广播）。
+func (h *Handler) handleWallDevices(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	fn := h.wallState
+	h.mu.RUnlock()
+
+	devices := []ws.WallDevice{}
+	if fn != nil {
+		if got := fn(); got != nil {
+			devices = got
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ws.WallStatePayload{Devices: devices})
 }
 
 func (h *Handler) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
@@ -789,17 +874,17 @@ func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
 		}
 
 	case ws.MsgTypeViewControl:
-		// 视频帧带宽高，未显式请求的连接默认不推送（issue #26）；
-		// 开关挂在连接上，断线重连后由前端重新发送 start
+		// 视频帧带宽高，未订阅的连接默认不推送（issue #26）；订阅按
+		// dev+cam 画面粒度挂在连接上（#39），断线重连后由前端重新发送 start
 		var payload ws.ViewControlPayload
 		if msg.Payload != nil {
 			json.Unmarshal(msg.Payload, &payload)
 		}
 		switch payload.Action {
 		case ws.ViewActionStart:
-			h.hub.SetVideoView(client, true)
+			h.hub.SetVideoView(client, payload.Dev, payload.Cam, true)
 		case ws.ViewActionStop:
-			h.hub.SetVideoView(client, false)
+			h.hub.SetVideoView(client, payload.Dev, payload.Cam, false)
 		}
 
 	case ws.MsgTypeClockSync:

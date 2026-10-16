@@ -23,19 +23,25 @@ const (
 type Hub struct {
 	clients   map[*Client]bool
 	broadcast chan []byte
-	// videoBroadcast 承载视频帧：与 broadcast 分离，投递时只发给
-	// 已显式请求画面的连接（issue #26），其余消息仍全员广播
+	// videoBroadcast 承载视频帧：与 broadcast 分离，投递时只发给已
+	// 订阅该画面的连接（issue #26 + #39 tile 级订阅），其余消息全员广播
 	videoBroadcast chan videoMsg
 	register       chan *Client
 	unregister     chan *Client
 	mu             sync.RWMutex
 }
 
-// videoMsg 视频广播单元：序列化后的消息 + 关键帧语义（供丢到关键帧策略）。
+// videoMsg 视频广播单元：序列化后的消息 + 路由键与关键帧语义。
+// key 为 dev+"/"+cam 复合键（驱动按画面订阅与丢到关键帧策略）。
 type videoMsg struct {
 	data []byte
-	cam  string
-	key  bool
+	key  string
+	idr  bool
+}
+
+// VideoRouteKey 拼出一路画面的订阅键：设备地址 + media profile token。
+func VideoRouteKey(dev, cam string) string {
+	return dev + "/" + cam
 }
 
 type Client struct {
@@ -45,15 +51,16 @@ type Client struct {
 	mu     sync.Mutex
 	closed bool
 
-	// wantVideo 由 hub.mu 保护：该连接是否已显式请求接收视频帧。
-	// 默认 false（页面打开不自动推流），view_control start 置 true。
-	// 状态挂在连接上，断开即销毁，重连自然回到默认关闭。
-	wantVideo bool
+	// videoSubs 由 hub.mu 保护：该连接已显式订阅的画面集合（键为
+	// VideoRouteKey）。默认为空（页面打开不自动推流），view_control
+	// start/stop 增删条目。状态挂在连接上，断开即销毁，重连自然回到
+	// 默认空订阅。
+	videoSubs map[string]bool
 
 	// slowSince 由 Run 循环独占访问：send 持续满仓的起始时刻
 	slowSince time.Time
 
-	// skipUntilKey 由 Run 循环独占访问：cam → 是否丢弃该路非关键帧。
+	// skipUntilKey 由 Run 循环独占访问：路由键 → 是否丢弃该路非关键帧。
 	// send 满仓丢帧后置位：H.264 丢掉 GOP 中间的参考帧后，后续 P 帧会
 	// 解码出绿色/花屏伪影；改为持续丢弃非关键帧直到下一个关键帧，
 	// 表现为画面短暂冻结而非花屏。
@@ -90,36 +97,38 @@ func (h *Hub) Run() {
 			}
 
 		case message := <-h.broadcast:
-			h.dispatch(message, false, "", false)
+			h.dispatch(message, "", false)
 
 		case vm := <-h.videoBroadcast:
-			h.dispatch(vm.data, true, vm.cam, vm.key)
+			h.dispatch(vm.data, vm.key, vm.idr)
 		}
 	}
 }
 
-// dispatch 把一条已序列化的消息投递给客户端；videoOnly 为 true 时仅投给
-// 已显式请求画面的连接。video 消息带 key 语义（cam 非空时启用丢到关键帧
-// 策略）。只在 Run 循环内调用，slowSince/skipUntilKey 的独占访问约定
-// 保持不变。
-func (h *Hub) dispatch(message []byte, videoOnly bool, cam string, key bool) {
+// dispatch 把一条已序列化的消息投递给客户端；routeKey 非空表示视频帧，
+// 仅投给已订阅该画面的连接（键为 VideoRouteKey）。视频消息带 idr 语义
+// （启用丢到关键帧策略）。只在 Run 循环内调用，slowSince/skipUntilKey
+// 的独占访问约定保持不变。
+func (h *Hub) dispatch(message []byte, routeKey string, idr bool) {
 	h.mu.RLock()
 	for client := range h.clients {
-		if videoOnly && !client.wantVideo {
-			continue
-		}
-		if videoOnly && cam != "" && client.skipUntilKey[cam] && !key {
-			// 该路正处丢帧期：非关键帧直接丢弃（不计慢、不触发断开）
-			continue
+		if routeKey != "" {
+			if !client.videoSubs[routeKey] {
+				continue
+			}
+			if client.skipUntilKey[routeKey] && !idr {
+				// 该路正处丢帧期：非关键帧直接丢弃（不计慢、不触发断开）
+				continue
+			}
 		}
 		select {
 		case client.send <- message:
 			client.slowSince = time.Time{}
-			if videoOnly && cam != "" {
+			if routeKey != "" {
 				if client.skipUntilKey == nil {
 					client.skipUntilKey = map[string]bool{}
 				}
-				delete(client.skipUntilKey, cam)
+				delete(client.skipUntilKey, routeKey)
 			}
 		default:
 			// 缓冲满：宽限期内丢消息，并进入丢到关键帧模式；
@@ -127,8 +136,8 @@ func (h *Hub) dispatch(message []byte, videoOnly bool, cam string, key bool) {
 			if client.skipUntilKey == nil {
 				client.skipUntilKey = map[string]bool{}
 			}
-			if videoOnly && cam != "" {
-				client.skipUntilKey[cam] = true
+			if routeKey != "" {
+				client.skipUntilKey[routeKey] = true
 			}
 			if client.slowSince.IsZero() {
 				client.slowSince = time.Now()
@@ -163,25 +172,26 @@ func (h *Hub) BroadcastMessage(msg *Message) {
 	h.broadcast <- data
 }
 
-// BroadcastVideo 把视频消息只投递给已显式请求画面的客户端（issue #26：
-// 未打开画面的连接不搬运视频帧，省带宽），其余消息仍走 BroadcastMessage
-// 全员广播。cam/key 驱动丢到关键帧策略（见 dispatch）。
+// BroadcastVideo 把视频消息只投递给已订阅该画面的客户端（issue #26 +
+// #39 tile 级订阅），其余消息仍走 BroadcastMessage 全员广播。
+// dev+cam 组成路由键，idr 驱动丢到关键帧策略（见 dispatch）。
 func (h *Hub) BroadcastVideo(msg *Message) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
-	h.videoBroadcast <- videoMsg{data: data, cam: msg.Cam, key: msg.Key}
+	h.videoBroadcast <- videoMsg{data: data, key: VideoRouteKey(msg.Dev, msg.Cam), idr: msg.Key}
 }
 
 // BroadcastVideoFMP4 sends one fMP4 segment (init or fragment).
 // kind is "init" or "frag"; key marks a keyframe fragment.
-func (h *Hub) BroadcastVideoFMP4(cam, kind string, data []byte, key bool, codec string) {
+func (h *Hub) BroadcastVideoFMP4(dev, cam, kind string, data []byte, key bool, codec string) {
 	msg := &Message{
 		Type:  MsgTypeVideoFMP4,
 		Data:  base64.StdEncoding.EncodeToString(data),
 		Kind:  kind,
 		Key:   key,
+		Dev:   dev,
 		Cam:   cam,
 		Codec: codec,
 		Ts:    time.Now().UnixMilli(),
@@ -189,21 +199,29 @@ func (h *Hub) BroadcastVideoFMP4(cam, kind string, data []byte, key bool, codec 
 	h.BroadcastVideo(msg)
 }
 
-// SetVideoView 设置某条连接是否接收视频广播，是 view_control start/stop
+// SetVideoView 增删某条连接对一路画面的订阅，是 view_control start/stop
 // 的落地动作。写侧持 hub 锁，与 dispatch 的读侧互斥。
-func (h *Hub) SetVideoView(client *Client, enabled bool) {
+func (h *Hub) SetVideoView(client *Client, dev, cam string, enabled bool) {
 	h.mu.Lock()
-	client.wantVideo = enabled
+	if client.videoSubs == nil {
+		client.videoSubs = make(map[string]bool)
+	}
+	if enabled {
+		client.videoSubs[VideoRouteKey(dev, cam)] = true
+	} else {
+		delete(client.videoSubs, VideoRouteKey(dev, cam))
+	}
 	h.mu.Unlock()
 }
 
-// BroadcastVideoNAL sends one H.264 NAL unit; cam is the media profile token
-// of the camera it belongs to (may be empty for single-camera devices).
-func (h *Hub) BroadcastVideoNAL(cam string, nalu []byte) {
+// BroadcastVideoNAL sends one H.264 NAL unit; dev is the device address and
+// cam the media profile token of the camera it belongs to.
+func (h *Hub) BroadcastVideoNAL(dev, cam string, nalu []byte) {
 	msg := &Message{
 		Type: MsgTypeVideoNAL,
 		Data: base64.StdEncoding.EncodeToString(nalu),
 		Ts:   time.Now().UnixMilli(),
+		Dev:  dev,
 		Cam:  cam,
 	}
 	h.BroadcastVideo(msg)
@@ -212,14 +230,25 @@ func (h *Hub) BroadcastVideoNAL(cam string, nalu []byte) {
 // BroadcastVideoJPEG sends one JPEG snapshot frame for the given camera.
 // Key 恒为 true：JPEG 每帧独立可解，语义上等价关键帧——否则「丢到
 // 关键帧」策略在 JPEG 路永远无法解除，慢客户端一次满仓后该路永久冻结。
-func (h *Hub) BroadcastVideoJPEG(cam string, jpeg []byte) {
+func (h *Hub) BroadcastVideoJPEG(dev, cam string, jpeg []byte) {
 	msg := &Message{
 		Type: MsgTypeVideoJPEG,
 		Data: base64.StdEncoding.EncodeToString(jpeg),
+		Dev:  dev,
 		Cam:  cam,
 		Key:  true,
 	}
 	h.BroadcastVideo(msg)
+}
+
+// BroadcastWallState 广播视频墙设备快照（设备增删与画面状态变化时）。
+func (h *Hub) BroadcastWallState(devices []WallDevice) {
+	payload, _ := json.Marshal(WallStatePayload{Devices: devices})
+	msg := &Message{
+		Type:    MsgTypeWallState,
+		Payload: payload,
+	}
+	h.BroadcastMessage(msg)
 }
 
 // BroadcastAudioPCM sends one linear PCM chunk from the camera's audio track.

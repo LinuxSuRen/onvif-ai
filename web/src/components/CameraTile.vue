@@ -12,6 +12,8 @@ import { ref, computed, watch, onMounted, onUnmounted, inject } from 'vue'
  * RTSPtoWeb 模式一致）。
  */
 const props = defineProps<{
+  // dev 是该画面所属设备的地址（与 cam 的 token 组成订阅/路由键）
+  dev: string
   cam: {
     token: string
     name: string
@@ -67,11 +69,14 @@ let latencyTimer: ReturnType<typeof setInterval> | null = null
 let evictTimer: ReturnType<typeof setInterval> | null = null
 let lastCatchUpAt = 0
 
-// 向父组件注册本 tile 的数据入口（生命周期内自管理，避免 ref 顺序竞态）
+// 向父组件注册本 tile 的数据入口（生命周期内自管理，避免 ref 顺序竞态）。
+// 注册键是 dev+'/'+token 复合键，与 WS 帧路由一致。
 const registry = inject<{
-  register: (token: string, api: { feedFMP4: typeof feedFMP4; feedJpeg: typeof feedJpeg }) => void
-  unregister: (token: string, api: { feedFMP4: typeof feedFMP4; feedJpeg: typeof feedJpeg }) => void
+  register: (routeKey: string, api: { feedFMP4: typeof feedFMP4; feedJpeg: typeof feedJpeg }) => void
+  unregister: (routeKey: string, api: { feedFMP4: typeof feedFMP4; feedJpeg: typeof feedJpeg }) => void
 } | null>('cameraTileRegistry', null)
+
+const routeKey = () => `${props.dev}/${props.cam.token}`
 
 function destroyPipeline() {
   appendQueue.length = 0
@@ -303,11 +308,11 @@ onMounted(() => {
   }
   latencyTimer = setInterval(measurePresentationLag, 500)
   evictTimer = setInterval(evictBuffer, 5000)
-  registry?.register(props.cam.token, { feedFMP4, feedJpeg })
+  registry?.register(routeKey(), { feedFMP4, feedJpeg })
 })
 
 onUnmounted(() => {
-  registry?.unregister(props.cam.token, { feedFMP4, feedJpeg })
+  registry?.unregister(routeKey(), { feedFMP4, feedJpeg })
   videoRef.value?.removeEventListener('error', onVideoElementError)
   if (latencyTimer) clearInterval(latencyTimer)
   if (evictTimer) clearInterval(evictTimer)

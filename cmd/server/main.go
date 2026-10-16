@@ -108,6 +108,13 @@ func main() {
 		go cm.connect(addr, user, pass)
 	})
 
+	// 视频墙：上墙/下墙/快照（凭证由前端每次携带，后端不落盘）
+	h.SetWallCallbacks(
+		func(addr, user, pass string) { cm.connectWall(addr, user, pass) },
+		func(addr string) { cm.disconnectDevice(addr) },
+		cm.wallState,
+	)
+
 	h.SetLLMUpdateCallback(func(baseURL, apiKey, model string) {
 		cm.llmClient.UpdateConfig(baseURL, apiKey, model)
 		log.Printf("LLM config updated: %s, model=%s", baseURL, model)
@@ -140,7 +147,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("Shutting down...")
-	cm.disconnect()
+	cm.shutdown()
 }
 
 type cameraManager struct {
@@ -182,6 +189,9 @@ type deviceSession struct {
 	units       []*camUnit
 	backchannel *rtsp.Backchannel
 	life        *streamLife
+	// state 是视频墙展示用的连接阶段：connecting（建连中）/ online
+	//（画面单元已建立）。空值按 connecting 处理。
+	state string
 
 	cameraAudioBuf    []byte
 	cameraAudioBufMax int
@@ -245,19 +255,74 @@ func (l *streamLife) stop() {
 	l.once.Do(func() { close(l.stopCh) })
 }
 
-// isCurrent reports whether life is still the active connection of cm.
-func (cm *cameraManager) isCurrent(life *streamLife) bool {
+// isCurrentSession 报告 life 是否仍是该会话的活跃连接代际：会话被拆解
+//（teardownSession 将 life 置 nil）或被重连替换后，旧代次的循环据此退出。
+func (cm *cameraManager) isCurrentSession(sess *deviceSession, life *streamLife) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	return cm.life == life
+	return sess != nil && sess.life == life
 }
 
-// maxCams 限制同时拉取的画面路数：带宽与浏览器解码能力有限。
+// maxCams 限制单台设备同时拉取的画面路数：带宽与浏览器解码能力有限。
 const maxCams = 6
 
-func (cm *cameraManager) connect(address, username, password string) {
-	cm.disconnect()
+// maxWallStreams 限制视频墙总路数（所有设备之和）：默认 9，可经环境
+// 变量 MAX_WALL_STREAMS 覆盖。720p 子码流下该值对应约 5Mbps 上行带宽。
+var maxWallStreams = func() int {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("MAX_WALL_STREAMS"))); err == nil && v > 0 {
+		return v
+	}
+	return 9
+}()
 
+// connect 以聚焦模式连接设备（详情页入口）：取全部 media profile 并把
+// 会话设为当前聚焦；旧聚焦设备（含其上的对讲/TTS 资源）随会话拆除。
+func (cm *cameraManager) connect(address, username, password string) {
+	cm.mu.Lock()
+	focused := cm.deviceSession
+	cm.mu.Unlock()
+	if focused != nil && focused.addr != "" {
+		cm.teardownSession(focused)
+	}
+	cm.startSession(address, username, password, false)
+}
+
+// connectWall 把一台设备上墙（视频墙入口）：只取子码流一路（profile
+// 列表末位，主码流在前的设备惯例），不动当前聚焦设备；路数超限时拒绝。
+func (cm *cameraManager) connectWall(address, username, password string) {
+	cm.mu.Lock()
+	total := 0
+	for _, s := range cm.registry.Sessions() {
+		total += len(s.units)
+	}
+	_, exists := cm.registry.Get(address)
+	cm.mu.Unlock()
+	if !exists && total >= maxWallStreams {
+		cm.hub.BroadcastError(fmt.Sprintf("视频墙路数已达上限（%d），请先下墙部分设备", maxWallStreams))
+		return
+	}
+	cm.startSession(address, username, password, true)
+}
+
+// disconnectDevice 下墙一台设备（视频墙入口）。
+func (cm *cameraManager) disconnectDevice(address string) {
+	if sess, ok := cm.registry.Get(address); ok {
+		cm.teardownSession(sess)
+	}
+}
+
+// shutdown 拆除全部设备会话（进程退出时调用）。
+func (cm *cameraManager) shutdown() {
+	for _, sess := range cm.registry.Sessions() {
+		cm.teardownSession(sess)
+	}
+	cm.disconnect()
+}
+
+// startSession 建立并运行一台设备的会话。wallMode 为 true 是视频墙上墙：
+// 只取子码流一路、不替换聚焦；否则为聚焦连接（详情页），取全部 profile
+// 并设为当前聚焦会话。
+func (cm *cameraManager) startSession(address, username, password string, wallMode bool) {
 	cm.mu.Lock()
 	life := newStreamLife()
 	sess := &deviceSession{
@@ -265,9 +330,14 @@ func (cm *cameraManager) connect(address, username, password string) {
 		authUser: username,
 		authPass: password,
 		life:     life,
+		state:    "connecting",
 	}
-	cm.deviceSession = sess
 	cm.registry.Register(address, sess)
+	if !wallMode || cm.deviceSession.addr == "" {
+		// 聚焦连接直接接管详情页；首台设备上墙时顺带聚焦，
+		// 详情页不至于空屏
+		cm.deviceSession = sess
+	}
 	cm.mu.Unlock()
 
 	log.Printf("Connecting to camera: %s", address)
@@ -281,13 +351,13 @@ func (cm *cameraManager) connect(address, username, password string) {
 	})
 
 	cm.mu.Lock()
-	cm.onvifClient = onvifClient
+	sess.onvifClient = onvifClient
 	cm.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	profiles, err := cm.getProfilesWithRetry(onvifClient, ctx, life, address)
+	profiles, err := cm.getProfilesWithRetry(sess, onvifClient, ctx, life, address)
 	if err != nil {
 		log.Printf("GetProfiles failed: %v", err)
 		cm.handler.SetDeviceState(true, false, false, address)
@@ -305,6 +375,11 @@ func (cm *cameraManager) connect(address, username, password string) {
 		return
 	}
 
+	if wallMode {
+		// 视频墙只取子码流一路：GetProfiles 不携带分辨率信息，按「主码
+		// 流在前」的设备惯例取列表末位作为子码流近似（#39）
+		profiles = profiles[len(profiles)-1:]
+	}
 	if len(profiles) > maxCams {
 		log.Printf("Found %d profiles, using first %d", len(profiles), maxCams)
 		profiles = profiles[:maxCams]
@@ -348,26 +423,28 @@ func (cm *cameraManager) connect(address, username, password string) {
 	}
 
 	cm.mu.Lock()
-	cm.units = units
-	cm.cameraAudioBufMax = 160000
+	sess.units = units
+	sess.cameraAudioBufMax = 160000
+	sess.state = "online"
 	cm.mu.Unlock()
-	cm.syncCameraStates()
-	cm.syncForwardSources()
+	if wallMode {
+		cm.broadcastWallState()
+	} else {
+		cm.syncCameraStates()
+	}
+	cm.syncForwardSources(sess)
 
 	// 启动 Event 订阅（PullPoint）：设备端实时推送 SignalLoss/Motion/Battery 等，
 	// 不支持 Event 的设备静默降级。Motion 事件触发 AI 分析管线。
 	cm.mu.Lock()
-	client := cm.onvifClient
-	cm.mu.Unlock()
-	if client != nil {
+	if client := sess.onvifClient; client != nil {
 		logger := slog.Default()
-		cm.mu.Lock()
-		cm.eventSub = client.StartEventSubscriber(address, logger, cm.onDeviceEvent)
-		cm.mu.Unlock()
+		sess.eventSub = client.StartEventSubscriber(address, logger, cm.onDeviceEvent)
 	}
+	cm.mu.Unlock()
 
 	for _, u := range units {
-		go cm.runUnit(u, life, address)
+		go cm.runUnit(sess, u, life)
 	}
 }
 
@@ -395,6 +472,7 @@ func (cm *cameraManager) syncCameraStates() {
 
 	cm.handler.SetCameras(cams)
 	cm.handler.SetDeviceState(true, anyStreaming, anySnapshot && !anyStreaming, "")
+	cm.broadcastWallState()
 }
 
 // setUnitMode 更新单路画面的运行状态并重新广播。
@@ -425,7 +503,7 @@ func (cm *cameraManager) setUnitResolution(u *camUnit, width, height int) {
 // runUnit 启动一路画面：先起快照降级，再进入 RTSP 重试循环。
 // 同一 unit 同时只允许一个循环在跑：断流回调若恰逢循环仍在运行（例如
 // 被并发循环关闭旧连接触发），直接跳过，否则会指数级派生 RTSP 连接。
-func (cm *cameraManager) runUnit(u *camUnit, life *streamLife, address string) {
+func (cm *cameraManager) runUnit(sess *deviceSession, u *camUnit, life *streamLife) {
 	cm.mu.Lock()
 	if u.loopRunning {
 		cm.mu.Unlock()
@@ -444,20 +522,21 @@ func (cm *cameraManager) runUnit(u *camUnit, life *streamLife, address string) {
 
 	if u.snapshotURL != "" {
 		go func() {
-			if err := cm.fetchAndShowSnapshot(u, u.snapshotURL); err != nil {
+			if err := cm.fetchAndShowSnapshot(sess, u, u.snapshotURL); err != nil {
 				log.Printf("Initial snapshot(%s) fetch failed: %v", u.token, err)
 			}
 		}()
-		go cm.startSnapshotLoop(u, u.snapshotURL, snapStop)
+		go cm.startSnapshotLoop(sess, u, u.snapshotURL, snapStop)
 		cm.setUnitMode(u, false, true)
 	}
 
-	cm.runUnitRTSPLoop(u, life, address)
+	cm.runUnitRTSPLoop(sess, u, life)
 }
 
 // runUnitRTSPLoop 对一路画面持续重试 RTSP；成功后停掉该路快照降级，
 // 断流时自动恢复快照并重试。
-func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address string) {
+func (cm *cameraManager) runUnitRTSPLoop(sess *deviceSession, u *camUnit, life *streamLife) {
+	address := sess.addr
 	if u.rtspURL == "" {
 		return // 该路无取流地址，仅快照
 	}
@@ -467,7 +546,7 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 	const maxAttempts = 12
 	const retryWait = 5 * time.Second
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if !cm.isCurrent(life) {
+		if !cm.isCurrentSession(sess, life) {
 			return
 		}
 
@@ -502,18 +581,18 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 			// 都要等一份 init 才能开始 append，只在连接建立时发一次会造成
 			// 前端 awaitingInit 死锁。
 			if key {
-				cm.hub.BroadcastVideoFMP4(cam, "init", mux.InitSegment(), true, mux.CodecString())
+				cm.hub.BroadcastVideoFMP4(address, cam, "init", mux.InitSegment(), true, mux.CodecString())
 			}
 			seg, err := mux.Fragment(au, durTicks, key)
 			if err != nil {
 				log.Printf("[%s] fmp4 fragment failed: %v", cam, err)
 				return
 			}
-			cm.hub.BroadcastVideoFMP4(cam, "frag", seg, key, "")
+			cm.hub.BroadcastVideoFMP4(address, cam, "frag", seg, key, "")
 		})
 		// MJPEG（RFC 2435）帧为完整 JPEG，复用快照通道推给浏览器
 		stream.OnVideoJPEG(func(jpeg []byte) {
-			cm.hub.BroadcastVideoJPEG(cam, jpeg)
+			cm.hub.BroadcastVideoJPEG(address, cam, jpeg)
 		})
 		// 分辨率（H.264 SDP/带内 SPS、MJPEG JPEG SOF）解析出即上报
 		stream.OnVideoResolution(func(width, height int) {
@@ -599,15 +678,15 @@ func (cm *cameraManager) runUnitRTSPLoop(u *camUnit, life *streamLife, address s
 			}
 
 			stream.WatchDisconnect(func() {
-				if !cm.isCurrent(life) {
+				if !cm.isCurrentSession(sess, life) {
 					return
 				}
 				log.Printf("[%s] RTSP stream disconnected — reconnecting", u.token)
 				cm.setUnitMode(u, false, u.snapshotURL != "")
 				cm.resetAudioState(u)
 				time.Sleep(2 * time.Second)
-				if cm.isCurrent(life) && cm.ownsUnit(u) && !cm.unitLoopBusy(u) {
-					cm.runUnit(u, life, address)
+				if cm.isCurrentSession(sess, life) && cm.ownsUnit(u) && !cm.unitLoopBusy(u) {
+					cm.runUnit(sess, u, life)
 				}
 			})
 			return
@@ -795,16 +874,16 @@ func (cm *cameraManager) ownsUnit(u *camUnit) bool {
 	return false
 }
 
-// syncForwardSources 把当前连接设备的各路画面登记到转发管理器：
+// syncForwardSources 把指定会话的各路画面登记到转发管理器：
 // rtspURL 已内嵌凭证，转发直接复用；仅快照降级（无 rtspURL）的画面跳过。
-func (cm *cameraManager) syncForwardSources() {
-	if cm.fwd == nil {
+func (cm *cameraManager) syncForwardSources(sess *deviceSession) {
+	if cm.fwd == nil || sess == nil {
 		return
 	}
 	cm.mu.Lock()
-	addr := cm.addr
-	srcs := make([]forward.Source, 0, len(cm.units))
-	for _, u := range cm.units {
+	addr := sess.addr
+	srcs := make([]forward.Source, 0, len(sess.units))
+	for _, u := range sess.units {
 		if u.rtspURL != "" {
 			srcs = append(srcs, forward.Source{
 				DeviceAddr: addr,
@@ -823,12 +902,12 @@ func (cm *cameraManager) syncForwardSources() {
 // retry loop can only kick in once profiles are known. Authentication
 // failures are not transient — retrying them only delays the structured
 // connect_error that guides the user to the credential form.
-func (cm *cameraManager) getProfilesWithRetry(client *onvif.Client, ctx context.Context, life *streamLife, address string) ([]onvif.Profile, error) {
+func (cm *cameraManager) getProfilesWithRetry(sess *deviceSession, client *onvif.Client, ctx context.Context, life *streamLife, address string) ([]onvif.Profile, error) {
 	const maxAttempts = 12
 	const retryWait = 5 * time.Second
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if !cm.isCurrent(life) {
+		if !cm.isCurrentSession(sess, life) {
 			return nil, lastErr
 		}
 		profiles, err := client.GetProfiles(ctx)
@@ -897,7 +976,7 @@ func probeJPEG(httpClient *http.Client, url string) bool {
 	return err == nil && n == 2 && magic[0] == 0xFF && magic[1] == 0xD8
 }
 
-func (cm *cameraManager) fetchAndShowSnapshot(u *camUnit, snapshotURL string) error {
+func (cm *cameraManager) fetchAndShowSnapshot(sess *deviceSession, u *camUnit, snapshotURL string) error {
 	if snapshotURL == "" {
 		return fmt.Errorf("empty snapshot URL")
 	}
@@ -909,7 +988,7 @@ func (cm *cameraManager) fetchAndShowSnapshot(u *camUnit, snapshotURL string) er
 	}
 	/* 设备开启认证时快照端点同样要求登录(HTTP Basic,与 RTSP/ONVIF 同账号) */
 	cm.mu.Lock()
-	user, pass := cm.authUser, cm.authPass
+	user, pass := sess.authUser, sess.authPass
 	cm.mu.Unlock()
 	if user != "" {
 		req.SetBasicAuth(user, pass)
@@ -933,11 +1012,11 @@ func (cm *cameraManager) fetchAndShowSnapshot(u *camUnit, snapshotURL string) er
 		cm.setUnitResolution(u, w, h)
 	}
 
-	cm.hub.BroadcastVideoJPEG(u.token, jpeg)
+	cm.hub.BroadcastVideoJPEG(sess.addr, u.token, jpeg)
 	return nil
 }
 
-func (cm *cameraManager) startSnapshotLoop(u *camUnit, snapshotURL string, stopCh chan struct{}) {
+func (cm *cameraManager) startSnapshotLoop(sess *deviceSession, u *camUnit, snapshotURL string, stopCh chan struct{}) {
 	if snapshotURL == "" {
 		return
 	}
@@ -963,7 +1042,7 @@ func (cm *cameraManager) startSnapshotLoop(u *camUnit, snapshotURL string, stopC
 		}
 		lastTick = now
 
-		if err := cm.fetchAndShowSnapshot(u, snapshotURL); err != nil {
+		if err := cm.fetchAndShowSnapshot(sess, u, snapshotURL); err != nil {
 			consecutiveFails++
 			if consecutiveFails == 3 {
 				log.Printf("Snapshot loop failing repeatedly: %v", err)
@@ -1109,11 +1188,34 @@ func (cm *cameraManager) processCameraAudio() {
 	processLLMResponseWithHistory(cm.llmClient, cm.ttsClient, cm.hub, cm, text, &cm.history)
 }
 
+// disconnect 拆除当前聚焦设备的会话（详情页断开/进程退出兜底）。
 func (cm *cameraManager) disconnect() {
 	cm.mu.Lock()
-	// 取下旧会话并原地换上空白会话：晋升字段（cm.units 等）在锁外也
-	// 恒非 nil；旧会话的字段仍在锁内拆解（goroutine 以 cm.mu 访问）。
-	old := cm.deviceSession
+	focused := cm.deviceSession
+	cm.mu.Unlock()
+	if focused != nil && focused.addr != "" {
+		cm.teardownSession(focused)
+	}
+}
+
+// teardownSession 拆解一台设备的会话：停止事件订阅、各路画面与快照循
+// 环、对讲回传通道，从 registry 注销并移除转发源；被拆的是聚焦设备时
+// 同步清空详情页状态并广播 wall_state。幂等（重连替换后旧引用直接放过）。
+func (cm *cameraManager) teardownSession(old *deviceSession) {
+	if old == nil {
+		return
+	}
+	cm.mu.Lock()
+	if cur, ok := cm.registry.Get(old.addr); !ok || cur != old {
+		// 已被重连替换或已拆除；仅当它仍挂为聚焦时清空聚焦
+		if cm.deviceSession == old {
+			cm.deviceSession = &deviceSession{}
+		}
+		cm.mu.Unlock()
+		return
+	}
+	cm.registry.Unregister(old.addr)
+	wasFocused := cm.deviceSession == old
 	life := old.life
 	old.life = nil
 	addr := old.addr
@@ -1144,8 +1246,10 @@ func (cm *cameraManager) disconnect() {
 		old.backchannel.Close()
 		old.backchannel = nil
 	}
-	cm.deviceSession = &deviceSession{}
-	cm.registry.Unregister(addr)
+	old.state = ""
+	if wasFocused {
+		cm.deviceSession = &deviceSession{}
+	}
 	cm.mu.Unlock()
 
 	life.stop()
@@ -1153,11 +1257,48 @@ func (cm *cameraManager) disconnect() {
 	if cm.fwd != nil && addr != "" {
 		cm.fwd.RemoveDevice(addr)
 	}
-	cm.handler.SetCameras(nil)
-	cm.handler.SetAudio(nil)
-	cm.handler.SetTalkback(nil)
-	cm.handler.SetDeviceState(false, false, false, "未连接")
-	cm.hub.BroadcastStatus(ws.StatusIdle)
+	if wasFocused {
+		cm.handler.SetCameras(nil)
+		cm.handler.SetAudio(nil)
+		cm.handler.SetTalkback(nil)
+		cm.handler.SetDeviceState(false, false, false, "未连接")
+		cm.hub.BroadcastStatus(ws.StatusIdle)
+	}
+	cm.broadcastWallState()
+}
+
+// wallState 汇总视频墙快照：registry 中每台设备的地址、连接状态与
+// 各路画面（上墙设备仅子码流一路）。
+func (cm *cameraManager) wallState() []ws.WallDevice {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	sessions := cm.registry.Sessions()
+	out := make([]ws.WallDevice, 0, len(sessions))
+	for _, s := range sessions {
+		wd := ws.WallDevice{Address: s.addr, Cameras: []ws.WallCamera{}}
+		wd.State = s.state
+		if wd.State == "" {
+			wd.State = "connecting"
+		}
+		for _, u := range s.units {
+			wd.Cameras = append(wd.Cameras, ws.WallCamera{
+				Token:     u.token,
+				Name:      u.name,
+				Streaming: u.streaming,
+				Snapshot:  u.snapshotOn,
+				MJPEG:     u.mjpeg,
+				Width:     u.width,
+				Height:    u.height,
+			})
+		}
+		out = append(out, wd)
+	}
+	return out
+}
+
+// broadcastWallState 在设备增删或画面状态变化后广播视频墙快照。
+func (cm *cameraManager) broadcastWallState() {
+	cm.hub.BroadcastWallState(cm.wallState())
 }
 
 // processLLMResponseWithHistory 走完整语音问答链路：LLM 流式回复 →
