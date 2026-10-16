@@ -1,6 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, provide } from 'vue'
 import { useWebSocket, type WsMessage, type WallStateData } from '../composables/useWebSocket'
+import {
+  refreshDiscovered,
+  useDiscoveredDevices,
+  type DiscoveredDevice,
+} from '../composables/useDiscoveredDevices'
 import CameraTile from './CameraTile.vue'
 
 /**
@@ -39,16 +44,20 @@ const layout = ref<number>(
 )
 const adding = ref(false)
 const addForm = ref({ username: '', password: '' })
-interface DiscoveredDevice {
-  address: string
-  name: string
-  label: string
-}
-const discovered = ref<DiscoveredDevice[]>([])
+// 发现设备走共享缓存（sessionStorage）：查看器搜到的设备直接可选
+const discoveredRaw = useDiscoveredDevices()
 const selectedAddress = ref('')
 const loadingDiscovery = ref(false)
 const addError = ref('')
 const busy = ref(false)
+
+const discovered = computed(() =>
+  discoveredRaw.value.map((d: DiscoveredDevice) => ({
+    address: d.address,
+    name: nameFromScopes(d.scopes),
+    label: hostOf(d.address),
+  })),
+)
 
 const { isConnected, send, subscribe } = useWebSocket('/ws')
 
@@ -153,17 +162,7 @@ function nameFromScopes(scopes: unknown): string {
 async function refreshDiscovery() {
   loadingDiscovery.value = true
   try {
-    const resp = await fetch('/api/discovery')
-    if (resp.ok) {
-      const data = await resp.json()
-      discovered.value = (data.devices || []).map((d: { address: string; scopes?: unknown }) => ({
-        address: d.address,
-        name: nameFromScopes(d.scopes),
-        label: hostOf(d.address),
-      }))
-    }
-  } catch {
-    /* 探测失败保持原列表，可重试或手动输入 */
+    await refreshDiscovered()
   } finally {
     loadingDiscovery.value = false
   }
