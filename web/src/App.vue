@@ -8,7 +8,15 @@ import DeviceInfo from './components/DeviceInfo.vue'
 import EventPanel from './components/EventPanel.vue'
 
 // 顶层视图：查看器（单设备详情 + 语音对讲）↔ 视频墙（多设备同开，#39）
-const view = ref<'viewer' | 'wall'>('viewer')
+// 选择记忆到 localStorage，刷新页面回到上次所在的视图
+const view = ref<'viewer' | 'wall'>(
+  localStorage.getItem('onvif-ai-app-view') === 'wall' ? 'wall' : 'viewer',
+)
+
+function setView(v: 'viewer' | 'wall') {
+  view.value = v
+  localStorage.setItem('onvif-ai-app-view', v)
+}
 
 const clockText = ref('--:--:--')
 let clockTimer: ReturnType<typeof setInterval> | null = null
@@ -54,14 +62,14 @@ onUnmounted(() => {
             :class="{ 'app-header__view-btn--active': view === 'viewer' }"
             role="tab"
             :aria-selected="view === 'viewer'"
-            @click="view = 'viewer'"
+            @click="setView('viewer')"
           >查看器</button>
           <button
             class="app-header__view-btn"
             :class="{ 'app-header__view-btn--active': view === 'wall' }"
             role="tab"
             :aria-selected="view === 'wall'"
-            @click="view = 'wall'"
+            @click="setView('wall')"
           >视频墙</button>
         </div>
         <span class="app-header__time">{{ clockText }}</span>
