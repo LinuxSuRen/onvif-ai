@@ -1254,6 +1254,35 @@ func (cm *cameraManager) handlePTZMove(dev, camera, direction string, durationMs
 			cm.hub.BroadcastError("回到初始位置失败: " + err.Error())
 		}
 		return
+	case "focus_near", "focus_far":
+		// 焦距属 Imaging 服务：连续对焦（正值向远、负值向近），
+		// 松开（focus_stop）停止
+		speed := 1.0
+		if direction == "focus_near" {
+			speed = -1.0
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := client.ImagingFocusMove(ctx, target.token, speed); err != nil {
+			log.Printf("Focus move %s(%s) failed: %v", direction, target.token, err)
+			cm.hub.BroadcastError("焦距调整失败: " + err.Error())
+		}
+		return
+	case "focus_stop":
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := client.ImagingFocusStop(ctx, target.token); err != nil {
+			log.Printf("Focus stop(%s) failed: %v", target.token, err)
+		}
+		return
+	case "focus_auto", "focus_manual":
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := client.ImagingSetAutoFocus(ctx, target.token, direction == "focus_auto"); err != nil {
+			log.Printf("Focus mode %s(%s) failed: %v", direction, target.token, err)
+			cm.hub.BroadcastError("对焦模式切换失败: " + err.Error())
+		}
+		return
 	default:
 		return
 	}

@@ -470,6 +470,19 @@ function ptzHome(dev: string, token: string) {
   send({ type: 'ptz_move', payload: { dev, camera: token, direction: 'home' } })
 }
 
+// 焦距（对焦）属 Imaging 服务：按住近/远对焦，松开停止；A 切回自动对焦
+function focusHold(dev: string, token: string, direction: 'focus_near' | 'focus_far') {
+  send({ type: 'ptz_move', payload: { dev, camera: token, direction } })
+}
+
+function focusStop(dev: string, token: string) {
+  send({ type: 'ptz_move', payload: { dev, camera: token, direction: 'focus_stop' } })
+}
+
+function focusAuto(dev: string, token: string) {
+  send({ type: 'ptz_move', payload: { dev, camera: token, direction: 'focus_auto' } })
+}
+
 // 键盘操控的目标：优先当前悬停的画面，其次放大中的画面
 function activePTZTarget(): { dev: string; token: string } | null {
   const key = hoveredKey.value || zoomedKey.value
@@ -678,6 +691,29 @@ function deviceLabel(d: WallDeviceView): string {
                   @pointerleave="ptzStop(d.address, cam.token)"
                   @pointercancel="ptzStop(d.address, cam.token)"
                 >－</button>
+              </div>
+              <div class="wall__ptz-focus">
+                <button
+                  class="wall__ptz-btn"
+                  title="近焦（按住对焦）"
+                  @pointerdown.prevent="focusHold(d.address, cam.token, 'focus_near')"
+                  @pointerup="focusStop(d.address, cam.token)"
+                  @pointerleave="focusStop(d.address, cam.token)"
+                  @pointercancel="focusStop(d.address, cam.token)"
+                >▣近</button>
+                <button
+                  class="wall__ptz-btn wall__ptz-btn--auto"
+                  title="切回自动对焦"
+                  @pointerdown.prevent="focusAuto(d.address, cam.token)"
+                >A</button>
+                <button
+                  class="wall__ptz-btn"
+                  title="远焦（按住对焦）"
+                  @pointerdown.prevent="focusHold(d.address, cam.token, 'focus_far')"
+                  @pointerup="focusStop(d.address, cam.token)"
+                  @pointerleave="focusStop(d.address, cam.token)"
+                  @pointercancel="focusStop(d.address, cam.token)"
+                >▣远</button>
               </div>
             </div>
           </div>
@@ -1014,6 +1050,25 @@ function deviceLabel(d: WallDeviceView): string {
 .wall__ptz-zoom .wall__ptz-btn {
   width: 28px;
   height: 26px;
+}
+
+.wall__ptz-focus {
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.wall__ptz-focus .wall__ptz-btn {
+  height: 26px;
+  font-size: 0.65rem;
+  padding: 0 6px;
+}
+
+.wall__ptz-btn--auto {
+  color: var(--color-accent-green);
 }
 
 .wall__cell-body {

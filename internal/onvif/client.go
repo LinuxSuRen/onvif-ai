@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,11 +20,12 @@ import (
 )
 
 type Client struct {
-	config     Config
-	http       *http.Client
-	mediaXAddr string
-	ptzXAddr   string
-	discovered bool
+	config      Config
+	http        *http.Client
+	mediaXAddr  string
+	ptzXAddr    string
+	imagingXAddr string
+	discovered  bool
 
 	/* 设备时钟偏移(digest Created 的 Created 时间须与设备钟对齐,
 	 * 超窗即被拒;首次带认证调用前用免认证的 GetSystemDateAndTime 对时) */
@@ -110,6 +112,9 @@ func (c *Client) discoverServices(ctx context.Context) error {
 		if strings.Contains(svc.Namespace, "ptz") || strings.Contains(svc.Namespace, "PTZ") {
 			c.ptzXAddr = svc.XAddr
 		}
+		if strings.Contains(svc.Namespace, "imaging") || strings.Contains(svc.Namespace, "Imaging") {
+			c.imagingXAddr = svc.XAddr
+		}
 	}
 
 	if c.mediaXAddr == "" {
@@ -132,6 +137,13 @@ func (c *Client) ptzURL() string {
 		return c.ptzXAddr
 	}
 	return c.serviceURL("/onvif/ptz_service")
+}
+
+func (c *Client) imagingURL() string {
+	if c.imagingXAddr != "" {
+		return c.imagingXAddr
+	}
+	return c.serviceURL("/onvif/imaging_service")
 }
 
 func (c *Client) GetProfiles(ctx context.Context) ([]Profile, error) {
@@ -534,6 +546,139 @@ func (c *Client) PTZGotoHomePosition(ctx context.Context, profileToken string) e
 	}
 	_ = resp
 	return nil
+}
+
+// ImagingFocusMove 以连续速度调整焦距（对焦）：speed 取 (-1,1)，
+// 正值向远（FAR）对焦、负值向近（NEAR）对焦。焦距属 Imaging 服务
+// 而非 PTZ 服务。
+func (c *Client) ImagingFocusMove(ctx context.Context, profileToken string, speed float64) error {
+	if err := c.discoverServices(ctx); err != nil {
+		return err
+	}
+
+	body := c.soapEnvelope(fmt.Sprintf(`
+		<timg:Move>
+			<timg:ProfileToken>%s</timg:ProfileToken>
+			<timg:Focus>
+				<timg:Continuous>
+					<tt:Speed>%f</tt:Speed>
+				</timg:Continuous>
+			</timg:Focus>
+		</timg:Move>
+	`, xmlEscape(profileToken), speed))
+
+	resp, err := c.soapCall(ctx, c.deviceURL(), c.imagingURL(), "Move", body)
+	if err != nil {
+		return err
+	}
+	_ = resp
+	return nil
+}
+
+// ImagingFocusStop 停止焦距马达的连续移动。
+func (c *Client) ImagingFocusStop(ctx context.Context, profileToken string) error {
+	if err := c.discoverServices(ctx); err != nil {
+		return err
+	}
+
+	body := c.soapEnvelope(fmt.Sprintf(`
+		<timg:Stop>
+			<timg:ProfileToken>%s</timg:ProfileToken>
+		</timg:Stop>
+	`, xmlEscape(profileToken)))
+
+	resp, err := c.soapCall(ctx, c.deviceURL(), c.imagingURL(), "Stop", body)
+	if err != nil {
+		return err
+	}
+	_ = resp
+	return nil
+}
+
+// ImagingSetAutoFocus 切换自动/手动对焦。read-before-write：先取当前
+// 成像设置，仅替换 AutoFocusMode 后整包写回，避免覆盖其它字段。
+func (c *Client) ImagingSetAutoFocus(ctx context.Context, profileToken string, auto bool) error {
+	if err := c.discoverServices(ctx); err != nil {
+		return err
+	}
+
+	getBody := c.soapEnvelope(fmt.Sprintf(`
+		<timg:GetImagingSettings>
+			<timg:ProfileToken>%s</timg:ProfileToken>
+		</timg:GetImagingSettings>
+	`, xmlEscape(profileToken)))
+	resp, err := c.soapCall(ctx, c.deviceURL(), c.imagingURL(), "GetImagingSettings", getBody)
+	if err != nil {
+		return err
+	}
+
+	mode := "MANUAL"
+	if auto {
+		mode = "AUTO"
+	}
+	settings := extractImagingSettingsXML(string(resp))
+	settings = replaceAutoFocusMode(settings, mode)
+
+	setBody := c.soapEnvelope(fmt.Sprintf(`
+		<timg:SetImagingSettings>
+			<timg:ProfileToken>%s</timg:ProfileToken>
+			<timg:ImagingSettings>%s</timg:ImagingSettings>
+		</timg:SetImagingSettings>
+	`, xmlEscape(profileToken), settings))
+
+	resp2, err := c.soapCall(ctx, c.deviceURL(), c.imagingURL(), "SetImagingSettings", setBody)
+	if err != nil {
+		return err
+	}
+	_ = resp2
+	return nil
+}
+
+// extractImagingSettingsXML 从 GetImagingSettings 响应中截取
+// ImagingSettings 元素的内部 XML（去掉命名空间前缀由写回端补）。
+func extractImagingSettingsXML(resp string) string {
+	startTag := "<ImagingSettings>"
+	endTag := "</ImagingSettings>"
+	start := strings.Index(resp, startTag)
+	if start < 0 {
+		// 带命名空间前缀的形态（如 <timg:ImagingSettings>）
+		if i := strings.Index(resp, ":ImagingSettings>"); i > 0 {
+			// 回退到 < 之后截取整个带前缀元素
+			open := strings.LastIndex(resp[:i], "<")
+			if open >= 0 {
+				prefix := resp[open+1 : i] // 如 timg
+				start = strings.Index(resp, "<"+prefix+":ImagingSettings")
+				startTag = "<" + prefix + ":ImagingSettings>"
+				endTag = "</" + prefix + ":ImagingSettings>"
+			}
+		}
+	}
+	if start < 0 {
+		return ""
+	}
+	start += len(startTag)
+	end := strings.Index(resp[start:], endTag)
+	if end < 0 {
+		return ""
+	}
+	return resp[start : start+end]
+}
+
+// replaceAutoFocusMode 在成像设置 XML 里替换（缺失则注入）AutoFocusMode。
+func replaceAutoFocusMode(settings, mode string) string {
+	re := regexp.MustCompile(`(<tt:AutoFocusMode>)[^<]*(</tt:AutoFocusMode>)`)
+	if re.MatchString(settings) {
+		return re.ReplaceAllString(settings, "${1}"+mode+"${2}")
+	}
+	// 缺失则注入到 Focus 元素内；无 Focus 则追加在根部
+	if idx := strings.Index(settings, "<tt:Focus>"); idx >= 0 {
+		at := idx + len("<tt:Focus>")
+		return settings[:at] + "<tt:AutoFocusMode>" + mode + "</tt:AutoFocusMode>" + settings[at:]
+	}
+	if settings == "" {
+		return "<tt:Focus><tt:AutoFocusMode>" + mode + "</tt:AutoFocusMode></tt:Focus>"
+	}
+	return settings + "<tt:Focus><tt:AutoFocusMode>" + mode + "</tt:AutoFocusMode></tt:Focus>"
 }
 
 func formatISO8601(d time.Duration) string {
