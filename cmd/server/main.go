@@ -108,9 +108,10 @@ func main() {
 		go cm.connect(addr, user, pass)
 	})
 
-	// 视频墙：上墙/下墙/快照（凭证由前端每次携带，后端不落盘）
+	// 视频墙：上墙/下墙/快照（凭证由前端每次携带，后端不落盘；
+	// profile 为空时取子码流近似）
 	h.SetWallCallbacks(
-		func(addr, user, pass string) { cm.connectWall(addr, user, pass) },
+		func(addr, user, pass, profile string) { cm.connectWall(addr, user, pass, profile) },
 		func(addr string) { cm.disconnectDevice(addr) },
 		cm.wallState,
 	)
@@ -284,12 +285,13 @@ func (cm *cameraManager) connect(address, username, password string) {
 	if focused != nil && focused.addr != "" {
 		cm.teardownSession(focused)
 	}
-	cm.startSession(address, username, password, false)
+	cm.startSession(address, username, password, false, "")
 }
 
-// connectWall 把一台设备上墙（视频墙入口）：只取子码流一路（profile
-// 列表末位，主码流在前的设备惯例），不动当前聚焦设备；路数超限时拒绝。
-func (cm *cameraManager) connectWall(address, username, password string) {
+// connectWall 把一台设备上墙（视频墙入口）：只取一路画面——优先用
+// 前端选定的 profile，未指定时取列表末位（主码流在前的设备惯例）作为
+// 子码流近似；不动当前聚焦设备；路数超限时拒绝。
+func (cm *cameraManager) connectWall(address, username, password, profile string) {
 	cm.mu.Lock()
 	total := 0
 	for _, s := range cm.registry.Sessions() {
@@ -301,7 +303,7 @@ func (cm *cameraManager) connectWall(address, username, password string) {
 		cm.hub.BroadcastError(fmt.Sprintf("视频墙路数已达上限（%d），请先下墙部分设备", maxWallStreams))
 		return
 	}
-	cm.startSession(address, username, password, true)
+	cm.startSession(address, username, password, true, profile)
 }
 
 // disconnectDevice 下墙一台设备（视频墙入口）。
@@ -320,9 +322,9 @@ func (cm *cameraManager) shutdown() {
 }
 
 // startSession 建立并运行一台设备的会话。wallMode 为 true 是视频墙上墙：
-// 只取子码流一路、不替换聚焦；否则为聚焦连接（详情页），取全部 profile
-// 并设为当前聚焦会话。
-func (cm *cameraManager) startSession(address, username, password string, wallMode bool) {
+// 只取一路画面（profileToken 指定则按 token 匹配，否则取列表末位）、
+// 不替换聚焦；否则为聚焦连接（详情页），取全部 profile 并设为当前聚焦。
+func (cm *cameraManager) startSession(address, username, password string, wallMode bool, profileToken string) {
 	cm.mu.Lock()
 	life := newStreamLife()
 	sess := &deviceSession{
@@ -376,9 +378,20 @@ func (cm *cameraManager) startSession(address, username, password string, wallMo
 	}
 
 	if wallMode {
-		// 视频墙只取子码流一路：GetProfiles 不携带分辨率信息，按「主码
-		// 流在前」的设备惯例取列表末位作为子码流近似（#39）
-		profiles = profiles[len(profiles)-1:]
+		// 视频墙只取一路画面：优先前端选定的 profile（按 token 精确匹配，
+		// 匹配不到回退末位），未指定时按「主码流在前」的设备惯例取列表
+		// 末位作为子码流近似（#39）
+		if profileToken != "" {
+			for _, p := range profiles {
+				if p.Token == profileToken {
+					profiles = []onvif.Profile{p}
+					break
+				}
+			}
+		}
+		if len(profiles) > 1 {
+			profiles = profiles[len(profiles)-1:]
+		}
 	}
 	if len(profiles) > maxCams {
 		log.Printf("Found %d profiles, using first %d", len(profiles), maxCams)

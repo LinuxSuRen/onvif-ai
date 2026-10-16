@@ -51,6 +51,17 @@ const loadingDiscovery = ref(false)
 const addError = ref('')
 const busy = ref(false)
 
+// ---- profile 选择：选定设备后拉取画面列表（纯 SOAP 查询，不建会话）----
+interface ProfileItem {
+  token: string
+  name: string
+  ptz: boolean
+}
+const profiles = ref<ProfileItem[]>([])
+const selectedProfile = ref('')
+const loadingProfiles = ref(false)
+const profileError = ref('')
+
 const discovered = computed(() =>
   discoveredRaw.value.map((d: DiscoveredDevice) => ({
     address: d.address,
@@ -181,6 +192,43 @@ function pickDevice(address: string) {
     addForm.value.username = cred.username
     addForm.value.password = cred.password
   }
+  // 选定设备即拉取画面列表（有存储凭证时直接用；认证失败可填好
+  // 凭证后点「重新获取」）
+  fetchProfiles()
+}
+
+async function fetchProfiles() {
+  const address = selectedAddress.value
+  if (!address) return
+  loadingProfiles.value = true
+  profileError.value = ''
+  profiles.value = []
+  selectedProfile.value = ''
+  try {
+    const q = new URLSearchParams({
+      address,
+      username: addForm.value.username,
+      password: addForm.value.password,
+    })
+    const resp = await fetch(`/api/camera/profiles?${q}`)
+    const data = await resp.json()
+    if (!resp.ok) {
+      throw new Error(data.error || `获取画面列表失败（HTTP ${resp.status}）`)
+    }
+    profiles.value = (data.profiles || []).map((p: { token: string; name: string; ptz: boolean }) => ({
+      token: p.token,
+      name: p.name || p.token,
+      ptz: !!p.ptz,
+    }))
+    if (profiles.value.length === 1) {
+      // 单画面设备无需选择
+      selectedProfile.value = profiles.value[0].token
+    }
+  } catch (e) {
+    profileError.value = e instanceof Error ? e.message : '无法获取画面列表，请检查凭证后重试'
+  } finally {
+    loadingProfiles.value = false
+  }
 }
 
 function selectedLabel(): string {
@@ -193,6 +241,9 @@ async function openAddDialog() {
   addError.value = ''
   addForm.value = { username: '', password: '' }
   selectedAddress.value = ''
+  profiles.value = []
+  selectedProfile.value = ''
+  profileError.value = ''
   refreshDiscovery()
 }
 
@@ -200,6 +251,10 @@ async function submitAdd() {
   const address = selectedAddress.value.trim()
   if (!address) {
     addError.value = '请先在列表中选择一台设备'
+    return
+  }
+  if (profiles.value.length > 1 && !selectedProfile.value) {
+    addError.value = '请选择要上墙的画面（profile）'
     return
   }
   busy.value = true
@@ -212,6 +267,7 @@ async function submitAdd() {
         address,
         username: addForm.value.username,
         password: addForm.value.password,
+        profile: selectedProfile.value,
       }),
     })
     if (!resp.ok) {
@@ -452,6 +508,35 @@ function deviceLabel(d: WallDeviceView): string {
           <span>密码</span>
           <input v-model="addForm.password" type="password" autocomplete="off" placeholder="匿名设备可留空" />
         </label>
+
+        <div v-if="selectedAddress" class="wall__pick">
+          <div class="wall__pick-head">
+            <span>上墙画面</span>
+            <button
+              class="wall__refresh"
+              type="button"
+              :disabled="loadingProfiles"
+              @click="fetchProfiles"
+            >{{ loadingProfiles ? '获取中…' : '重新获取' }}</button>
+          </div>
+          <div v-if="loadingProfiles" class="wall__device-empty">正在获取画面列表…</div>
+          <div v-else-if="profileError" class="wall__device-empty">{{ profileError }}</div>
+          <div v-else class="wall__device-list">
+            <button
+              v-for="p in profiles"
+              :key="p.token"
+              class="wall__device-item"
+              :class="{ 'wall__device-item--selected': selectedProfile === p.token }"
+              type="button"
+              :title="p.token"
+              @click="selectedProfile = p.token"
+            >
+              <span class="wall__device-name">{{ p.name }}</span>
+              <span class="wall__device-host">{{ p.ptz ? '支持云台' : '' }}</span>
+            </button>
+            <div v-if="!profiles.length" class="wall__device-empty">填写凭证后点击「重新获取」拉取画面列表</div>
+          </div>
+        </div>
         <p class="wall__dialog-hint">凭证仅保存在本浏览器（localStorage），每次连接时带给后端。</p>
         <div v-if="addError" class="wall__dialog-error">{{ addError }}</div>
         <div class="wall__dialog-actions">

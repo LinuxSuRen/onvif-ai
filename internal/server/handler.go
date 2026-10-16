@@ -80,9 +80,9 @@ type Handler struct {
 	llmConfig      *LLMConfig
 	forwardConfig  *ForwardConfig
 	snapshotFPS    int
-	onConnect        func(address, username, password string)
-	onWallConnect    func(address, username, password string)
-	onWallDisconnect func(string)
+	onConnect          func(address, username, password string)
+	onWallConnect      func(address, username, password, profile string)
+	onWallDisconnect   func(string)
 	wallState        func() []ws.WallDevice
 	onAudioData    func([]byte)
 	onAudioStart   func()
@@ -190,9 +190,10 @@ func (h *Handler) SetOnConnect(fn func(address, username, password string)) {
 }
 
 // SetWallCallbacks 注册视频墙连接管理回调：onWallConnect 上墙一台设备
-//（凭证由前端每次携带，后端不落盘），onWallDisconnect 下墙一台设备，
-// wallState 提供当前墙设备快照（GET /api/wall/devices 与 WS 广播共用）。
-func (h *Handler) SetWallCallbacks(onWallConnect func(address, username, password string), onWallDisconnect func(string), wallState func() []ws.WallDevice) {
+//（凭证由前端每次携带，后端不落盘；profile 为空时取子码流近似），
+// onWallDisconnect 下墙一台设备，wallState 提供当前墙设备快照
+//（GET /api/wall/devices 与 WS 广播共用）。
+func (h *Handler) SetWallCallbacks(onWallConnect func(address, username, password, profile string), onWallDisconnect func(string), wallState func() []ws.WallDevice) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onWallConnect = onWallConnect
@@ -281,6 +282,7 @@ func (h *Handler) RegisterRoutes() http.Handler {
 	r.Get("/health", h.handleHealth)
 	r.Get("/api/camera/discover", h.handleDiscover)
 	r.Get("/api/camera/info", h.handleCameraInfo)
+	r.Get("/api/camera/profiles", h.handleCameraProfiles)
 	r.Post("/api/camera/connect", h.handleConnect)
 	r.Post("/api/wall/connect", h.handleWallConnect)
 	r.Post("/api/wall/disconnect", h.handleWallDisconnect)
@@ -366,6 +368,7 @@ func (h *Handler) handleWallConnect(w http.ResponseWriter, r *http.Request) {
 		Address  string `json:"address"`
 		Username string `json:"username"`
 		Password string `json:"password"`
+		Profile  string `json:"profile"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
 		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
@@ -380,7 +383,7 @@ func (h *Handler) handleWallConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"wall not available"}`, http.StatusServiceUnavailable)
 		return
 	}
-	go fn(req.Address, req.Username, req.Password)
+	go fn(req.Address, req.Username, req.Password, req.Profile)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "connecting", "address": req.Address})
@@ -454,6 +457,47 @@ func (h *Handler) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(info)
+}
+
+// handleCameraProfiles 返回指定设备的 media profile 列表（纯 SOAP 查询，
+// 不建立取流会话）：供视频墙在连接前选择要上墙的画面（#39）。
+func (h *Handler) handleCameraProfiles(w http.ResponseWriter, r *http.Request) {
+	address := r.URL.Query().Get("address")
+	if address == "" {
+		http.Error(w, `{"error":"missing address"}`, http.StatusBadRequest)
+		return
+	}
+
+	client := onvif.NewClient(onvif.Config{
+		DeviceAddr: address,
+		Username:   r.URL.Query().Get("username"),
+		Password:   r.URL.Query().Get("password"),
+		Timeout:    5 * time.Second,
+	})
+
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	profiles, err := client.GetProfiles(ctx)
+	if err != nil {
+		log.Printf("GetProfiles for %s failed: %v", address, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	type profileItem struct {
+		Token string `json:"token"`
+		Name  string `json:"name"`
+		PTZ   bool   `json:"ptz"`
+	}
+	items := make([]profileItem, 0, len(profiles))
+	for _, p := range profiles {
+		items = append(items, profileItem{Token: p.Token, Name: p.Name, PTZ: p.HasPTZ()})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"profiles": items})
 }
 
 func (h *Handler) handleCameraInfo(w http.ResponseWriter, r *http.Request) {

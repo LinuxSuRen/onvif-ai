@@ -135,11 +135,11 @@ func TestWallEndpoints(t *testing.T) {
 		t.Fatalf("without callbacks expected 503, got %d", rec.Code)
 	}
 
-	type connectReq struct{ addr, user, pass string }
+	type connectReq struct{ addr, user, pass, profile string }
 	connects := make(chan connectReq, 2)
 	disconnects := make(chan string, 2)
 	h.SetWallCallbacks(
-		func(addr, user, pass string) { connects <- connectReq{addr, user, pass} },
+		func(addr, user, pass, profile string) { connects <- connectReq{addr, user, pass, profile} },
 		func(addr string) { disconnects <- addr },
 		func() []ws.WallDevice {
 			return []ws.WallDevice{{
@@ -150,16 +150,16 @@ func TestWallEndpoints(t *testing.T) {
 		},
 	)
 
-	// connect：参数透传，立即返回 connecting
+	// connect：参数透传（含 profile），立即返回 connecting
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/wall/connect",
-		strings.NewReader(`{"address":"192.168.1.10","username":"admin","password":"pw"}`)))
+		strings.NewReader(`{"address":"192.168.1.10","username":"admin","password":"pw","profile":"profile_2"}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("connect status = %d, body %s", rec.Code, rec.Body.String())
 	}
 	select {
 	case got := <-connects:
-		if got.addr != "192.168.1.10" || got.user != "admin" || got.pass != "pw" {
+		if got.addr != "192.168.1.10" || got.user != "admin" || got.pass != "pw" || got.profile != "profile_2" {
 			t.Fatalf("connect callback args: %+v", got)
 		}
 	case <-time.After(time.Second):
