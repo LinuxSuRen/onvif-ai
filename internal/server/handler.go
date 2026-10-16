@@ -316,12 +316,26 @@ func (h *Handler) handleDiscover(w http.ResponseWriter, r *http.Request) {
 
 	probed, err := discovery.Probe("")
 	if err == nil {
+		// 去重键用全部 XAddr（而非仅主地址）：双栈设备的 IPv4/IPv6
+		// 地址可能分别出现在监听记录与主动探测结果里
 		seen := make(map[string]bool)
 		for _, d := range allDevices {
+			for _, addr := range d.XAddrs {
+				seen[addr] = true
+			}
 			seen[d.Address] = true
 		}
 		for _, d := range probed {
-			if !seen[d.Address] {
+			dup := seen[d.Address]
+			if !dup {
+				for _, addr := range d.XAddrs {
+					if seen[addr] {
+						dup = true
+						break
+					}
+				}
+			}
+			if !dup {
 				allDevices = append(allDevices, d)
 			}
 		}

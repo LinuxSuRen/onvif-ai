@@ -88,12 +88,53 @@ func TestParseDevicesHelloWithoutPrefix(t *testing.T) {
 }
 
 func TestParseDevicesMultipleXAddrs(t *testing.T) {
+	// 双栈设备（IPv4+IPv6 双 XAddr）：一条记录，主地址取 IPv4，
+	// XAddrs 携带全部地址
 	body := strings.Replace(wsddProbeMatches,
 		"http://192.168.1.64:80/onvif/device_service",
-		"http://192.168.1.64:80/onvif/device_service http://192.168.1.64:8000/onvif/device_service", 1)
+		"http://[2408:8210::1]/onvif/device_service http://192.168.1.64:80/onvif/device_service", 1)
 	devices := parseDevices(body)
-	if len(devices) != 2 {
-		t.Fatalf("expected 2 devices, got %d", len(devices))
+	if len(devices) != 1 {
+		t.Fatalf("expected 1 device for dual-stack XAddrs, got %d", len(devices))
+	}
+	if devices[0].Address != "http://192.168.1.64:80/onvif/device_service" {
+		t.Fatalf("primary address should prefer IPv4, got %s", devices[0].Address)
+	}
+	if len(devices[0].XAddrs) != 2 {
+		t.Fatalf("expected 2 xaddrs on the device, got %v", devices[0].XAddrs)
+	}
+}
+
+func TestParseDevicesIPv6Only(t *testing.T) {
+	body := strings.Replace(wsddProbeMatches,
+		"http://192.168.1.64:80/onvif/device_service",
+		"http://[2408:8210::1]/onvif/device_service", 1)
+	devices := parseDevices(body)
+	if len(devices) != 1 || devices[0].Address != "http://[2408:8210::1]/onvif/device_service" {
+		t.Fatalf("ipv6-only device: %+v", devices)
+	}
+}
+
+func TestListenerMergesDualStackArrivals(t *testing.T) {
+	// 同一设备先以 IPv4+IPv6 到达，再以纯 IPv6 的 Hello 到达：合并为一条
+	l := NewListener()
+	dual := strings.Replace(wsddProbeMatches,
+		"http://192.168.1.64:80/onvif/device_service",
+		"http://192.168.1.64:80/onvif/device_service http://[2408:8210::1]/onvif/device_service", 1)
+	l.parseAndStore([]byte(dual))
+
+	v6Hello := strings.Replace(strings.Replace(helloBody,
+		"http://192.168.1.65:80/onvif/device_service",
+		"http://[2408:8210::1]/onvif/device_service", 1),
+		"192.168.1.65", "192.168.1.64", 1)
+	l.parseAndStore([]byte(v6Hello))
+
+	devices := l.Devices()
+	if len(devices) != 1 {
+		t.Fatalf("dual-stack arrivals should merge into 1 device, got %d", len(devices))
+	}
+	if len(devices[0].XAddrs) != 2 {
+		t.Fatalf("merged device should carry both xaddrs, got %v", devices[0].XAddrs)
 	}
 }
 

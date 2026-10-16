@@ -138,18 +138,27 @@ type helloMessage struct {
 	MetadataVersion int      `xml:"MetadataVersion"`
 }
 
-func devicesFrom(types, scopes, xaddrs string, metadataVersion int) (devices []Device) {
+func devicesFrom(types, scopes, xaddrs string, metadataVersion int) []Device {
 	fields := strings.Fields(xaddrs)
-	for _, addr := range fields {
-		devices = append(devices, Device{
-			Address:         addr,
-			Types:           strings.Fields(types),
-			Scopes:          strings.Fields(scopes),
-			XAddrs:          fields,
-			MetadataVersion: metadataVersion,
-		})
+	if len(fields) == 0 {
+		return nil
 	}
-	return
+	// 同一设备可能同时宣告 IPv4/IPv6 多个地址（海康实测）：一条消息
+	// 只产生一条记录，XAddrs 携带全部地址，主地址优先取 IPv4。
+	address := fields[0]
+	for _, addr := range fields {
+		if !strings.Contains(addr, "]") { // 无 ']' 即非 [IPv6] 字面量
+			address = addr
+			break
+		}
+	}
+	return []Device{{
+		Address:         address,
+		Types:           strings.Fields(types),
+		Scopes:          strings.Fields(scopes),
+		XAddrs:          fields,
+		MetadataVersion: metadataVersion,
+	}}
 }
 
 // parseDevices 从一条 SOAP 报文中提取设备，兼容任意命名空间前缀，
@@ -175,10 +184,49 @@ func parseDevices(body string) (devices []Device) {
 func (l *Listener) addDevice(d Device) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// 同一设备可能经不同消息以不同主地址到达（IPv4/IPv6 双栈）：任一
+	// XAddr 重叠即视为同一设备，合并 XAddrs 而非新增记录。
+	for addr, existing := range l.devices {
+		if xaddrsOverlap(existing.XAddrs, d.XAddrs) {
+			existing.XAddrs = mergeXAddrs(existing.XAddrs, d.XAddrs)
+			l.devices[addr] = existing
+			return
+		}
+	}
 	if _, exists := l.devices[d.Address]; !exists {
 		l.devices[d.Address] = d
 		log.Printf("Discovered ONVIF device: %s", d.Address)
 	}
+}
+
+// xaddrsOverlap 判断两组地址是否存在交集。
+func xaddrsOverlap(a, b []string) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if x == y {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// mergeXAddrs 求并集并保持原有顺序（新地址追加在尾部）。
+func mergeXAddrs(a, b []string) []string {
+	out := append([]string(nil), a...)
+	for _, y := range b {
+		found := false
+		for _, x := range out {
+			if x == y {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, y)
+		}
+	}
+	return out
 }
 
 var probeTemplate = `<?xml version="1.0" encoding="UTF-8"?>
@@ -271,7 +319,16 @@ func Probe(ifaceName string) ([]Device, error) {
 				}
 				mu.Lock()
 				for _, d := range parseDevices(string(buf[:n])) {
-					if _, exists := devices[d.Address]; !exists {
+					// 同一设备可能以不同主地址应答（IPv4/IPv6 双栈）：
+					// 任一 XAddr 与已收录设备重叠即跳过
+					dup := false
+					for _, existing := range devices {
+						if xaddrsOverlap(existing.XAddrs, d.XAddrs) {
+							dup = true
+							break
+						}
+					}
+					if !dup {
 						devices[d.Address] = d
 					}
 				}
