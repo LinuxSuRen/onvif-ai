@@ -1171,8 +1171,8 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 			log.Println("Conversation history cleared")
 			hub.BroadcastStatus(ws.StatusIdle)
 		},
-		func(dev, camera, direction string) {
-			cm.handlePTZMove(dev, camera, direction)
+		func(dev, camera, direction string, durationMs int64) {
+			cm.handlePTZMove(dev, camera, direction, durationMs)
 		},
 		func(mode string) {
 			log.Printf("Audio mode: %s", mode)
@@ -1189,7 +1189,9 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 
 // handlePTZMove 处理一路画面的云台控制。dev 为空时作用于当前聚焦设备
 //（查看器路径）；视频墙路径携带目标设备地址，可控制任意已上墙设备。
-func (cm *cameraManager) handlePTZMove(dev, camera, direction string) {
+// durationMs 为按住场景的长时长（缺省 2s 点动；上限 60s 防丢停止事件
+// 后云台失控常转）。
+func (cm *cameraManager) handlePTZMove(dev, camera, direction string, durationMs int64) {
 	cm.mu.Lock()
 	var sess *deviceSession
 	if dev != "" {
@@ -1244,11 +1246,27 @@ func (cm *cameraManager) handlePTZMove(dev, camera, direction string) {
 			log.Printf("PTZ stop(%s) failed: %v", target.token, err)
 		}
 		return
+	case "home":
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		if err := client.PTZGotoHomePosition(ctx, target.token); err != nil {
+			log.Printf("PTZ home(%s) failed: %v", target.token, err)
+			cm.hub.BroadcastError("回到初始位置失败: " + err.Error())
+		}
+		return
 	default:
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	duration := 2 * time.Second
+	if durationMs > 0 {
+		if durationMs > 60000 {
+			durationMs = 60000
+		}
+		duration = time.Duration(durationMs) * time.Millisecond
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second+duration)
 	defer cancel()
 
 	if err := client.PTZContinuousMove(ctx, target.token, pan, tilt, zoom, 2*time.Second); err != nil {

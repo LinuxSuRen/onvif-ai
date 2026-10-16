@@ -457,8 +457,17 @@ function toggleZoom(routeKey: string) {
 // ---- PTZ：悬停/放大的画面可通过悬浮按钮或键盘操控 ----
 const hoveredKey = ref('')
 
-function ptzMove(dev: string, token: string, direction: string) {
-  send({ type: 'ptz_move', payload: { dev, camera: token, direction } })
+// 按住连转：按下发长时长移动（30s 上限由后端钳制），松开发停止
+function ptzHold(dev: string, token: string, direction: string) {
+  send({ type: 'ptz_move', payload: { dev, camera: token, direction, duration_ms: 30000 } })
+}
+
+function ptzStop(dev: string, token: string) {
+  send({ type: 'ptz_move', payload: { dev, camera: token, direction: 'stop' } })
+}
+
+function ptzHome(dev: string, token: string) {
+  send({ type: 'ptz_move', payload: { dev, camera: token, direction: 'home' } })
 }
 
 // 键盘操控的目标：优先当前悬停的画面，其次放大中的画面
@@ -475,6 +484,19 @@ function activePTZTarget(): { dev: string; token: string } | null {
   return null
 }
 
+// 按住的键 → 已下发的方向：keyup 时按记录发送停止
+const heldKeys = new Map<string, string>()
+
+const KEY_DIRECTIONS: Record<string, string> = {
+  ArrowUp: 'up',
+  ArrowDown: 'down',
+  ArrowLeft: 'left',
+  ArrowRight: 'right',
+  '+': 'zoom_in',
+  '=': 'zoom_in',
+  '-': 'zoom_out',
+}
+
 function onKeydown(e: KeyboardEvent) {
   // 输入控件内不拦截
   const tag = (e.target as HTMLElement)?.tagName
@@ -484,32 +506,46 @@ function onKeydown(e: KeyboardEvent) {
     zoomedKey.value = ''
     return
   }
+  if (e.repeat) return
   const target = activePTZTarget()
   if (!target) return
-  const map: Record<string, string> = {
-    ArrowUp: 'up',
-    ArrowDown: 'down',
-    ArrowLeft: 'left',
-    ArrowRight: 'right',
-    '+': 'zoom_in',
-    '=': 'zoom_in',
-    '-': 'zoom_out',
-    ' ': 'stop',
+
+  if (e.key === 'h' || e.key === 'H') {
+    e.preventDefault()
+    ptzHome(target.dev, target.token)
+    return
   }
-  const direction = map[e.key]
+  if (e.key === ' ') {
+    e.preventDefault()
+    ptzStop(target.dev, target.token)
+    return
+  }
+  const direction = KEY_DIRECTIONS[e.key]
   if (!direction) return
   e.preventDefault()
-  ptzMove(target.dev, target.token, direction)
+  heldKeys.set(e.key, direction)
+  ptzHold(target.dev, target.token, direction)
+}
+
+function onKeyup(e: KeyboardEvent) {
+  if (!heldKeys.has(e.key)) return
+  heldKeys.delete(e.key)
+  const target = activePTZTarget()
+  if (target) {
+    ptzStop(target.dev, target.token)
+  }
 }
 
 onMounted(() => {
   restoreWall()
   observeTiles()
   window.addEventListener('keydown', onKeydown)
+  window.addEventListener('keyup', onKeyup)
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('keyup', onKeyup)
   observer?.disconnect()
   observer = null
   // 退订本页面持有的全部画面
@@ -587,15 +623,61 @@ function deviceLabel(d: WallDeviceView): string {
             />
             <div v-if="cam.ptz" class="wall__ptz">
               <div class="wall__ptz-pad">
-                <button class="wall__ptz-btn wall__ptz-btn--up" title="上" @pointerdown.prevent="ptzMove(d.address, cam.token, 'up')">▲</button>
-                <button class="wall__ptz-btn wall__ptz-btn--left" title="左" @pointerdown.prevent="ptzMove(d.address, cam.token, 'left')">◀</button>
-                <button class="wall__ptz-btn wall__ptz-btn--stop" title="停止" @pointerdown.prevent="ptzMove(d.address, cam.token, 'stop')">■</button>
-                <button class="wall__ptz-btn wall__ptz-btn--right" title="右" @pointerdown.prevent="ptzMove(d.address, cam.token, 'right')">▶</button>
-                <button class="wall__ptz-btn wall__ptz-btn--down" title="下" @pointerdown.prevent="ptzMove(d.address, cam.token, 'down')">▼</button>
+                <button
+                  class="wall__ptz-btn wall__ptz-btn--up"
+                  title="上（按住转动）"
+                  @pointerdown.prevent="ptzHold(d.address, cam.token, 'up')"
+                  @pointerup="ptzStop(d.address, cam.token)"
+                  @pointerleave="ptzStop(d.address, cam.token)"
+                  @pointercancel="ptzStop(d.address, cam.token)"
+                >▲</button>
+                <button
+                  class="wall__ptz-btn wall__ptz-btn--left"
+                  title="左（按住转动）"
+                  @pointerdown.prevent="ptzHold(d.address, cam.token, 'left')"
+                  @pointerup="ptzStop(d.address, cam.token)"
+                  @pointerleave="ptzStop(d.address, cam.token)"
+                  @pointercancel="ptzStop(d.address, cam.token)"
+                >◀</button>
+                <button
+                  class="wall__ptz-btn wall__ptz-btn--home"
+                  title="回到初始位置（键盘 H）"
+                  @pointerdown.prevent="ptzHome(d.address, cam.token)"
+                >⌂</button>
+                <button
+                  class="wall__ptz-btn wall__ptz-btn--right"
+                  title="右（按住转动）"
+                  @pointerdown.prevent="ptzHold(d.address, cam.token, 'right')"
+                  @pointerup="ptzStop(d.address, cam.token)"
+                  @pointerleave="ptzStop(d.address, cam.token)"
+                  @pointercancel="ptzStop(d.address, cam.token)"
+                >▶</button>
+                <button
+                  class="wall__ptz-btn wall__ptz-btn--down"
+                  title="下（按住转动）"
+                  @pointerdown.prevent="ptzHold(d.address, cam.token, 'down')"
+                  @pointerup="ptzStop(d.address, cam.token)"
+                  @pointerleave="ptzStop(d.address, cam.token)"
+                  @pointercancel="ptzStop(d.address, cam.token)"
+                >▼</button>
               </div>
               <div class="wall__ptz-zoom">
-                <button class="wall__ptz-btn" title="变焦+（键盘 +）" @pointerdown.prevent="ptzMove(d.address, cam.token, 'zoom_in')">＋</button>
-                <button class="wall__ptz-btn" title="变焦-（键盘 -）" @pointerdown.prevent="ptzMove(d.address, cam.token, 'zoom_out')">－</button>
+                <button
+                  class="wall__ptz-btn"
+                  title="变焦+（按住，键盘 +）"
+                  @pointerdown.prevent="ptzHold(d.address, cam.token, 'zoom_in')"
+                  @pointerup="ptzStop(d.address, cam.token)"
+                  @pointerleave="ptzStop(d.address, cam.token)"
+                  @pointercancel="ptzStop(d.address, cam.token)"
+                >＋</button>
+                <button
+                  class="wall__ptz-btn"
+                  title="变焦-（按住，键盘 -）"
+                  @pointerdown.prevent="ptzHold(d.address, cam.token, 'zoom_out')"
+                  @pointerup="ptzStop(d.address, cam.token)"
+                  @pointerleave="ptzStop(d.address, cam.token)"
+                  @pointercancel="ptzStop(d.address, cam.token)"
+                >－</button>
               </div>
             </div>
           </div>
@@ -901,7 +983,7 @@ function deviceLabel(d: WallDeviceView): string {
 
 .wall__ptz-btn--up { grid-column: 2; grid-row: 1; }
 .wall__ptz-btn--left { grid-column: 1; grid-row: 2; }
-.wall__ptz-btn--stop { grid-column: 2; grid-row: 2; }
+.wall__ptz-btn--home { grid-column: 2; grid-row: 2; }
 .wall__ptz-btn--right { grid-column: 3; grid-row: 2; }
 .wall__ptz-btn--down { grid-column: 2; grid-row: 3; }
 

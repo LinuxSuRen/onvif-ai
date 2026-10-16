@@ -507,6 +507,35 @@ func (c *Client) PTZStop(ctx context.Context, profileToken string) error {
 	return nil
 }
 
+// PTZGotoHomePosition 让云台回到预置的初始位置（Home Position）。
+// 设备未设置 Home 时多数实现会回到默认位（如正前方水平）。
+func (c *Client) PTZGotoHomePosition(ctx context.Context, profileToken string) error {
+	if err := c.discoverServices(ctx); err != nil {
+		return err
+	}
+
+	ptzURL := c.ptzURL()
+	if c.mediaXAddr != "" {
+		base := c.deviceURL()
+		if idx := strings.Index(base, "/onvif/"); idx > 0 {
+			ptzURL = base[:idx] + "/onvif/ptz_service"
+		}
+	}
+
+	body := c.soapEnvelope(fmt.Sprintf(`
+		<tptz:GotoHomePosition>
+			<tptz:ProfileToken>%s</tptz:ProfileToken>
+		</tptz:GotoHomePosition>
+	`, xmlEscape(profileToken)))
+
+	resp, err := c.soapCall(ctx, c.deviceURL(), ptzURL, "GotoHomePosition", body)
+	if err != nil {
+		return err
+	}
+	_ = resp
+	return nil
+}
+
 func formatISO8601(d time.Duration) string {
 	sec := d.Seconds()
 	return fmt.Sprintf("PT%.1fS", sec)
