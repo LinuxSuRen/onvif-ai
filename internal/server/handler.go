@@ -90,7 +90,7 @@ type Handler struct {
 	onSpeechText   func(string)
 	onCameraListen func()
 	onClearHistory func()
-	onPTZMove      func(camera, direction string)
+	onPTZMove      func(dev, camera, direction string)
 	onSwitchMode   func(string)
 	onLLMUpdate    func(baseURL, apiKey, model string)
 	// onForwardUpdate 在转发配置保存成功后回调（携带合并后的完整配置），
@@ -170,7 +170,7 @@ func NewHandler(hub *ws.Hub, listener *discovery.Listener) *Handler {
 	}
 }
 
-func (h *Handler) SetCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onClear func(), onPTZ func(camera, direction string), onMode func(string)) {
+func (h *Handler) SetCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onClear func(), onPTZ func(dev, camera, direction string), onMode func(string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onAudioData = onData
@@ -859,8 +859,9 @@ func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
 
 	case ws.MsgTypePTZMove:
 		var payload struct {
-			Camera    string
-			Direction string
+			Dev       string `json:"dev"`
+			Camera    string `json:"camera"`
+			Direction string `json:"direction"`
 		}
 		if msg.Payload != nil {
 			json.Unmarshal(msg.Payload, &payload)
@@ -868,7 +869,7 @@ func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
 		if payload.Direction != "" {
 			h.mu.RLock()
 			if h.onPTZMove != nil {
-				h.onPTZMove(payload.Camera, payload.Direction)
+				h.onPTZMove(payload.Dev, payload.Camera, payload.Direction)
 			}
 			h.mu.RUnlock()
 		}

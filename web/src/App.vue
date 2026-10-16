@@ -24,33 +24,6 @@ onMounted(() => {
 onUnmounted(() => {
   if (clockTimer) clearInterval(clockTimer)
 })
-
-// 视频墙点击 tile → 切回查看器并以该设备聚焦连接（凭证取自视频墙的
-// localStorage 存储；无凭证时详情页会按匿名连接引导补填）
-async function focusFromWall(address: string) {
-  view.value = 'viewer'
-  let username = ''
-  let password = ''
-  try {
-    const creds = JSON.parse(localStorage.getItem('onvif-ai-wall-creds') || '{}')
-    const cred = creds[address]
-    if (cred) {
-      username = cred.username || ''
-      password = cred.password || ''
-    }
-  } catch {
-    /* 凭证解析失败按匿名处理 */
-  }
-  try {
-    await fetch('/api/camera/connect', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ address, username, password }),
-    })
-  } catch {
-    /* 连接结果经 device_state/connect_error 广播反馈 */
-  }
-}
 </script>
 
 <template>
@@ -109,7 +82,7 @@ async function focusFromWall(address: string) {
         </aside>
       </template>
       <section v-else class="app-main__wall">
-        <VideoWall @focus="focusFromWall" />
+        <VideoWall />
       </section>
     </main>
   </div>

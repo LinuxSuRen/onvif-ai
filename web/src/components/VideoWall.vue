@@ -29,14 +29,39 @@ interface WallCam {
   width: number
   height: number
 }
+
+const CREDS_KEY = 'onvif-ai-wall-creds'
+const LAYOUT_KEY = 'onvif-ai-wall-layout'
+// 上墙配置（设备 + 画面集合）持久化：刷新/浏览器重启后自动恢复上墙
+const WALL_CONFIG_KEY = 'onvif-ai-wall-config'
+
+interface WallEntry {
+  address: string
+  profiles: string[]
+}
+
+function loadWallConfig(): WallEntry[] {
+  try {
+    const list = JSON.parse(localStorage.getItem(WALL_CONFIG_KEY) || '[]')
+    return Array.isArray(list) ? list : []
+  } catch {
+    return []
+  }
+}
+
+function saveWallConfig(entries: WallEntry[]) {
+  try {
+    localStorage.setItem(WALL_CONFIG_KEY, JSON.stringify(entries))
+  } catch {
+    /* 存储满/禁用时仅保留会话内状态 */
+  }
+}
+
 interface WallDeviceView {
   address: string
   state: string
   cameras: WallCam[]
 }
-
-const CREDS_KEY = 'onvif-ai-wall-creds'
-const LAYOUT_KEY = 'onvif-ai-wall-layout'
 
 const devices = ref<WallDeviceView[]>([])
 const layout = ref<number>(
@@ -156,15 +181,45 @@ function saveCred(address: string, username: string, password: string) {
 }
 
 // ---- 添加 / 移除设备 ----
-async function loadWall() {
+async function loadWall(): Promise<WallDeviceView[]> {
   try {
     const resp = await fetch('/api/wall/devices')
     if (resp.ok) {
       const data = (await resp.json()) as WallStateData
       applyWallState(data)
+      return devices.value
     }
   } catch {
     /* 初始快照失败时等待 wall_state 广播 */
+  }
+  return devices.value
+}
+
+// 恢复上墙：按 localStorage 配置把不在墙上的设备自动连回（凭证取自
+// 浏览器存储；后端重启或浏览器刷新后无需手动重挂）
+async function restoreWall() {
+  const current = await loadWall()
+  const onWall = new Set(current.map((d) => d.address))
+  const creds = loadCreds()
+  for (const entry of loadWallConfig()) {
+    if (!entry.address || !Array.isArray(entry.profiles) || entry.profiles.length === 0) continue
+    if (onWall.has(entry.address)) continue
+    const cred = creds[entry.address] || { username: '', password: '' }
+    try {
+      const resp = await fetch('/api/wall/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          address: entry.address,
+          username: cred.username,
+          password: cred.password,
+          profiles: entry.profiles,
+        }),
+      })
+      if (resp.ok) onWall.add(entry.address)
+    } catch {
+      /* 设备离线/后端不可达：保留配置，下次挂载再试 */
+    }
   }
 }
 
@@ -320,15 +375,6 @@ async function removeDevice(address: string, profile: string) {
   }
 }
 
-const emit = defineEmits<{
-  // 点击 tile 主体：切换到查看器并聚焦该设备（凭证从 localStorage 取）
-  (e: 'focus', address: string): void
-}>()
-
-function focusDevice(address: string) {
-  emit('focus', address)
-}
-
 // ---- 可见性驱动的按路订阅 ----
 const visibleTiles = new Set<string>()
 let observer: IntersectionObserver | null = null
@@ -384,9 +430,15 @@ watch(isConnected, (connected) => {
 })
 
 watch(devices, () => {
-  // 设备集合变化后重新观察 tile 容器（新 tile 需要进入观察）
+  // 设备集合变化后：持久化当前墙配置 + 重新观察 tile 容器
+  saveWallConfig(
+    devices.value.map((d) => ({
+      address: d.address,
+      profiles: d.cameras.map((c) => c.token),
+    })),
+  )
   requestAnimationFrame(observeTiles)
-})
+}, { deep: true })
 
 watch(layout, (l) => localStorage.setItem(LAYOUT_KEY, String(l)))
 
@@ -395,12 +447,69 @@ function setLayout(l: number) {
   requestAnimationFrame(observeTiles)
 }
 
+// ---- 双击放大：zoomedKey 为当前放大的画面（dev/token 复合键） ----
+const zoomedKey = ref('')
+
+function toggleZoom(routeKey: string) {
+  zoomedKey.value = zoomedKey.value === routeKey ? '' : routeKey
+}
+
+// ---- PTZ：悬停/放大的画面可通过悬浮按钮或键盘操控 ----
+const hoveredKey = ref('')
+
+function ptzMove(dev: string, token: string, direction: string) {
+  send({ type: 'ptz_move', payload: { dev, camera: token, direction } })
+}
+
+// 键盘操控的目标：优先当前悬停的画面，其次放大中的画面
+function activePTZTarget(): { dev: string; token: string } | null {
+  const key = hoveredKey.value || zoomedKey.value
+  if (!key) return null
+  for (const d of devices.value) {
+    for (const c of d.cameras) {
+      if (`${d.address}/${c.token}` === key && c.ptz) {
+        return { dev: d.address, token: c.token }
+      }
+    }
+  }
+  return null
+}
+
+function onKeydown(e: KeyboardEvent) {
+  // 输入控件内不拦截
+  const tag = (e.target as HTMLElement)?.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || adding.value) return
+
+  if (e.key === 'Escape' && zoomedKey.value) {
+    zoomedKey.value = ''
+    return
+  }
+  const target = activePTZTarget()
+  if (!target) return
+  const map: Record<string, string> = {
+    ArrowUp: 'up',
+    ArrowDown: 'down',
+    ArrowLeft: 'left',
+    ArrowRight: 'right',
+    '+': 'zoom_in',
+    '=': 'zoom_in',
+    '-': 'zoom_out',
+    ' ': 'stop',
+  }
+  const direction = map[e.key]
+  if (!direction) return
+  e.preventDefault()
+  ptzMove(target.dev, target.token, direction)
+}
+
 onMounted(() => {
-  loadWall()
+  restoreWall()
   observeTiles()
+  window.addEventListener('keydown', onKeydown)
 })
 
 onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown)
   observer?.disconnect()
   observer = null
   // 退订本页面持有的全部画面
@@ -444,13 +553,17 @@ function deviceLabel(d: WallDeviceView): string {
       <button class="wall__add" type="button" @click="openAddDialog">＋ 添加设备</button>
     </div>
 
-    <div class="wall__grid" :style="{ gridTemplateColumns: gridTemplate }">
+    <div class="wall__grid" :style="{ gridTemplateColumns: zoomedKey ? '1fr' : gridTemplate }">
       <template v-for="d in devices" :key="d.address">
         <div
           v-for="cam in d.cameras"
+          v-show="!zoomedKey || `${d.address}/${cam.token}` === zoomedKey"
           :key="`${d.address}/${cam.token}`"
           class="wall__cell"
+          :class="{ 'wall__cell--zoomed': zoomedKey === `${d.address}/${cam.token}` }"
           :data-route-key="`${d.address}/${cam.token}`"
+          @mouseenter="hoveredKey = `${d.address}/${cam.token}`"
+          @mouseleave="hoveredKey = ''"
         >
           <div class="wall__cell-bar">
             <span class="wall__cell-name" :title="`${d.address} · ${cam.name}`">
@@ -459,15 +572,32 @@ function deviceLabel(d: WallDeviceView): string {
             <span v-if="d.state === 'connecting'" class="wall__cell-state wall__cell-state--connecting">连接中</span>
             <button class="wall__cell-remove" title="下墙" @click.stop="removeDevice(d.address, cam.token)">×</button>
           </div>
-          <div class="wall__cell-body" @click="focusDevice(d.address)">
+          <div
+            class="wall__cell-body"
+            title="双击放大/还原"
+            @dblclick="toggleZoom(`${d.address}/${cam.token}`)"
+          >
             <CameraTile
               :dev="d.address"
               :cam="cam"
-              :active="layout === 1"
+              :active="zoomedKey === `${d.address}/${cam.token}`"
               :show-label="false"
               :clock-offset="null"
               :reset-key="resetKey"
             />
+            <div v-if="cam.ptz" class="wall__ptz">
+              <div class="wall__ptz-pad">
+                <button class="wall__ptz-btn wall__ptz-btn--up" title="上" @pointerdown.prevent="ptzMove(d.address, cam.token, 'up')">▲</button>
+                <button class="wall__ptz-btn wall__ptz-btn--left" title="左" @pointerdown.prevent="ptzMove(d.address, cam.token, 'left')">◀</button>
+                <button class="wall__ptz-btn wall__ptz-btn--stop" title="停止" @pointerdown.prevent="ptzMove(d.address, cam.token, 'stop')">■</button>
+                <button class="wall__ptz-btn wall__ptz-btn--right" title="右" @pointerdown.prevent="ptzMove(d.address, cam.token, 'right')">▶</button>
+                <button class="wall__ptz-btn wall__ptz-btn--down" title="下" @pointerdown.prevent="ptzMove(d.address, cam.token, 'down')">▼</button>
+              </div>
+              <div class="wall__ptz-zoom">
+                <button class="wall__ptz-btn" title="变焦+（键盘 +）" @pointerdown.prevent="ptzMove(d.address, cam.token, 'zoom_in')">＋</button>
+                <button class="wall__ptz-btn" title="变焦-（键盘 -）" @pointerdown.prevent="ptzMove(d.address, cam.token, 'zoom_out')">－</button>
+              </div>
+            </div>
           </div>
         </div>
       </template>
@@ -737,10 +867,77 @@ function deviceLabel(d: WallDeviceView): string {
   color: var(--color-accent-red);
 }
 
+.wall__cell--zoomed {
+  grid-column: 1 / -1;
+  grid-row: 1 / -1;
+}
+
+/* ---- 悬停 PTZ 悬浮控制 ---- */
+.wall__ptz {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 5;
+  display: none;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.wall__cell:hover .wall__ptz {
+  display: flex;
+}
+
+.wall__ptz-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 28px);
+  grid-template-rows: repeat(3, 28px);
+  gap: 2px;
+  padding: 4px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.wall__ptz-btn--up { grid-column: 2; grid-row: 1; }
+.wall__ptz-btn--left { grid-column: 1; grid-row: 2; }
+.wall__ptz-btn--stop { grid-column: 2; grid-row: 2; }
+.wall__ptz-btn--right { grid-column: 3; grid-row: 2; }
+.wall__ptz-btn--down { grid-column: 2; grid-row: 3; }
+
+.wall__ptz-btn {
+  border: none;
+  background: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 0.72rem;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.wall__ptz-btn:hover {
+  background: rgba(0, 229, 160, 0.55);
+  color: #04110c;
+}
+
+.wall__ptz-zoom {
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.wall__ptz-zoom .wall__ptz-btn {
+  width: 28px;
+  height: 26px;
+}
+
 .wall__cell-body {
+  position: relative;
   flex: 1;
   min-height: 0;
-  cursor: pointer;
 }
 
 .wall__cell-body :deep(.cam-tile) {

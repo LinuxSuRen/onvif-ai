@@ -153,8 +153,8 @@ type DeviceEventPayload struct {
 	Time   string            `json:"time,omitempty"`   // 设备侧 UTC 时间
 }
 
-// WallCamera 是视频墙快照里的一路画面（视频墙设备每台只保留子码流
-// 一路；完整 profile 列表在详情页的 device_state 里）。
+// WallCamera 是视频墙快照里的一路画面（视频墙设备每台只保留所选
+// profile 集合；完整 profile 列表在详情页的 device_state 里）。
 type WallCamera struct {
 	Token     string `json:"token"`
 	Name      string `json:"name"`
@@ -163,6 +163,7 @@ type WallCamera struct {
 	MJPEG     bool   `json:"mjpeg"`
 	Width     int    `json:"width"`
 	Height    int    `json:"height"`
+	PTZ       bool   `json:"ptz"`
 }
 
 // WallDevice 是视频墙快照里的一台已连接设备。

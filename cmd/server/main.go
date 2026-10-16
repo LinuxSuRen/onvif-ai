@@ -1171,8 +1171,8 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 			log.Println("Conversation history cleared")
 			hub.BroadcastStatus(ws.StatusIdle)
 		},
-		func(camera, direction string) {
-			cm.handlePTZMove(camera, direction)
+		func(dev, camera, direction string) {
+			cm.handlePTZMove(dev, camera, direction)
 		},
 		func(mode string) {
 			log.Printf("Audio mode: %s", mode)
@@ -1187,18 +1187,29 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 	hub.BroadcastStatus(ws.StatusIdle)
 }
 
-func (cm *cameraManager) handlePTZMove(camera, direction string) {
+// handlePTZMove 处理一路画面的云台控制。dev 为空时作用于当前聚焦设备
+//（查看器路径）；视频墙路径携带目标设备地址，可控制任意已上墙设备。
+func (cm *cameraManager) handlePTZMove(dev, camera, direction string) {
 	cm.mu.Lock()
-	client := cm.onvifClient
+	var sess *deviceSession
+	if dev != "" {
+		sess, _ = cm.registry.Get(dev)
+	} else {
+		sess = cm.deviceSession
+	}
+	if sess == nil || sess.addr == "" {
+		sess = cm.deviceSession
+	}
+	client := sess.onvifClient
 	var target *camUnit
-	for _, u := range cm.units {
+	for _, u := range sess.units {
 		if camera != "" && u.token == camera {
 			target = u
 			break
 		}
 	}
-	if target == nil && len(cm.units) > 0 {
-		target = cm.units[0] // 未指定时回退到第一路
+	if target == nil && len(sess.units) > 0 {
+		target = sess.units[0] // 未指定时回退到第一路
 	}
 	cm.mu.Unlock()
 
@@ -1226,6 +1237,13 @@ func (cm *cameraManager) handlePTZMove(camera, direction string) {
 		zoom = 1.0
 	case "zoom_out":
 		zoom = -1.0
+	case "stop":
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := client.PTZStop(ctx, target.token); err != nil {
+			log.Printf("PTZ stop(%s) failed: %v", target.token, err)
+		}
+		return
 	default:
 		return
 	}
@@ -1379,6 +1397,7 @@ func (cm *cameraManager) wallState() []ws.WallDevice {
 				MJPEG:     u.mjpeg,
 				Width:     u.width,
 				Height:    u.height,
+				PTZ:       u.ptz,
 			})
 		}
 		out = append(out, wd)
