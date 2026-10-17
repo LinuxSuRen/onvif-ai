@@ -73,26 +73,26 @@ type CameraState struct {
 }
 
 type Handler struct {
-	hub            *ws.Hub
-	listener       *discovery.Listener
-	upgrader       websocket.Upgrader
-	deviceState    DeviceState
-	llmConfig      *LLMConfig
-	forwardConfig  *ForwardConfig
-	snapshotFPS    int
-	onConnect          func(address, username, password string)
-	onWallConnect      func(address, username, password string, profiles []string)
-	onWallDisconnect   func(address, profile string)
+	hub              *ws.Hub
+	listener         *discovery.Listener
+	upgrader         websocket.Upgrader
+	deviceState      DeviceState
+	llmConfig        *LLMConfig
+	forwardConfig    *ForwardConfig
+	snapshotFPS      int
+	onConnect        func(address, username, password string)
+	onWallConnect    func(address, username, password string, profiles []string)
+	onWallDisconnect func(address, profile string)
 	wallState        func() []ws.WallDevice
-	onAudioData    func([]byte)
-	onAudioStart   func()
-	onAudioStop    func()
-	onSpeechText   func(string)
-	onCameraListen func()
-	onClearHistory func()
-	onPTZMove      func(dev, camera, direction string, durationMs int64)
-	onSwitchMode   func(string)
-	onLLMUpdate    func(baseURL, apiKey, model string)
+	onAudioData      func([]byte)
+	onAudioStart     func()
+	onAudioStop      func()
+	onSpeechText     func(string)
+	onCameraListen   func()
+	onClearHistory   func()
+	onPTZMove        func(dev, camera, direction string, durationMs int64)
+	onSwitchMode     func(string)
+	onLLMUpdate      func(baseURL, apiKey, model string)
 	// onForwardUpdate 在转发配置保存成功后回调（携带合并后的完整配置），
 	// 由 main 换算成 forward.Config 热更新 Manager
 	onForwardUpdate func(ForwardConfig)
@@ -190,9 +190,9 @@ func (h *Handler) SetOnConnect(fn func(address, username, password string)) {
 }
 
 // SetWallCallbacks 注册视频墙连接管理回调：onWallConnect 上墙一台设备
-//（凭证由前端每次携带，后端不落盘；profile 为空时取子码流近似），
+// （凭证由前端每次携带，后端不落盘；profile 为空时取子码流近似），
 // onWallDisconnect 下墙一台设备，wallState 提供当前墙设备快照
-//（GET /api/wall/devices 与 WS 广播共用）。
+// （GET /api/wall/devices 与 WS 广播共用）。
 func (h *Handler) SetWallCallbacks(onWallConnect func(address, username, password string, profiles []string), onWallDisconnect func(address, profile string), wallState func() []ws.WallDevice) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

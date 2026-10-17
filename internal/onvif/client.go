@@ -277,6 +277,7 @@ func (c *Client) soapEnvelope(body string) string {
 	xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
 	xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
 	xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"
+	xmlns:timg="http://www.onvif.org/ver10/imaging/wsdl"
 	xmlns:tt="http://www.onvif.org/ver10/schema"
 	xmlns:xsd="http://www.w3.org/2001/XMLSchema"
 	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -285,13 +286,20 @@ func (c *Client) soapEnvelope(body string) string {
 }
 
 func (c *Client) soapCall(ctx context.Context, deviceAddr, serviceURL, action, body string) ([]byte, error) {
+	return c.soapCallDomain(ctx, deviceAddr, serviceURL, soapActionDomain(action), action, body)
+}
+
+// soapCallDomain 是 soapCall 的显式服务域版本：Imaging 等未在
+// soapActionDomain 登记动作名的服务（或与其它服务重名的动作，如
+// Imaging Stop vs PTZ Stop）用它指定 SOAPAction 所属域。
+func (c *Client) soapCallDomain(ctx context.Context, deviceAddr, serviceURL, domain, action, body string) ([]byte, error) {
 	/* WS-Security UsernameToken 按 ONVIF 规范置于 SOAP Header(非 HTTP 头),
 	 * 每次请求随机 nonce;首次使用前与设备对时,规避钟差导致的 digest 拒绝 */
 	if c.config.Username != "" {
 		c.clockOnce.Do(func() { c.syncClock(ctx) })
 		body = c.injectSecurityHeader(body)
 	}
-	return c.doSoapCall(ctx, serviceURL, action, body)
+	return c.doSoapCallDomain(ctx, serviceURL, domain, action, body)
 }
 
 /* AuthError 表示设备返回 401:CredentialsProvided 区分「未提供凭证」与
@@ -309,7 +317,14 @@ func (e *AuthError) Error() string {
 
 /* doSoapCall 发送 SOAP 请求并校验应答(不带任何认证注入) */
 func (c *Client) doSoapCall(ctx context.Context, serviceURL, action, body string) ([]byte, error) {
-	soapAction := fmt.Sprintf("http://www.onvif.org/ver10/%s/wsdl/%s", soapActionDomain(action), action)
+	return c.doSoapCallDomain(ctx, serviceURL, soapActionDomain(action), action, body)
+}
+
+// doSoapCallDomain 以显式服务域构造 SOAPAction。同一操作名可能同时
+// 存在于多个服务（PTZ 与 Imaging 都有 Stop），按调用方所属服务路由
+// 而非按名字猜测；校验 SOAPAction 头的设备会拒绝域不匹配的请求。
+func (c *Client) doSoapCallDomain(ctx context.Context, serviceURL, domain, action, body string) ([]byte, error) {
+	soapAction := fmt.Sprintf("http://www.onvif.org/ver10/%s/wsdl/%s", domain, action)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", serviceURL, strings.NewReader(body))
 	if err != nil {
@@ -549,8 +564,9 @@ func (c *Client) PTZGotoHomePosition(ctx context.Context, profileToken string) e
 }
 
 // ImagingFocusMove 以连续速度调整焦距（对焦）：speed 取 (-1,1)，
-// 正值向远（FAR）对焦、负值向近（NEAR）对焦。携带 10s 超时：部分
-// 固件的 Imaging Stop 返回 500（海康实测），超时保证移动自终止。
+// 正值向远（FAR）对焦、负值向近（NEAR）对焦。停止依赖 Stop（失败时
+// 本方法以零速度兜底），设备侧无超时参数——Move 操作按 WSDL 只有
+// ProfileToken + Focus，不能夹带 Timeout 子元素（严格校验的设备会拒收）。
 func (c *Client) ImagingFocusMove(ctx context.Context, profileToken string, speed float64) error {
 	if err := c.discoverServices(ctx); err != nil {
 		return err
@@ -564,11 +580,10 @@ func (c *Client) ImagingFocusMove(ctx context.Context, profileToken string, spee
 					<tt:Speed>%f</tt:Speed>
 				</timg:Continuous>
 			</timg:Focus>
-			<timg:Timeout>%s</timg:Timeout>
 		</timg:Move>
-	`, xmlEscape(profileToken), speed, formatISO8601(10*time.Second)))
+	`, xmlEscape(profileToken), speed))
 
-	resp, err := c.soapCall(ctx, c.deviceURL(), c.imagingURL(), "Move", body)
+	resp, err := c.soapCallDomain(ctx, c.deviceURL(), c.imagingURL(), "imaging", "Move", body)
 	if err != nil {
 		return err
 	}
@@ -589,7 +604,7 @@ func (c *Client) ImagingFocusStop(ctx context.Context, profileToken string) erro
 		</timg:Stop>
 	`, xmlEscape(profileToken)))
 
-	if _, err := c.soapCall(ctx, c.deviceURL(), c.imagingURL(), "Stop", body); err == nil {
+	if _, err := c.soapCallDomain(ctx, c.deviceURL(), c.imagingURL(), "imaging", "Stop", body); err == nil {
 		return nil
 	}
 	// 兜底：零速度连续移动在绝大多数实现里等价于停止
@@ -608,7 +623,7 @@ func (c *Client) ImagingSetAutoFocus(ctx context.Context, profileToken string, a
 			<timg:ProfileToken>%s</timg:ProfileToken>
 		</timg:GetImagingSettings>
 	`, xmlEscape(profileToken)))
-	resp, err := c.soapCall(ctx, c.deviceURL(), c.imagingURL(), "GetImagingSettings", getBody)
+	resp, err := c.soapCallDomain(ctx, c.deviceURL(), c.imagingURL(), "imaging", "GetImagingSettings", getBody)
 	if err != nil {
 		return err
 	}
@@ -627,7 +642,7 @@ func (c *Client) ImagingSetAutoFocus(ctx context.Context, profileToken string, a
 		</timg:SetImagingSettings>
 	`, xmlEscape(profileToken), settings))
 
-	resp2, err := c.soapCall(ctx, c.deviceURL(), c.imagingURL(), "SetImagingSettings", setBody)
+	resp2, err := c.soapCallDomain(ctx, c.deviceURL(), c.imagingURL(), "imaging", "SetImagingSettings", setBody)
 	if err != nil {
 		return err
 	}

@@ -263,7 +263,7 @@ func (l *streamLife) stop() {
 }
 
 // isCurrentSession 报告 life 是否仍是该会话的活跃连接代际：会话被拆解
-//（teardownSession 将 life 置 nil）或被重连替换后，旧代次的循环据此退出。
+// （teardownSession 将 life 置 nil）或被重连替换后，旧代次的循环据此退出。
 func (cm *cameraManager) isCurrentSession(sess *deviceSession, life *streamLife) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -449,6 +449,10 @@ func (cm *cameraManager) startSession(address, username, password string, profil
 			}
 			cm.hub.BroadcastConnectError(address, code)
 		}
+		// 失败必须拆会话：否则 registry 残留 state=connecting 的僵尸条目，
+		// wall_state 永远显示「连接中」，且前端把该地址当作已在墙上
+		// 禁止重新添加（teardownSession 对已被替换的会话幂等）
+		cm.teardownSession(sess)
 		return
 	}
 
@@ -466,6 +470,7 @@ func (cm *cameraManager) startSession(address, username, password string, profil
 		}
 		if len(filtered) == 0 {
 			cm.hub.BroadcastError("指定的画面（profile）不存在或不可用")
+			cm.teardownSession(sess)
 			return
 		}
 		profiles = filtered
@@ -479,6 +484,7 @@ func (cm *cameraManager) startSession(address, username, password string, profil
 	if len(profiles) == 0 {
 		cm.hub.BroadcastError("摄像头未返回任何媒体配置（profile），无法取流")
 		cm.handler.SetDeviceState(true, false, false, address)
+		cm.teardownSession(sess)
 		return
 	}
 
@@ -1188,7 +1194,7 @@ func setupVoiceCallbacks(h *server.Handler, hub *ws.Hub, cm *cameraManager) {
 }
 
 // handlePTZMove 处理一路画面的云台控制。dev 为空时作用于当前聚焦设备
-//（查看器路径）；视频墙路径携带目标设备地址，可控制任意已上墙设备。
+// （查看器路径）；视频墙路径携带目标设备地址，可控制任意已上墙设备。
 // durationMs 为按住场景的长时长（缺省 2s 点动；上限 60s 防丢停止事件
 // 后云台失控常转）。
 func (cm *cameraManager) handlePTZMove(dev, camera, direction string, durationMs int64) {
@@ -1298,7 +1304,10 @@ func (cm *cameraManager) handlePTZMove(dev, camera, direction string, durationMs
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second+duration)
 	defer cancel()
 
-	if err := client.PTZContinuousMove(ctx, target.token, pan, tilt, zoom, 2*time.Second); err != nil {
+	// duration 必须下发为 ContinuousMove 的设备侧 Timeout：它是相机在
+	// 收不到 Stop 时自动停转的唯一保险（丢停止事件防失控），同时也让
+	// 「按住连转」在规范设备上真正持续整个按住时长，而非每次 2 秒。
+	if err := client.PTZContinuousMove(ctx, target.token, pan, tilt, zoom, duration); err != nil {
 		log.Printf("PTZ move %s(%s) failed: %v", direction, target.token, err)
 		cm.hub.BroadcastError("云台转动失败: " + err.Error())
 		return
