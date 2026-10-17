@@ -77,13 +77,17 @@ async function fetchDeviceInfo(addr: string) {
   if (deviceInfoMap[addr]?.data || deviceInfoMap[addr]?.loading) return
   deviceInfoMap[addr] = { loading: true }
   try {
+    // 凭证经 POST body 传输:URL query 会被访问日志明文记录
     const cred = deviceCreds[addr]
-    const q = new URLSearchParams({ address: addr })
-    if (cred?.username) {
-      q.set('username', cred.username)
-      q.set('password', cred.password)
-    }
-    const resp = await fetch(`/api/camera/device-info?${q}`)
+    const resp = await fetch('/api/camera/device-info', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        address: addr,
+        username: cred?.username || '',
+        password: cred?.password || '',
+      }),
+    })
     if (resp.ok) {
       deviceInfoMap[addr] = { loading: false, data: await resp.json() }
     } else {
