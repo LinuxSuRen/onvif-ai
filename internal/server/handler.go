@@ -287,7 +287,10 @@ func (h *Handler) RegisterRoutes() http.Handler {
 	r.Post("/api/wall/connect", h.handleWallConnect)
 	r.Post("/api/wall/disconnect", h.handleWallDisconnect)
 	r.Get("/api/wall/devices", h.handleWallDevices)
+	// GET 仅收地址参数;带凭证查询走 POST body——凭证进 URL query 会被
+	// 访问日志(chi middleware.Logger 打印完整 URL)以明文落盘
 	r.Get("/api/camera/device-info", h.handleDeviceInfo)
+	r.Post("/api/camera/device-info", h.handleDeviceInfo)
 	r.Get("/api/llm/config", h.handleLLMGetConfig)
 	r.Post("/api/llm/config", h.handleLLMSetConfig)
 	r.Get("/api/forward/config", h.handleForwardGetConfig)
@@ -448,6 +451,20 @@ func (h *Handler) handleWallDevices(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 	address := r.URL.Query().Get("address")
+	username := ""
+	password := ""
+	if r.Method == http.MethodPost {
+		var req struct {
+			Address  string `json:"address"`
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+			return
+		}
+		address, username, password = req.Address, req.Username, req.Password
+	}
 	if address == "" {
 		http.Error(w, `{"error":"missing address"}`, http.StatusBadRequest)
 		return
@@ -455,8 +472,8 @@ func (h *Handler) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 
 	client := onvif.NewClient(onvif.Config{
 		DeviceAddr: address,
-		Username:   r.URL.Query().Get("username"),
-		Password:   r.URL.Query().Get("password"),
+		Username:   username,
+		Password:   password,
 		Timeout:    5 * time.Second,
 	})
 
