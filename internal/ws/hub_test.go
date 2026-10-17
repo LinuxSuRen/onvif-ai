@@ -188,7 +188,7 @@ func TestVideoBroadcastRouting(t *testing.T) {
 }
 
 // TestTileLevelRouting 视频墙核心语义（#39）：一条连接可以按画面
-//（dev+cam 复合键）精确订阅——只订阅 dev1/cam1 的连接收不到
+// （dev+cam 复合键）精确订阅——只订阅 dev1/cam1 的连接收不到
 // dev2/cam1 与 dev1/cam2 的帧；追加订阅后两路都送达。
 func TestTileLevelRouting(t *testing.T) {
 	hub := NewHub()
@@ -252,14 +252,17 @@ func TestViewControlMessageContract(t *testing.T) {
 // TestJPEGClearsSkipUntilKey 锁定 JPEG 路的关键帧语义回归：JPEG 每帧
 // 独立可解、Key 恒为 true——丢帧模式下 JPEG 必须照常送达并解除该路的
 // 丢帧状态，否则快照/MJPEG 相机在慢客户端一次满仓后永久冻结。
+// 全程直接调 dispatch（Run 循环外）：dispatch 约定仅由 Run 单线程调用，
+// 测试线程与 Run 并发同时调它会写同一份 send/skipUntilKey（仅 RLock），
+// 是 -race 可检出的人类错误，而非待测语义。
 func TestJPEGClearsSkipUntilKey(t *testing.T) {
 	hub := NewHub()
-	go hub.Run()
 	viewer := newDirectClient(hub)
 	route := VideoRouteKey("dev1", "cam1")
 	hub.SetVideoView(viewer, "dev1", "cam1", true)
 
 	frag, _ := json.Marshal(&Message{Type: MsgTypeVideoFMP4, Dev: "dev1", Cam: "cam1", Kind: "frag"})
+	jpeg, _ := json.Marshal(&Message{Type: MsgTypeVideoJPEG, Dev: "dev1", Cam: "cam1", Key: true})
 
 	// 灌满 send 缓冲后投递非关键帧 → 进入丢帧模式
 	for len(viewer.send) < cap(viewer.send) {
@@ -272,8 +275,9 @@ func TestJPEGClearsSkipUntilKey(t *testing.T) {
 	hub.dispatch(frag, route, false)
 	expectNothing(t, "viewer during skip", viewer.send)
 
-	// JPEG 帧必须穿透丢帧模式送达（Key=true），并解除丢帧
-	hub.BroadcastVideoJPEG("dev1", "cam1", []byte{0xFF, 0xD8, 0xFF, 0xE0})
+	// JPEG 帧（idr=true，与 BroadcastVideoJPEG 的 Key 语义一致）必须
+	// 穿透丢帧模式送达，并解除丢帧
+	hub.dispatch(jpeg, route, true)
 	if m := expectReceived(t, viewer.send); m.Type != MsgTypeVideoJPEG {
 		t.Fatalf("expected video_jpeg delivered during skip mode, got %+v", m)
 	}
