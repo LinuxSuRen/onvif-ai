@@ -25,13 +25,15 @@ interface CamInfo {
 
 const connectionStatus = ref<'disconnected' | 'connecting' | 'connected'>('connecting')
 const cameras = ref<CamInfo[]>([])
+// 当前聚焦设备地址（device_state 携带）：视频帧的 dev 路由键来源
+const focusedDev = ref('')
 const mode = ref<'grid' | 'single'>(
   (localStorage.getItem('onvif-ai-view-mode') as 'grid' | 'single') || 'single',
 )
 const activeCam = ref('')
 const videoError = ref('')
-// 画面开关（issue #26）：默认不自动播放，用户点击占位符后才向服务端
-// 请求视频帧。服务端按连接记忆该状态，断线重连是新连接，需要重发 start。
+// 画面开关（issue #26）：默认不自动播放，用户点击占位符后按当前可见的
+// 画面逐路订阅（dev+cam）。服务端按连接记忆订阅集，断线重连需重发 start。
 const viewing = ref(false)
 
 const { isConnected, isConnecting, send, subscribe } = useWebSocket('/ws')
@@ -48,7 +50,7 @@ function handleMessage(msg: WsMessage) {
       const codec = msg.codec || ''
       const ts = msg.ts
       const key = !!msg.key
-      routeToTile(msg.cam, (tile) => tile.feedFMP4(kind, codec, seg, ts, key))
+      routeToTile(msg, (tile) => tile.feedFMP4(kind, codec, seg, ts, key))
     }
     return
   }
@@ -56,7 +58,7 @@ function handleMessage(msg: WsMessage) {
     lastFrameTime = Date.now()
     if (!paused.value) {
       const data = msg.data
-      routeToTile(msg.cam, (tile) => tile.feedJpeg(data))
+      routeToTile(msg, (tile) => tile.feedJpeg(data))
     }
     return
   }
@@ -80,15 +82,16 @@ subscribe(['video_fmp4', 'video_jpeg', 'device_state', 'clock_sync', 'error'], h
 
 // tile 自注册表：v-for 的函数 ref 在模式切换时挂载/卸载回调顺序不确定，
 // 由 CameraTile 在自身生命周期内注册/注销，避免 Map 被旧实例误删。
+// 键为 dev+'/'+token 复合键（与 WS 帧路由一致）。
 interface TileAPI {
   feedFMP4: (kind: string, codec: string, data: string, serverTs?: number, key?: boolean) => void
   feedJpeg: (data: string) => void
 }
 const tiles = new Map<string, TileAPI>()
 provide('cameraTileRegistry', {
-  register: (token: string, api: TileAPI) => tiles.set(token, api),
-  unregister: (token: string, api: TileAPI) => {
-    if (tiles.get(token) === api) tiles.delete(token)
+  register: (routeKey: string, api: TileAPI) => tiles.set(routeKey, api),
+  unregister: (routeKey: string, api: TileAPI) => {
+    if (tiles.get(routeKey) === api) tiles.delete(routeKey)
   },
 })
 
@@ -99,29 +102,67 @@ const activeCamera = computed(
 )
 
 function setMode(m: 'grid' | 'single') {
+  if (mode.value === m) return
+  // 订阅集跟随可见画面切换：退订旧集合再订阅新集合
+  if (viewing.value) unsubscribeCams(visibleCams())
   mode.value = m
   localStorage.setItem('onvif-ai-view-mode', m)
+  if (viewing.value) subscribeCams(visibleCams())
 }
 
 function switchCamera(token: string) {
+  if (activeCam.value === token) return
+  if (viewing.value && mode.value === 'single') unsubscribeCams(visibleCams())
   activeCam.value = token
+  if (viewing.value && mode.value === 'single') subscribeCams(visibleCams())
 }
 
-// 用户点击占位符打开画面：只需发一次 start，服务端会持续推帧到本连接
+// 用户点击占位符打开画面：按当前模式逐路订阅（多画面=全部，单画面=当前路）
+function visibleCams(): CamInfo[] {
+  if (mode.value === 'grid' || !activeCam.value) return cameras.value
+  return cameras.value.filter((c) => c.token === activeCam.value)
+}
+
+function subscribeCams(cams: CamInfo[]) {
+  const dev = focusedDev.value
+  if (!dev) return
+  for (const cam of cams) {
+    send({ type: 'view_control', payload: { action: 'start', dev, cam: cam.token } })
+  }
+}
+
+function unsubscribeCams(cams: CamInfo[]) {
+  const dev = focusedDev.value
+  if (!dev) return
+  for (const cam of cams) {
+    send({ type: 'view_control', payload: { action: 'stop', dev, cam: cam.token } })
+  }
+}
+
 function openView() {
   if (viewing.value) return
   viewing.value = true
-  send({ type: 'view_control', payload: { action: 'start' } })
+  subscribeCams(visibleCams())
 }
 
 function camDisplayName(cam: CamInfo, index: number) {
   return cam.name || `摄像头 ${index + 1}`
 }
 
+// PTZ：hold:xxx = 按住连转（30s 上限后端钳制），stop = 松开停止，
+// home = 回中。dev 携带聚焦设备地址（后端据此路由到对应会话）
 function ptzMove(direction: string) {
   const cam = activeCamera.value
   if (!cam) return
-  send({ type: 'ptz_move', payload: { camera: cam.token, direction } })
+  let action = direction
+  let durationMs: number | undefined
+  if (action.startsWith('hold:')) {
+    action = action.slice(5)
+    durationMs = 30000
+  }
+  const payload: Record<string, unknown> = { dev: focusedDev.value, camera: cam.token, direction: action }
+  if (durationMs) payload.duration_ms = durationMs
+  send({ type: 'ptz_move', payload })
 }
 
 // ---- 时钟同步：为各路延迟测量提供统一的时钟偏移 ----
@@ -151,9 +192,10 @@ const resetKey = ref(0)
 watch(isConnected, (connected) => {
   if (connected) {
     connectionStatus.value = 'connected'
-    // 服务端按连接记忆画面开关：重连后默认回到关闭，已打开过则重发 start
+    // 服务端按连接记忆订阅集：重连后回到空订阅，已打开过则按当前可见
+    // 画面重新逐路订阅
     if (viewing.value) {
-      send({ type: 'view_control', payload: { action: 'start' } })
+      subscribeCams(visibleCams())
     }
     bestSyncRtt = Number.POSITIVE_INFINITY
     clockOffsetRef.value = null
@@ -182,16 +224,18 @@ let lastFrameTime = 0
 
 
 
-function routeToTile(cam: string | undefined, feed: (tile: TileAPI) => void) {
+function routeToTile(msg: WsMessage, feed: (tile: TileAPI) => void) {
   if (!cameras.value.length) return
-  const token = cam || cameras.value[0].token
-  const tile = tiles.get(token)
+  const dev = msg.dev || focusedDev.value
+  const token = msg.cam || cameras.value[0].token
+  const tile = tiles.get(`${dev}/${token}`)
   if (tile) {
     feed(tile)
   }
 }
 
 function applyDeviceState(state: any) {
+  if (state.address) focusedDev.value = state.address
   const list: CamInfo[] = (state.cameras || []).map((c: any) => ({
     token: c.token,
     name: c.name || c.token,
@@ -298,6 +342,7 @@ onUnmounted(() => {
         <CameraTile
           v-for="cam in cameras"
           :key="cam.token"
+          :dev="focusedDev"
           :cam="cam"
           :active="false"
           :show-label="true"
@@ -311,6 +356,7 @@ onUnmounted(() => {
         <CameraTile
           v-for="cam in cameras.filter((c) => c.token === activeCam)"
           :key="cam.token"
+          :dev="focusedDev"
           :cam="cam"
           :active="true"
           :show-label="false"

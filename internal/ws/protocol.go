@@ -20,7 +20,7 @@ const (
 	MsgTypeTalkbackStart MessageType = "talkback_start" // Start intercom session (browser mic → camera speaker)
 	MsgTypeAudioIn       MessageType = "audio_in"       // Intercom audio chunk (base64 PCM16 16k mono)
 	MsgTypeTalkbackStop  MessageType = "talkback_stop"  // Stop intercom session
-	MsgTypeViewControl   MessageType = "view_control"   // Open/close video push for this connection (start/stop)
+	MsgTypeViewControl   MessageType = "view_control"   // Open/close video push per tile (start/stop, dev+cam)
 
 	// Server → Client
 	MsgTypeVideoNAL      MessageType = "video_nal"      // H.264 NAL unit (base64)（旧路径，保留兼容）
@@ -35,6 +35,7 @@ const (
 	MsgTypeTalkbackState MessageType = "talkback_state" // Intercom session accept/reject result
 	MsgTypeConnectError  MessageType = "connect_error"  // Structured connect failure (stable code)
 	MsgTypeDeviceEvent   MessageType = "device_event"   // ONVIF device event (SignalLoss/Motion/Battery/AuthFailure)
+	MsgTypeWallState     MessageType = "wall_state"     // Video wall: all connected devices snapshot
 )
 
 // Message is the JSON envelope for all WebSocket messages.
@@ -47,10 +48,11 @@ type Message struct {
 	// received from the RTSP source; used by the browser to measure latency.
 	Ts int64 `json:"ts,omitempty"`
 	// Cam identifies which camera (media profile token) a frame belongs to
-	// when a single ONVIF device exposes multiple cameras. Empty in the
-	// legacy single-camera case, where the frontend treats it as the only
-	// camera.
+	// when a single ONVIF device exposes multiple cameras.
 	Cam string `json:"cam,omitempty"`
+	// Dev identifies which ONVIF device a frame belongs to（连接时的设备
+	// 地址）。视频帧以 dev+cam 为复合键路由到订阅了该画面的连接。
+	Dev string `json:"dev,omitempty"`
 	// Kind 限定 video_fmp4 消息：init（初始化段）或 frag（媒体段）。
 	Kind string `json:"kind,omitempty"`
 	// Key 标记 video_fmp4/frag 是否关键帧；hub 丢帧时据此实现"丢到下个
@@ -106,11 +108,14 @@ const (
 	ViewActionStop  = "stop"  // 该连接停止接收视频帧
 )
 
-// ViewControlPayload 是 view_control 消息的负载。视频帧带宽高，
-// 页面打开不等于用户想看画面，因此服务端默认不向新连接推送视频，
-// 由用户点击画面前景占位符后显式请求（issue #26）。
+// ViewControlPayload 是 view_control 消息的负载。视频帧带宽高，页面
+// 打开不等于用户想看画面：服务端默认不向新连接推送视频，由前端按
+// tile 显式订阅（issue #26）。订阅粒度是 dev+cam 复合键——视频墙场景
+// 下一条连接可以只订多台设备中的可见画面（#39）。
 type ViewControlPayload struct {
 	Action string `json:"action"` // start / stop，见 ViewAction* 常量
+	Dev    string `json:"dev"`    // 目标设备地址
+	Cam    string `json:"cam"`    // 目标 media profile token
 }
 
 // TalkbackSessionPayload 是 talkback_state 消息的负载：服务器对
@@ -146,6 +151,32 @@ type DeviceEventPayload struct {
 	Data   map[string]string `json:"data,omitempty"`
 	Device string            `json:"device,omitempty"` // 设备地址
 	Time   string            `json:"time,omitempty"`   // 设备侧 UTC 时间
+}
+
+// WallCamera 是视频墙快照里的一路画面（视频墙设备每台只保留所选
+// profile 集合；完整 profile 列表在详情页的 device_state 里）。
+type WallCamera struct {
+	Token     string `json:"token"`
+	Name      string `json:"name"`
+	Streaming bool   `json:"streaming"`
+	Snapshot  bool   `json:"snapshot"`
+	MJPEG     bool   `json:"mjpeg"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+	PTZ       bool   `json:"ptz"`
+}
+
+// WallDevice 是视频墙快照里的一台已连接设备。
+type WallDevice struct {
+	Address string       `json:"address"`
+	State   string       `json:"state"` // connecting / streaming / snapshot / offline
+	Cameras []WallCamera `json:"cameras"`
+}
+
+// WallStatePayload 是 wall_state 消息的负载：视频墙上全部已连接设备的
+// 快照，设备增删与画面状态变化时全员广播，前端初始加载走 REST 快照。
+type WallStatePayload struct {
+	Devices []WallDevice `json:"devices"`
 }
 
 // WithData sets the data field (base64).

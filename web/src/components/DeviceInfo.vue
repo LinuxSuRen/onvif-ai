@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, reactive, nextTick } from 'vue'
 import { useWebSocket } from '../composables/useWebSocket'
+import { saveDiscovered } from '../composables/useDiscoveredDevices'
 
 interface DiscoveredDevice {
   address: string
@@ -186,6 +187,9 @@ async function discoverDevices() {
     devices.value = data.devices || []
     if (devices.value.length === 0) {
       discoverError.value = '未发现 ONVIF 设备'
+    } else {
+      // 写入共享缓存（sessionStorage）：视频墙添加设备时直接可选
+      saveDiscovered(devices.value)
     }
   } catch (e) {
     discoverError.value = '搜索失败: ' + (e instanceof Error ? e.message : '网络错误')

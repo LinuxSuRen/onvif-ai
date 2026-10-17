@@ -12,6 +12,8 @@ import { ref, computed, watch, onMounted, onUnmounted, inject } from 'vue'
  * RTSPtoWeb 模式一致）。
  */
 const props = defineProps<{
+  // dev 是该画面所属设备的地址（与 cam 的 token 组成订阅/路由键）
+  dev: string
   cam: {
     token: string
     name: string
@@ -67,11 +69,14 @@ let latencyTimer: ReturnType<typeof setInterval> | null = null
 let evictTimer: ReturnType<typeof setInterval> | null = null
 let lastCatchUpAt = 0
 
-// 向父组件注册本 tile 的数据入口（生命周期内自管理，避免 ref 顺序竞态）
+// 向父组件注册本 tile 的数据入口（生命周期内自管理，避免 ref 顺序竞态）。
+// 注册键是 dev+'/'+token 复合键，与 WS 帧路由一致。
 const registry = inject<{
-  register: (token: string, api: { feedFMP4: typeof feedFMP4; feedJpeg: typeof feedJpeg }) => void
-  unregister: (token: string, api: { feedFMP4: typeof feedFMP4; feedJpeg: typeof feedJpeg }) => void
+  register: (routeKey: string, api: { feedFMP4: typeof feedFMP4; feedJpeg: typeof feedJpeg }) => void
+  unregister: (routeKey: string, api: { feedFMP4: typeof feedFMP4; feedJpeg: typeof feedJpeg }) => void
 } | null>('cameraTileRegistry', null)
+
+const routeKey = () => `${props.dev}/${props.cam.token}`
 
 function destroyPipeline() {
   appendQueue.length = 0
@@ -303,11 +308,11 @@ onMounted(() => {
   }
   latencyTimer = setInterval(measurePresentationLag, 500)
   evictTimer = setInterval(evictBuffer, 5000)
-  registry?.register(props.cam.token, { feedFMP4, feedJpeg })
+  registry?.register(routeKey(), { feedFMP4, feedJpeg })
 })
 
 onUnmounted(() => {
-  registry?.unregister(props.cam.token, { feedFMP4, feedJpeg })
+  registry?.unregister(routeKey(), { feedFMP4, feedJpeg })
   videoRef.value?.removeEventListener('error', onVideoElementError)
   if (latencyTimer) clearInterval(latencyTimer)
   if (evictTimer) clearInterval(evictTimer)
@@ -392,6 +397,7 @@ watch(
 function ptzMove(direction: string) {
   emit('ptz', direction)
 }
+void ptzMove
 
 defineExpose({ feedFMP4, feedJpeg })
 </script>
@@ -427,10 +433,59 @@ defineExpose({ feedFMP4, feedJpeg })
     </div>
 
     <div v-if="active && cam.ptz && cam.streaming" class="cam-tile__ptz">
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--up" @pointerdown.prevent="ptzMove('up')">▲</button>
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--left" @pointerdown.prevent="ptzMove('left')">◀</button>
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--right" @pointerdown.prevent="ptzMove('right')">▶</button>
-      <button class="cam-tile__ptz-btn cam-tile__ptz-btn--down" @pointerdown.prevent="ptzMove('down')">▼</button>
+      <button
+        class="cam-tile__ptz-btn cam-tile__ptz-btn--up"
+        title="上（按住转动）"
+        @pointerdown.prevent="emit('ptz', 'hold:up')"
+        @pointerup="emit('ptz', 'stop')"
+        @pointerleave="emit('ptz', 'stop')"
+        @pointercancel="emit('ptz', 'stop')"
+      >▲</button>
+      <button
+        class="cam-tile__ptz-btn cam-tile__ptz-btn--left"
+        title="左（按住转动）"
+        @pointerdown.prevent="emit('ptz', 'hold:left')"
+        @pointerup="emit('ptz', 'stop')"
+        @pointerleave="emit('ptz', 'stop')"
+        @pointercancel="emit('ptz', 'stop')"
+      >◀</button>
+      <button
+        class="cam-tile__ptz-btn cam-tile__ptz-btn--home"
+        title="回到初始位置"
+        @pointerdown.prevent="emit('ptz', 'home')"
+      >⌂</button>
+      <button
+        class="cam-tile__ptz-btn cam-tile__ptz-btn--right"
+        title="右（按住转动）"
+        @pointerdown.prevent="emit('ptz', 'hold:right')"
+        @pointerup="emit('ptz', 'stop')"
+        @pointerleave="emit('ptz', 'stop')"
+        @pointercancel="emit('ptz', 'stop')"
+      >▶</button>
+      <button
+        class="cam-tile__ptz-btn cam-tile__ptz-btn--down"
+        title="下（按住转动）"
+        @pointerdown.prevent="emit('ptz', 'hold:down')"
+        @pointerup="emit('ptz', 'stop')"
+        @pointerleave="emit('ptz', 'stop')"
+        @pointercancel="emit('ptz', 'stop')"
+      >▼</button>
+      <button
+        class="cam-tile__ptz-btn cam-tile__ptz-btn--zoomin"
+        title="变焦+（按住）"
+        @pointerdown.prevent="emit('ptz', 'hold:zoom_in')"
+        @pointerup="emit('ptz', 'stop')"
+        @pointerleave="emit('ptz', 'stop')"
+        @pointercancel="emit('ptz', 'stop')"
+      >＋</button>
+      <button
+        class="cam-tile__ptz-btn cam-tile__ptz-btn--zoomout"
+        title="变焦-（按住）"
+        @pointerdown.prevent="emit('ptz', 'hold:zoom_out')"
+        @pointerup="emit('ptz', 'stop')"
+        @pointerleave="emit('ptz', 'stop')"
+        @pointercancel="emit('ptz', 'stop')"
+      >－</button>
     </div>
 
     <div v-if="!hasVideo && !decodeDegraded" class="cam-tile__placeholder">暂无画面</div>
@@ -574,12 +629,24 @@ defineExpose({ feedFMP4, feedJpeg })
   grid-column: 1;
   grid-row: 2;
 }
+.cam-tile__ptz-btn--home {
+  grid-column: 2;
+  grid-row: 2;
+}
 .cam-tile__ptz-btn--right {
   grid-column: 3;
   grid-row: 2;
 }
 .cam-tile__ptz-btn--down {
   grid-column: 2;
+  grid-row: 3;
+}
+.cam-tile__ptz-btn--zoomin {
+  grid-column: 1;
+  grid-row: 3;
+}
+.cam-tile__ptz-btn--zoomout {
+  grid-column: 3;
   grid-row: 3;
 }
 

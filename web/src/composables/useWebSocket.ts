@@ -4,10 +4,11 @@ import { ref } from 'vue'
  * WebSocket message from the ONVIF AI backend.
  */
 export interface WsMessage {
-  type: 'video_fmp4' | 'video_nal' | 'video_jpeg' | 'audio_out' | 'transcript' | 'status' | 'error' | 'audio_start' | 'audio_data' | 'audio_stop' | 'speech_text' | 'switch_mode' | 'device_state' | 'ptz_move' | 'camera_listen' | 'clear_history' | 'clock_sync' | 'talkback_start' | 'audio_in' | 'talkback_stop' | 'talkback_state' | 'view_control' | 'connect_error' | 'device_event'
+  type: 'video_fmp4' | 'video_nal' | 'video_jpeg' | 'audio_out' | 'transcript' | 'status' | 'error' | 'audio_start' | 'audio_data' | 'audio_stop' | 'speech_text' | 'switch_mode' | 'device_state' | 'ptz_move' | 'camera_listen' | 'clear_history' | 'clock_sync' | 'talkback_start' | 'audio_in' | 'talkback_stop' | 'talkback_state' | 'view_control' | 'connect_error' | 'device_event' | 'wall_state'
   data?: string
   text?: string
   ts?: number
+  dev?: string // 帧所属设备地址（与 cam 组成复合路由键）
   cam?: string
   kind?: string // video_fmp4: init / frag
   key?: boolean // video_fmp4: 是否关键帧
@@ -16,6 +17,24 @@ export interface WsMessage {
     state?: string
     [key: string]: unknown
   }
+}
+
+/** wall_state 消息的负载（与后端 ws.WallStatePayload 对应） */
+export interface WallStateData {
+  devices: Array<{
+    address: string
+    state: string // connecting / online
+    cameras: Array<{
+      token: string
+      name: string
+      ptz: boolean
+      streaming: boolean
+      snapshot: boolean
+      mjpeg: boolean
+      width: number
+      height: number
+    }>
+  }>
 }
 
 /** device_event 消息的负载（与后端 ws.DeviceEventPayload 对应） */

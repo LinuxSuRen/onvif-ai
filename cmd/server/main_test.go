@@ -14,7 +14,12 @@ import (
 func newTestCameraManager() *cameraManager {
 	hub := ws.NewHub()
 	h := server.NewHandler(hub, nil)
-	return &cameraManager{hub: hub, handler: h}
+	return &cameraManager{
+		hub:           hub,
+		handler:       h,
+		deviceSession: &deviceSession{},
+		registry:      newDeviceRegistry(),
+	}
 }
 
 // TestBeginTalkbackLifecycle 校验会话受理的先到先得：

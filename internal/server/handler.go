@@ -80,14 +80,17 @@ type Handler struct {
 	llmConfig      *LLMConfig
 	forwardConfig  *ForwardConfig
 	snapshotFPS    int
-	onConnect      func(address, username, password string)
+	onConnect          func(address, username, password string)
+	onWallConnect      func(address, username, password string, profiles []string)
+	onWallDisconnect   func(address, profile string)
+	wallState        func() []ws.WallDevice
 	onAudioData    func([]byte)
 	onAudioStart   func()
 	onAudioStop    func()
 	onSpeechText   func(string)
 	onCameraListen func()
 	onClearHistory func()
-	onPTZMove      func(camera, direction string)
+	onPTZMove      func(dev, camera, direction string, durationMs int64)
 	onSwitchMode   func(string)
 	onLLMUpdate    func(baseURL, apiKey, model string)
 	// onForwardUpdate 在转发配置保存成功后回调（携带合并后的完整配置），
@@ -167,7 +170,7 @@ func NewHandler(hub *ws.Hub, listener *discovery.Listener) *Handler {
 	}
 }
 
-func (h *Handler) SetCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onClear func(), onPTZ func(camera, direction string), onMode func(string)) {
+func (h *Handler) SetCallbacks(onData func([]byte), onStart func(), onStop func(), onSpeech func(string), onCamera func(), onClear func(), onPTZ func(dev, camera, direction string, durationMs int64), onMode func(string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onAudioData = onData
@@ -184,6 +187,18 @@ func (h *Handler) SetOnConnect(fn func(address, username, password string)) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.onConnect = fn
+}
+
+// SetWallCallbacks 注册视频墙连接管理回调：onWallConnect 上墙一台设备
+//（凭证由前端每次携带，后端不落盘；profile 为空时取子码流近似），
+// onWallDisconnect 下墙一台设备，wallState 提供当前墙设备快照
+//（GET /api/wall/devices 与 WS 广播共用）。
+func (h *Handler) SetWallCallbacks(onWallConnect func(address, username, password string, profiles []string), onWallDisconnect func(address, profile string), wallState func() []ws.WallDevice) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onWallConnect = onWallConnect
+	h.onWallDisconnect = onWallDisconnect
+	h.wallState = wallState
 }
 
 // SetTalkbackCallbacks 注册对讲（浏览器麦克风 → 摄像头扬声器）会话回调。
@@ -267,7 +282,11 @@ func (h *Handler) RegisterRoutes() http.Handler {
 	r.Get("/health", h.handleHealth)
 	r.Get("/api/camera/discover", h.handleDiscover)
 	r.Get("/api/camera/info", h.handleCameraInfo)
+	r.Get("/api/camera/profiles", h.handleCameraProfiles)
 	r.Post("/api/camera/connect", h.handleConnect)
+	r.Post("/api/wall/connect", h.handleWallConnect)
+	r.Post("/api/wall/disconnect", h.handleWallDisconnect)
+	r.Get("/api/wall/devices", h.handleWallDevices)
 	r.Get("/api/camera/device-info", h.handleDeviceInfo)
 	r.Get("/api/llm/config", h.handleLLMGetConfig)
 	r.Post("/api/llm/config", h.handleLLMSetConfig)
@@ -297,12 +316,26 @@ func (h *Handler) handleDiscover(w http.ResponseWriter, r *http.Request) {
 
 	probed, err := discovery.Probe("")
 	if err == nil {
+		// 去重键用全部 XAddr（而非仅主地址）：双栈设备的 IPv4/IPv6
+		// 地址可能分别出现在监听记录与主动探测结果里
 		seen := make(map[string]bool)
 		for _, d := range allDevices {
+			for _, addr := range d.XAddrs {
+				seen[addr] = true
+			}
 			seen[d.Address] = true
 		}
 		for _, d := range probed {
-			if !seen[d.Address] {
+			dup := seen[d.Address]
+			if !dup {
+				for _, addr := range d.XAddrs {
+					if seen[addr] {
+						dup = true
+						break
+					}
+				}
+			}
+			if !dup {
 				allDevices = append(allDevices, d)
 			}
 		}
@@ -342,6 +375,77 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "connecting", "address": req.Address})
 }
 
+// handleWallConnect 上墙一台设备：凭证由前端每次携带（浏览器侧保存），
+// 后端不落盘。路数超限由 cameraManager 侧拒绝并广播错误。
+func (h *Handler) handleWallConnect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Address  string   `json:"address"`
+		Username string   `json:"username"`
+		Password string   `json:"password"`
+		Profiles []string `json:"profiles"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" || len(req.Profiles) == 0 {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	h.mu.RLock()
+	fn := h.onWallConnect
+	h.mu.RUnlock()
+
+	if fn == nil {
+		http.Error(w, `{"error":"wall not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	go fn(req.Address, req.Username, req.Password, req.Profiles)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "connecting", "address": req.Address})
+}
+
+// handleWallDisconnect 下墙：body 携带 profile 时只下墙该路画面，
+// 否则整台设备下墙。
+func (h *Handler) handleWallDisconnect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Address string `json:"address"`
+		Profile string `json:"profile"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	h.mu.RLock()
+	fn := h.onWallDisconnect
+	h.mu.RUnlock()
+
+	if fn == nil {
+		http.Error(w, `{"error":"wall not available"}`, http.StatusServiceUnavailable)
+		return
+	}
+	fn(req.Address, req.Profile)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleWallDevices 返回视频墙设备快照（前端初始加载用，后续更新走
+// wall_state WS 广播）。
+func (h *Handler) handleWallDevices(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	fn := h.wallState
+	h.mu.RUnlock()
+
+	devices := []ws.WallDevice{}
+	if fn != nil {
+		if got := fn(); got != nil {
+			devices = got
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ws.WallStatePayload{Devices: devices})
+}
+
 func (h *Handler) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 	address := r.URL.Query().Get("address")
 	if address == "" {
@@ -369,6 +473,47 @@ func (h *Handler) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(info)
+}
+
+// handleCameraProfiles 返回指定设备的 media profile 列表（纯 SOAP 查询，
+// 不建立取流会话）：供视频墙在连接前选择要上墙的画面（#39）。
+func (h *Handler) handleCameraProfiles(w http.ResponseWriter, r *http.Request) {
+	address := r.URL.Query().Get("address")
+	if address == "" {
+		http.Error(w, `{"error":"missing address"}`, http.StatusBadRequest)
+		return
+	}
+
+	client := onvif.NewClient(onvif.Config{
+		DeviceAddr: address,
+		Username:   r.URL.Query().Get("username"),
+		Password:   r.URL.Query().Get("password"),
+		Timeout:    5 * time.Second,
+	})
+
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	profiles, err := client.GetProfiles(ctx)
+	if err != nil {
+		log.Printf("GetProfiles for %s failed: %v", address, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	type profileItem struct {
+		Token string `json:"token"`
+		Name  string `json:"name"`
+		PTZ   bool   `json:"ptz"`
+	}
+	items := make([]profileItem, 0, len(profiles))
+	for _, p := range profiles {
+		items = append(items, profileItem{Token: p.Token, Name: p.Name, PTZ: p.HasPTZ()})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"profiles": items})
 }
 
 func (h *Handler) handleCameraInfo(w http.ResponseWriter, r *http.Request) {
@@ -728,8 +873,10 @@ func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
 
 	case ws.MsgTypePTZMove:
 		var payload struct {
-			Camera    string
-			Direction string
+			Dev        string `json:"dev"`
+			Camera     string `json:"camera"`
+			Direction  string `json:"direction"`
+			DurationMs int64  `json:"duration_ms"`
 		}
 		if msg.Payload != nil {
 			json.Unmarshal(msg.Payload, &payload)
@@ -737,7 +884,7 @@ func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
 		if payload.Direction != "" {
 			h.mu.RLock()
 			if h.onPTZMove != nil {
-				h.onPTZMove(payload.Camera, payload.Direction)
+				h.onPTZMove(payload.Dev, payload.Camera, payload.Direction, payload.DurationMs)
 			}
 			h.mu.RUnlock()
 		}
@@ -789,17 +936,17 @@ func (h *Handler) handleClientMessage(client *ws.Client, msg *ws.Message) {
 		}
 
 	case ws.MsgTypeViewControl:
-		// 视频帧带宽高，未显式请求的连接默认不推送（issue #26）；
-		// 开关挂在连接上，断线重连后由前端重新发送 start
+		// 视频帧带宽高，未订阅的连接默认不推送（issue #26）；订阅按
+		// dev+cam 画面粒度挂在连接上（#39），断线重连后由前端重新发送 start
 		var payload ws.ViewControlPayload
 		if msg.Payload != nil {
 			json.Unmarshal(msg.Payload, &payload)
 		}
 		switch payload.Action {
 		case ws.ViewActionStart:
-			h.hub.SetVideoView(client, true)
+			h.hub.SetVideoView(client, payload.Dev, payload.Cam, true)
 		case ws.ViewActionStop:
-			h.hub.SetVideoView(client, false)
+			h.hub.SetVideoView(client, payload.Dev, payload.Cam, false)
 		}
 
 	case ws.MsgTypeClockSync:
