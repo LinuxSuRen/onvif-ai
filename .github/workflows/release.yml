@@ -75,6 +75,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           NAME="onvif-ai_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}"
           STAGE="dist/${NAME}"
+          mkdir -p "${STAGE}"
           # 二进制与项目同名（onvif-ai / onvif-ai.exe）；前端已嵌入二进制，无需单独打包
           mv "dist/onvif-ai${{ matrix.ext }}" "${STAGE}/"
           cp .env.example README.md "${STAGE}/"
