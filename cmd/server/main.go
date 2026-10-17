@@ -449,6 +449,10 @@ func (cm *cameraManager) startSession(address, username, password string, profil
 			}
 			cm.hub.BroadcastConnectError(address, code)
 		}
+		// 失败必须拆会话：否则 registry 残留 state=connecting 的僵尸条目，
+		// wall_state 永远显示「连接中」，且前端把该地址当作已在墙上
+		// 禁止重新添加（teardownSession 对已被替换的会话幂等）
+		cm.teardownSession(sess)
 		return
 	}
 
@@ -466,6 +470,7 @@ func (cm *cameraManager) startSession(address, username, password string, profil
 		}
 		if len(filtered) == 0 {
 			cm.hub.BroadcastError("指定的画面（profile）不存在或不可用")
+			cm.teardownSession(sess)
 			return
 		}
 		profiles = filtered
@@ -479,6 +484,7 @@ func (cm *cameraManager) startSession(address, username, password string, profil
 	if len(profiles) == 0 {
 		cm.hub.BroadcastError("摄像头未返回任何媒体配置（profile），无法取流")
 		cm.handler.SetDeviceState(true, false, false, address)
+		cm.teardownSession(sess)
 		return
 	}
 
